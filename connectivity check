@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+###############################################################################
+# Script: rswsolutionz_rmm_connectivity_check_5091126.sh
+# Company: Solutionz INC / RSW
+# Revision: 5091126
+# Purpose:
+#   Read-only network/connectivity validation for the Solutionz RMM Agent built
+#   by rswsolutionz_domotz_setup_rev5091126.sh.
+#
+# Traffic model:
+#   - Monitoring traffic originates from the RMM Agent toward AV devices.
+#   - Domotz/RMM cloud connections originate outbound from the RMM Agent.
+#   - No unsolicited Internet-initiated inbound connection is required.
+#
+# Notes:
+#   - TCP 32700-57699 is a firewall policy range. A remote endpoint does not
+#     necessarily listen on every port at all times, so representative probes
+#     are diagnostic only and cannot certify the entire range by themselves.
+#   - NTP validation uses the system's actual synchronization state. Merely
+#     sending a UDP packet would not prove that UDP/123 works.
+###############################################################################
+
+REVISION="5091126"
+SCRIPT_NAME="rswsolutionz_rmm_connectivity_check_5091126.sh"
+STATE_DIR="/var/lib/rswsolutionz-rmm"
+STATE_FILE="${STATE_DIR}/install.state"
+NETWORK_REQUIREMENTS_FILE="${STATE_DIR}/network-requirements-${REVISION}.txt"
+LOG_DIR="/var/log/solutionz-rmm/checks/connectivity"
+RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+LOG_FILE="${LOG_DIR}/connectivity-check-${REVISION}-${RUN_TIMESTAMP}.log"
+LATEST_LOG="${LOG_DIR}/latest.log"
+RESULT_DIR="${STATE_DIR}/check-results"
+RESULT_FILE="${RESULT_DIR}/connectivity-check-${REVISION}.result"
+
+# North America production endpoints. These can be overridden temporarily for
+# controlled testing without editing the script.
+DOMOTZ_PORTAL_HOST="${DOMOTZ_PORTAL_HOST:-portal.domotz.com}"
+DOMOTZ_API_HOST="${DOMOTZ_API_HOST:-api-us-east-1-cell-1.domotz.com}"
+DOMOTZ_MESSAGING_HOST="${DOMOTZ_MESSAGING_HOST:-messaging-us-east-1-cell-1.domotz.com}"
+DOMOTZ_ECHO_HOST="${DOMOTZ_ECHO_HOST:-echo.domotz.com}"
+DOMOTZ_PROVISIONING_HOST="${DOMOTZ_PROVISIONING_HOST:-provisioning.domotz.com}"
+DOMOTZ_ORCHESTRATION_MESSAGING_HOST="${DOMOTZ_ORCHESTRATION_MESSAGING_HOST:-messaging.orchestration.domotz.com}"
+DOMOTZ_ORCHESTRATION_API_HOST="${DOMOTZ_ORCHESTRATION_API_HOST:-api.orchestration.wl-pro.com}"
+DOMOTZ_TUNNEL_HOST="${DOMOTZ_TUNNEL_HOST:-tunny.domotz.org}"
+DOMOTZ_KEYSERVER_HOST="${DOMOTZ_KEYSERVER_HOST:-pool.sks-keyservers.net}"
+
+DOMOTZ_RELAY_HOSTS=(
+  sshg.domotz.co
+  us-east-1-sshg.domotz.co
+  us-east-1-02-sshg.domotz.co
+  us-west-2-sshg.domotz.co
+)
+
+CANONICAL_HTTPS_HOSTS=(
+  api.snapcraft.io
+  serial-vault-partners.canonical.com
+  storage.snapcraftcontent.com
+)
+
+PASS_COUNT=0
+WARN_COUNT=0
+FAIL_COUNT=0
+DEVICE_TARGETS=()
+TCP_TARGETS=()
+
+pass() { echo "PASS - $*"; PASS_COUNT=$((PASS_COUNT + 1)); }
+warn() { echo "WARN - $*"; WARN_COUNT=$((WARN_COUNT + 1)); }
+fail() { echo "FAIL - $*"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
+info() { echo "INFO - $*"; }
+
+section() {
+  echo
+  echo "==============================================================================="
+  echo "$*"
+  echo "==============================================================================="
+}
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  sudo ./rswsolutionz_rmm_connectivity_check_5091126.sh [options]
+
+Options:
+  --device <IP-or-host>     Test ICMP reachability to a monitored AV device.
+                            May be supplied multiple times.
+  --tcp <host:port>         Test a device-specific TCP monitoring/management
+                            service. May be supplied multiple times.
+  -h, --help                Show this help.
+
+Examples:
+  sudo ./rswsolutionz_rmm_connectivity_check_5091126.sh --device 10.50.1.20
+  sudo ./rswsolutionz_rmm_connectivity_check_5091126.sh \
+      --device 10.50.1.20 --tcp 10.50.1.20:443 --tcp 10.50.1.30:22
+USAGE
+}
+
+parse_args() {
+  while (($#)); do
+    case "$1" in
+      --device)
+        [[ $# -ge 2 ]] || { echo "ERROR: --device requires a value." >&2; exit 2; }
+        DEVICE_TARGETS+=("$2")
+        shift 2
+        ;;
+      --tcp)
+        [[ $# -ge 2 ]] || { echo "ERROR: --tcp requires host:port." >&2; exit 2; }
+        TCP_TARGETS+=("$2")
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "ERROR: Unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+  done
+}
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "ERROR: Run this script with sudo or as root." >&2
+    exit 2
+  fi
+}
+
+init_logging() {
+  install -d -m 750 "${LOG_DIR}" "${RESULT_DIR}"
+  touch "${LOG_FILE}"
+  chmod 640 "${LOG_FILE}"
+  ln -sfn "$(basename "${LOG_FILE}")" "${LATEST_LOG}"
+  exec > >(tee -a "${LOG_FILE}") 2>&1
+}
+
+state_value() {
+  local key="$1"
+  awk -F= -v key="${key}" '$1 == key {print substr($0, index($0,"=")+1); exit}' "${STATE_FILE}" 2>/dev/null || true
+}
+
+dns_ipv4() {
+  local host="$1"
+  getent ahostsv4 "${host}" 2>/dev/null | awk '{print $1}' | grep -Eq '^[0-9]+(\.[0-9]+){3}$'
+}
+
+tcp_open() {
+  local host="$1" port="$2"
+  nc -z -w7 "${host}" "${port}" >/dev/null 2>&1
+}
+
+check_revision_and_tools() {
+  section "REVISION / TOOL PREREQUISITES"
+
+  local revision=""
+  if [[ -s "${STATE_FILE}" ]]; then
+    revision="$(state_value revision)"
+    [[ "${revision}" == "${REVISION}" ]] \
+      && pass "Setup revision matches ${REVISION}." \
+      || fail "Setup revision '${revision:-missing}' does not match ${REVISION}."
+  else
+    fail "Setup state file is missing: ${STATE_FILE}"
+  fi
+
+  [[ -s "${NETWORK_REQUIREMENTS_FILE}" ]] \
+    && pass "Revision ${REVISION} network-requirements record exists." \
+    || fail "Network-requirements record is missing: ${NETWORK_REQUIREMENTS_FILE}"
+
+  local cmd
+  for cmd in ip getent nc ping timedatectl; do
+    if command -v "${cmd}" >/dev/null 2>&1; then
+      pass "Required command is available: ${cmd}."
+    else
+      fail "Required command is missing: ${cmd}. This check does not install packages."
+    fi
+  done
+}
+
+check_local_network_path() {
+  section "LOCAL NETWORK PATH"
+
+  if ip link show eth0 >/dev/null 2>&1; then
+    pass "eth0 exists."
+  else
+    fail "eth0 is missing."
+    return
+  fi
+
+  local addr defaults gateway
+  addr="$(ip -o -4 addr show dev eth0 scope global 2>/dev/null | awk 'NR==1 {print $4}')"
+  defaults="$(ip -4 route show default 2>/dev/null || true)"
+  gateway="$(ip -4 route show default 2>/dev/null | awk '$0 ~ / dev eth0 / {print $3; exit}')"
+
+  [[ -n "${addr}" ]] && pass "eth0 has IPv4 address ${addr}." || fail "eth0 has no global IPv4 address."
+
+  if grep -q ' dev eth0 ' <<< "${defaults}"; then
+    pass "IPv4 default route uses eth0."
+  else
+    fail "IPv4 default route does not use eth0."
+  fi
+
+  if grep -q ' dev eth1 ' <<< "${defaults}"; then
+    fail "eth1 has an IPv4 default route."
+  else
+    pass "eth1 has no IPv4 default route."
+  fi
+
+  if [[ -n "${gateway}" ]]; then
+    if ping -c 2 -W 2 "${gateway}" >/dev/null 2>&1; then
+      pass "Default gateway ${gateway} responds to ICMP."
+    else
+      warn "Default gateway ${gateway} did not respond to ICMP. Some networks intentionally suppress gateway ICMP."
+    fi
+  else
+    fail "Default gateway for eth0 could not be determined."
+  fi
+}
+
+check_dns() {
+  section "DNS RESOLUTION"
+
+  local hosts=(
+    "${DOMOTZ_PORTAL_HOST}"
+    "${DOMOTZ_API_HOST}"
+    "${DOMOTZ_MESSAGING_HOST}"
+    "${DOMOTZ_ECHO_HOST}"
+    "${DOMOTZ_PROVISIONING_HOST}"
+    "${DOMOTZ_ORCHESTRATION_MESSAGING_HOST}"
+    "${DOMOTZ_ORCHESTRATION_API_HOST}"
+    "${DOMOTZ_TUNNEL_HOST}"
+    "${DOMOTZ_KEYSERVER_HOST}"
+    api.snapcraft.io
+    archive.ubuntu.com
+    security.ubuntu.com
+  )
+
+  local host
+  for host in "${hosts[@]}"; do
+    if dns_ipv4 "${host}"; then
+      pass "DNS resolves ${host} to IPv4."
+    else
+      fail "DNS does not resolve ${host} to IPv4."
+    fi
+  done
+
+  for host in "${DOMOTZ_RELAY_HOSTS[@]}"; do
+    if dns_ipv4 "${host}"; then
+      pass "DNS resolves Domotz relay host ${host}."
+    else
+      fail "DNS does not resolve Domotz relay host ${host}."
+    fi
+  done
+}
+
+check_required_tcp_services() {
+  section "REQUIRED OUTBOUND TCP SERVICES"
+
+  local tests=(
+    "${DOMOTZ_PORTAL_HOST}:443:Domotz portal HTTPS"
+    "${DOMOTZ_API_HOST}:443:Domotz North America API"
+    "${DOMOTZ_MESSAGING_HOST}:5671:Domotz secure messaging"
+    "${DOMOTZ_PROVISIONING_HOST}:4505:Domotz provisioning"
+    "${DOMOTZ_PROVISIONING_HOST}:4506:Domotz provisioning"
+    "${DOMOTZ_ORCHESTRATION_MESSAGING_HOST}:5671:Domotz orchestration messaging"
+    "${DOMOTZ_ORCHESTRATION_API_HOST}:443:Domotz orchestration API"
+    "${DOMOTZ_TUNNEL_HOST}:55022:Domotz tunnel / remote support"
+    "${DOMOTZ_KEYSERVER_HOST}:11371:Provisioning key-server connectivity"
+    "api.snapcraft.io:443:Snap Store API"
+  )
+
+  local host port description item
+  for item in "${tests[@]}"; do
+    host="${item%%:*}"
+    item="${item#*:}"
+    port="${item%%:*}"
+    description="${item#*:}"
+
+    if tcp_open "${host}" "${port}"; then
+      pass "${description}: ${host}:${port} reachable."
+    else
+      fail "${description}: ${host}:${port} not reachable."
+    fi
+  done
+
+  local host
+  for host in "${CANONICAL_HTTPS_HOSTS[@]}"; do
+    if tcp_open "${host}" 443; then
+      pass "Canonical/Snap maintenance HTTPS reachable: ${host}:443."
+    else
+      warn "Canonical/Snap maintenance HTTPS not reachable: ${host}:443."
+    fi
+  done
+}
+
+check_remote_relay_range() {
+  section "DOMOTZ REMOTE RELAY RANGE - TCP 32700-57699"
+
+  info "Revision ${REVISION} requires outbound TCP 32700-57699 for Domotz remote relay connectivity."
+  info "A host probe cannot certify the entire firewall range because relay endpoints do not necessarily listen on every port continuously."
+  info "The firewall/security policy must explicitly allow the complete outbound range to the applicable Domotz relay endpoints."
+
+  local sample_ports=(32700 45000 57699)
+  local any_sample=0 host port
+
+  for host in "${DOMOTZ_RELAY_HOSTS[@]}"; do
+    dns_ipv4 "${host}" || continue
+    for port in "${sample_ports[@]}"; do
+      if tcp_open "${host}" "${port}"; then
+        pass "Representative relay probe succeeded: ${host}:${port}."
+        any_sample=1
+      else
+        warn "Representative relay probe did not connect: ${host}:${port}. This does not by itself prove the firewall range is blocked."
+      fi
+    done
+  done
+
+  if (( any_sample == 0 )); then
+    warn "No representative TCP relay probe connected. Confirm firewall policy for the full 32700-57699 outbound range."
+  fi
+}
+
+check_icmp_and_time() {
+  section "ICMP AND TIME SYNCHRONIZATION"
+
+  if ping -c 3 -W 3 "${DOMOTZ_ECHO_HOST}" >/dev/null 2>&1; then
+    pass "ICMP reachability to ${DOMOTZ_ECHO_HOST} succeeded."
+  else
+    fail "ICMP reachability to ${DOMOTZ_ECHO_HOST} failed."
+  fi
+
+  local ntp_sync
+  ntp_sync="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+  if [[ "${ntp_sync}" == "yes" ]]; then
+    pass "System clock is NTP synchronized; this validates working time synchronization rather than merely transmitting a UDP/123 packet."
+  else
+    fail "System clock is not reported as NTP synchronized."
+  fi
+
+  timedatectl status 2>/dev/null | sed -n '1,20p' || true
+}
+
+check_monitored_devices() {
+  section "OPTIONAL MONITORED AV DEVICE TESTS"
+
+  if (( ${#DEVICE_TARGETS[@]} == 0 && ${#TCP_TARGETS[@]} == 0 )); then
+    info "No --device or --tcp targets were supplied. Device-specific monitoring tests were skipped."
+    info "Use --device for ICMP heartbeat/reachability and --tcp host:port for specific monitoring/management services."
+    return
+  fi
+
+  local target
+  for target in "${DEVICE_TARGETS[@]}"; do
+    if ping -c 3 -W 3 "${target}" >/dev/null 2>&1; then
+      pass "Monitored device ${target} responds to ICMP."
+    else
+      fail "Monitored device ${target} does not respond to ICMP."
+    fi
+  done
+
+  local host port
+  for target in "${TCP_TARGETS[@]}"; do
+    if [[ "${target}" != *:* ]]; then
+      fail "Invalid --tcp target '${target}'. Expected host:port."
+      continue
+    fi
+    host="${target%:*}"
+    port="${target##*:}"
+    if [[ -z "${host}" || ! "${port}" =~ ^[0-9]+$ || "${port}" -lt 1 || "${port}" -gt 65535 ]]; then
+      fail "Invalid --tcp target '${target}'."
+      continue
+    fi
+    if tcp_open "${host}" "${port}"; then
+      pass "Monitored-device TCP service reachable: ${host}:${port}."
+    else
+      fail "Monitored-device TCP service not reachable: ${host}:${port}."
+    fi
+  done
+}
+
+write_result() {
+  local result="PASS"
+  (( FAIL_COUNT > 0 )) && result="FAIL"
+  {
+    echo "result=${result}"
+    echo "revision=${REVISION}"
+    echo "script=${SCRIPT_NAME}"
+    echo "timestamp_utc=$(date -u +%FT%TZ)"
+    echo "passes=${PASS_COUNT}"
+    echo "warnings=${WARN_COUNT}"
+    echo "failures=${FAIL_COUNT}"
+    echo "log=${LOG_FILE}"
+  } > "${RESULT_FILE}"
+  chmod 640 "${RESULT_FILE}"
+}
+
+summary() {
+  section "CONNECTIVITY CHECK SUMMARY"
+  echo "Revision: ${REVISION}"
+  echo "PASS: ${PASS_COUNT}"
+  echo "WARN: ${WARN_COUNT}"
+  echo "FAIL: ${FAIL_COUNT}"
+  echo "Log: ${LOG_FILE}"
+  echo "Result file: ${RESULT_FILE}"
+  echo "Internet inbound requirement: NONE for normal RMM/Domotz cloud communication."
+  echo "Agent-host inbound allowances TCP 22 and TCP 3000 are configuration items and are checked by the configuration script."
+
+  write_result
+
+  if (( FAIL_COUNT == 0 )); then
+    echo "RESULT: PASS"
+    return 0
+  fi
+
+  echo "RESULT: FAIL"
+  return 1
+}
+
+main() {
+  parse_args "$@"
+  require_root
+  init_logging
+
+  echo "Solutionz RMM Connectivity Check"
+  echo "Revision: ${REVISION}"
+  echo "Time: $(date -u +%FT%TZ)"
+  echo "Host: $(hostname)"
+
+  check_revision_and_tools
+  check_local_network_path
+  check_dns
+  check_required_tcp_services
+  check_remote_relay_range
+  check_icmp_and_time
+  check_monitored_devices
+  summary
+}
+
+main "$@"

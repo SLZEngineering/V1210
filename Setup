@@ -371,8 +371,14 @@ preflight_checks() {
 
   progress_message "Ubuntu ${SUPPORTED_UBUNTU_VERSION_ID} LTS OS family verified (Ubuntu 24.04.x Noble point releases, including 24.04.4 LTS, are supported)."
   progress_message "Detected runtime release: ${PRETTY_NAME:-${VERSION:-unknown}}"
-  cp -a /etc/os-release "${OS_BASELINE_FILE}"
+  # /etc/os-release is commonly a relative symlink to /usr/lib/os-release.
+  # Do not preserve that symlink under STATE_DIR because it becomes dangling.
+  # Capture the resolved file contents as a regular audit record instead.
+  rm -f "${OS_BASELINE_FILE}"
+  cat /etc/os-release > "${OS_BASELINE_FILE}"
   chmod 640 "${OS_BASELINE_FILE}"
+  [[ -s "${OS_BASELINE_FILE}" && ! -L "${OS_BASELINE_FILE}" ]] || \
+    error_exit "Unable to create regular OS baseline record at ${OS_BASELINE_FILE}."
 
   local sys_vendor product_name
   sys_vendor="$(read_dmi_value /sys/class/dmi/id/sys_vendor)"
@@ -1544,4 +1550,5 @@ main() {
 }
 
 main "$@"
+
 

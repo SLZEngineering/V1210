@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ###############################################################################
-# Script: rswsolutionz_domotz_setup_rev5091126_with_xio_collector.sh
+# Script: rswsolutionz_domotz_setup_rev5091126.sh
 # Company: Solutionz INC / RSW
 # Revision: 5091126
 # Release Date: 2026-09-11
@@ -10,10 +10,9 @@ set -Eeuo pipefail
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
 #   Ubuntu 24.04 LTS operating-system family, record the manufacturer-delivered
-#   package state, install/validate required components, install Domotz, and
-#   deploy the Crestron 4-Series
-#   XiO-style pull collector, configure the V1210 USB-C COM serial console,
-#   and install a serial-console local network configuration utility.
+#   package state, install/validate required components, install Domotz, configure
+#   the V1210 USB-C COM serial console, and install a serial-console local network
+#   configuration utility.
 #
 # Important:
 #   - General "apt upgrade -y" is intentionally NOT used.
@@ -22,11 +21,13 @@ set -Eeuo pipefail
 #   - The V1210 USB-C port labeled COM is a serial console, not USB Ethernet.
 #     This script exposes a login shell on ttyS0 and installs
 #     /usr/local/sbin/solutionz-rmm-local-config for direct laptop configuration.
+#   - Ubuntu 24.04 LTS is the controlled OS family. Supported Noble point
+#     releases include Ubuntu 24.04.4 LTS.
 #   - Network changes are staged and take effect after manual reboot.
 ###############################################################################
 
 REVISION="5091126"
-SCRIPT_NAME="rswsolutionz_domotz_setup_rev5091126_with_xio_collector.sh"
+SCRIPT_NAME="rswsolutionz_domotz_setup_rev5091126.sh"
 RELEASE_DATE="2026-09-11"
 
 SUPPORTED_OS_ID="ubuntu"
@@ -74,32 +75,6 @@ POSTREBOOT_VALIDATOR="/usr/local/sbin/rswsolutionz-rmm-postreboot-validate"
 POSTREBOOT_SERVICE="/etc/systemd/system/rswsolutionz-rmm-postreboot-validation.service"
 POSTREBOOT_LOG="${LOG_DIR}/postreboot-validation.log"
 
-RMM_ROOT="/opt/solutionz-rmm"
-RMM_OUTPUT_DIR="${RMM_ROOT}/output"
-RMM_STATE_DIR="${RMM_ROOT}/state"
-RMM_LOG_DIR="${RMM_ROOT}/logs"
-RMM_BACKUP_DIR="${RMM_ROOT}/backups"
-RMM_COLLECTOR="${RMM_ROOT}/crestron_4series_xio_style_collector.py"
-RMM_CONFIG="${RMM_ROOT}/config.json"
-RMM_CONFIG_SCHEMA_FILE="${RMM_ROOT}/config.schema.version"
-RMM_CONFIG_SCHEMA_VERSION="1"
-RMM_HISTORY="${RMM_STATE_DIR}/crestron_event_history.json"
-RMM_COLLECTOR_LOG="${RMM_LOG_DIR}/crestron_4series_xio_style_collector.log"
-
-COLLECTOR_USER="solutionz-rmm"
-COLLECTOR_GROUP="solutionz-rmm"
-OPERATOR_GROUP="solutionz-rmm-operators"
-OPERATOR_USER="${OPERATOR_USER:-solz_rmm}"
-COLLECTOR_HOME="/var/lib/solutionz-rmm"
-COLLECTOR_SSH_DIR="${COLLECTOR_HOME}/.ssh"
-COLLECTOR_SSH_KEY="${COLLECTOR_SSH_DIR}/id_rsa"
-COLLECTOR_WRAPPER="/usr/local/bin/solutionz-rmm-collector"
-COLLECTOR_SUDOERS="/etc/sudoers.d/solutionz-rmm-collector"
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUNDLED_COLLECTOR="${SCRIPT_DIR}/crestron_4series_xio_style_collector.py"
-BUNDLED_CONFIG="${SCRIPT_DIR}/config.4series.xio.example.json"
-
 NON_INTERACTIVE=0
 CURRENT_STEP="startup"
 
@@ -129,14 +104,10 @@ REQUIRED_PACKAGES=(
   openssh-server
   sudo
   python3
-  python3-pip
-  python3-requests
-  python3-psutil
-  python3-urllib3
 )
 
 # Solutionz RMM traffic model:
-# - Monitoring traffic originates from this collector toward monitored AV devices.
+# - Monitoring traffic originates from this RMM Agent toward monitored AV devices.
 # - Domotz/RMM cloud connections are outbound-initiated by this Agent.
 # - No unsolicited Internet-initiated inbound connection is required.
 # - Host UFW permits inbound TCP 22 and TCP 3000 from any reachable source, per
@@ -346,11 +317,8 @@ This script will:
   8. Normalize Solutionz hostname entries.
   9. Configure GRUB interface naming and the V1210 USB-C COM serial console.
  10. Install a direct serial-console network configuration utility.
- 11. Deploy the XiO-style collector under a dedicated service account.
- 12. Create a dedicated collector SSH key and restricted operator wrapper.
- 13. Validate collector configuration and runtime.
- 14. Install post-reboot validation.
- 15. Stage all changes without automatically rebooting.
+ 11. Install post-reboot production validation.
+ 12. Stage all changes without automatically rebooting.
 
 USB-C COM direct laptop configuration:
   After reboot, connect a laptop to the V1210 USB-C port labeled COM.
@@ -401,7 +369,7 @@ preflight_checks() {
     error_exit "Unsupported Ubuntu codename '${VERSION_CODENAME}'. Expected ${SUPPORTED_UBUNTU_CODENAME}."
   fi
 
-  progress_message "Ubuntu ${SUPPORTED_UBUNTU_VERSION_ID} LTS OS family verified."
+  progress_message "Ubuntu ${SUPPORTED_UBUNTU_VERSION_ID} LTS OS family verified (Ubuntu 24.04.x Noble point releases, including 24.04.4 LTS, are supported)."
   progress_message "Detected runtime release: ${PRETTY_NAME:-${VERSION:-unknown}}"
   cp -a /etc/os-release "${OS_BASELINE_FILE}"
   chmod 640 "${OS_BASELINE_FILE}"
@@ -1173,7 +1141,7 @@ echo '
  \___ \ | |  | | | |    | |  | |   | |   | | | |  | || |\ \| |   / /
  ____) || |__| | | |___ | |__| |   | |   | | | |__| || |  \  |  / /__
 |_____/  \____/  |_____| \____/    |_|   |_|  \____/ |_|   \_| /_____|'
-echo "Welcome to the Solutionz RMM Collector Login."
+echo "Welcome to the Solutionz RMM Agent Login."
 echo "============================================================"
 hostnamectl
 echo "------------------------------------------------------------"
@@ -1190,302 +1158,8 @@ EOF
   chmod 755 "${MOTD_FILE}"
 }
 
-setup_collector_identity() {
-  step_message 16 "Create dedicated collector service identity"
-
-  getent group "${COLLECTOR_GROUP}" >/dev/null 2>&1 || groupadd --system "${COLLECTOR_GROUP}"
-  getent group "${OPERATOR_GROUP}" >/dev/null 2>&1 || groupadd --system "${OPERATOR_GROUP}"
-
-  if ! id "${COLLECTOR_USER}" >/dev/null 2>&1; then
-    useradd --system \
-      --gid "${COLLECTOR_GROUP}" \
-      --home-dir "${COLLECTOR_HOME}" \
-      --create-home \
-      --shell /usr/sbin/nologin \
-      "${COLLECTOR_USER}"
-  fi
-
-  if id "${OPERATOR_USER}" >/dev/null 2>&1; then
-    usermod -a -G "${OPERATOR_GROUP}" "${OPERATOR_USER}"
-    progress_message "Added ${OPERATOR_USER} to ${OPERATOR_GROUP}."
-  else
-    warning_message "Operator user ${OPERATOR_USER} does not exist. Collector remote wrapper access was not assigned to that user."
-  fi
-
-  install -d -o "${COLLECTOR_USER}" -g "${COLLECTOR_GROUP}" -m 700 "${COLLECTOR_SSH_DIR}"
-
-  if [[ ! -f "${COLLECTOR_SSH_KEY}" ]]; then
-    runuser -u "${COLLECTOR_USER}" -- \
-      ssh-keygen -q -t rsa -b 4096 -N '' -f "${COLLECTOR_SSH_KEY}"
-  fi
-  chmod 600 "${COLLECTOR_SSH_KEY}"
-  chmod 644 "${COLLECTOR_SSH_KEY}.pub"
-  chown "${COLLECTOR_USER}:${COLLECTOR_GROUP}" "${COLLECTOR_SSH_KEY}" "${COLLECTOR_SSH_KEY}.pub"
-
-  cat > "${COLLECTOR_WRAPPER}" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-mode="\${1:-stdout}"
-case "\${mode}" in
-  stdout|file|both|--help|-h) ;;
-  *)
-    echo "Invalid collector mode: \${mode}" >&2
-    exit 2
-    ;;
-esac
-exec /usr/bin/python3 "${RMM_COLLECTOR}" "\${mode}"
-EOF
-  chmod 755 "${COLLECTOR_WRAPPER}"
-  chown root:root "${COLLECTOR_WRAPPER}"
-
-  cat > "${COLLECTOR_SUDOERS}" <<EOF
-%${OPERATOR_GROUP} ALL=(${COLLECTOR_USER}) NOPASSWD: ${COLLECTOR_WRAPPER} *
-EOF
-  chmod 440 "${COLLECTOR_SUDOERS}"
-  visudo -cf "${COLLECTOR_SUDOERS}" >/dev/null || error_exit "Collector sudoers validation failed."
-}
-
-validate_config_json() {
-  python3 - "${RMM_CONFIG}" <<'PY'
-import json
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-with path.open("r", encoding="utf-8") as f:
-    data = json.load(f)
-
-required = {
-    "common_tags": dict,
-    "crestron_devices": list,
-}
-for key, expected_type in required.items():
-    if key not in data:
-        raise SystemExit(f"Missing required config key: {key}")
-    if not isinstance(data[key], expected_type):
-        raise SystemExit(f"Config key {key!r} must be {expected_type.__name__}")
-
-if "output_file" in data and not isinstance(data["output_file"], str):
-    raise SystemExit("output_file must be a string when present")
-
-print("config.json syntax and required top-level structure are valid")
-PY
-}
-
-migrate_collector_identity_path() {
-  python3 - "${RMM_CONFIG}" "${COLLECTOR_SSH_KEY}" <<'PY'
-import json
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-new_key = sys.argv[2]
-
-with path.open("r", encoding="utf-8") as f:
-    data = json.load(f)
-
-changed = False
-for device in data.get("crestron_devices", []):
-    ssh = device.get("ssh")
-    if not isinstance(ssh, dict):
-        continue
-    identity = str(ssh.get("identity_file", "") or "")
-    if not identity or identity == "/root/.ssh/id_rsa":
-        ssh["identity_file"] = new_key
-        changed = True
-
-if changed:
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-    print(f"Updated collector SSH identity path to {new_key}")
-else:
-    print("Collector SSH identity path did not require migration")
-PY
-}
-
-
-validate_collector_identity_and_permissions() {
-  id "${COLLECTOR_USER}" >/dev/null 2>&1 || error_exit "Collector service account ${COLLECTOR_USER} is missing."
-  [[ "$(stat -c '%U:%G' "${COLLECTOR_HOME}" 2>/dev/null || true)" == "${COLLECTOR_USER}:${COLLECTOR_GROUP}" ]] || \
-    error_exit "Collector home ownership is incorrect: ${COLLECTOR_HOME}"
-  [[ -f "${COLLECTOR_SSH_KEY}" ]] || error_exit "Collector SSH private key is missing: ${COLLECTOR_SSH_KEY}"
-  [[ "$(stat -c '%U:%G' "${COLLECTOR_SSH_KEY}")" == "${COLLECTOR_USER}:${COLLECTOR_GROUP}" ]] || \
-    error_exit "Collector SSH private key ownership is incorrect."
-  [[ "$(stat -c '%a' "${COLLECTOR_SSH_KEY}")" == "600" ]] || error_exit "Collector SSH private key must be mode 600."
-  runuser -u "${COLLECTOR_USER}" -- test -r "${RMM_CONFIG}" || error_exit "Collector account cannot read ${RMM_CONFIG}."
-  runuser -u "${COLLECTOR_USER}" -- test -w "${RMM_STATE_DIR}" || error_exit "Collector account cannot write ${RMM_STATE_DIR}."
-  runuser -u "${COLLECTOR_USER}" -- test -w "${RMM_LOG_DIR}" || error_exit "Collector account cannot write ${RMM_LOG_DIR}."
-  runuser -u "${COLLECTOR_USER}" -- test -w "${RMM_OUTPUT_DIR}" || error_exit "Collector account cannot write ${RMM_OUTPUT_DIR}."
-  visudo -cf "${COLLECTOR_SUDOERS}" >/dev/null || error_exit "Collector sudoers file is invalid."
-  progress_message "Collector identity and permission model validated."
-}
-
-deploy_xio_collector() {
-  step_message 17 "Deploy XiO-style collector with controlled ownership"
-
-  [[ -f "${BUNDLED_COLLECTOR}" ]] || error_exit "Bundled collector not found: ${BUNDLED_COLLECTOR}"
-  [[ -f "${BUNDLED_CONFIG}" ]] || error_exit "Bundled config not found: ${BUNDLED_CONFIG}"
-
-  install -d -o root -g "${COLLECTOR_GROUP}" -m 750 "${RMM_ROOT}" "${RMM_BACKUP_DIR}"
-
-  local rollback_dir
-  rollback_dir="${RMM_BACKUP_DIR}/rollback-$(date -u +%Y%m%dT%H%M%SZ)"
-  install -d -o root -g "${COLLECTOR_GROUP}" -m 750 "${rollback_dir}"
-  for existing in "${RMM_COLLECTOR}" "${RMM_CONFIG}" "${RMM_CONFIG_SCHEMA_FILE}" "${COLLECTOR_WRAPPER}" "${COLLECTOR_SUDOERS}"; do
-    if [[ -e "${existing}" ]]; then
-      cp -a "${existing}" "${rollback_dir}/"
-    fi
-  done
-  printf 'revision=%s\ntimestamp_utc=%s\n' "${REVISION}" "$(date -u +%FT%TZ)" > "${rollback_dir}/rollback.manifest"
-  chmod 640 "${rollback_dir}/rollback.manifest"
-  progress_message "Created collector rollback snapshot: ${rollback_dir}"
-  install -d -o "${COLLECTOR_USER}" -g "${COLLECTOR_GROUP}" -m 750 \
-    "${RMM_OUTPUT_DIR}" "${RMM_STATE_DIR}" "${RMM_LOG_DIR}"
-
-  if [[ -f "${RMM_COLLECTOR}" ]]; then
-    cp -a "${RMM_COLLECTOR}" \
-      "${RMM_BACKUP_DIR}/crestron_4series_xio_style_collector.py.$(date -u +%Y%m%dT%H%M%SZ)"
-  fi
-
-  install -o root -g "${COLLECTOR_GROUP}" -m 750 \
-    "${BUNDLED_COLLECTOR}" "${RMM_COLLECTOR}"
-
-  if [[ -f "${RMM_CONFIG}" ]]; then
-    cp -a "${RMM_CONFIG}" \
-      "${RMM_BACKUP_DIR}/config.json.$(date -u +%Y%m%dT%H%M%SZ)"
-    progress_message "Preserving existing config.json after backup."
-  else
-    install -o root -g "${COLLECTOR_GROUP}" -m 640 \
-      "${BUNDLED_CONFIG}" "${RMM_CONFIG}"
-    progress_message "Installed example config as ${RMM_CONFIG}."
-  fi
-
-  migrate_collector_identity_path
-  chown root:"${COLLECTOR_GROUP}" "${RMM_CONFIG}"
-  chmod 640 "${RMM_CONFIG}"
-
-  printf '%s\n' "${RMM_CONFIG_SCHEMA_VERSION}" > "${RMM_CONFIG_SCHEMA_FILE}"
-  chown root:"${COLLECTOR_GROUP}" "${RMM_CONFIG_SCHEMA_FILE}"
-  chmod 640 "${RMM_CONFIG_SCHEMA_FILE}"
-
-  validate_config_json
-
-  if [[ ! -f "${RMM_HISTORY}" ]]; then
-    printf '{}\n' > "${RMM_HISTORY}"
-  fi
-  touch "${RMM_COLLECTOR_LOG}"
-  chown "${COLLECTOR_USER}:${COLLECTOR_GROUP}" "${RMM_HISTORY}" "${RMM_COLLECTOR_LOG}"
-  chmod 640 "${RMM_HISTORY}" "${RMM_COLLECTOR_LOG}"
-
-  progress_message "Collector deployed under ${RMM_ROOT}."
-  progress_message "Collector SSH public key: ${COLLECTOR_SSH_KEY}.pub"
-}
-
-verify_python_modules() {
-  python3 - <<'PY'
-import requests
-import psutil
-import urllib3
-print("requests, psutil, urllib3 OK")
-PY
-}
-
-
-validate_configured_collector_targets() {
-  step_message 18 "Test configured collector target reachability"
-
-  local tmp_devices example_flag target_count failures
-  tmp_devices="$(mktemp)"
-  target_count=0
-  failures=0
-
-  if ! python3 - "${RMM_CONFIG}" >"${tmp_devices}" <<'PY'
-import json, pathlib, sys
-path = pathlib.Path(sys.argv[1])
-with path.open("r", encoding="utf-8") as fh:
-    data = json.load(fh)
-common = data.get("common_tags", {})
-customer = str(common.get("customer", "") or "")
-deployment = str(common.get("deployment_id", "") or "")
-example = customer.strip().lower() in {"customer name", "example", "sample"} or deployment.strip() == "RMM-DEPLOY-001"
-print(f"#example\t{1 if example else 0}")
-for idx, dev in enumerate(data.get("crestron_devices", []), start=1):
-    if not isinstance(dev, dict):
-        continue
-    ssh = dev.get("ssh")
-    if not isinstance(ssh, dict) or not ssh.get("enabled", False):
-        continue
-    name = str(dev.get("device_name") or dev.get("name") or f"device-{idx}")
-    host = str(dev.get("host") or "").strip()
-    port = ssh.get("port", 22)
-    print("\t".join([name.replace("\t"," "), host.replace("\t"," "), str(port)]))
-PY
-  then
-    rm -f "${tmp_devices}"
-    error_exit "Unable to parse collector config for target-connectivity test."
-  fi
-
-  example_flag="$(awk -F'\t' '$1=="#example" {print $2; exit}' "${tmp_devices}")"
-  [[ "${example_flag}" == "1" ]] && warning_message "Collector configuration is still an example template; target failures are informational until field configuration is completed."
-
-  while IFS=$'\t' read -r name host port; do
-    [[ "${name}" == "#example" ]] && continue
-    [[ -z "${name}${host}${port}" ]] && continue
-    target_count=$((target_count + 1))
-    if [[ -z "${host}" || ! "${port}" =~ ^[0-9]+$ || ${port} -lt 1 || ${port} -gt 65535 ]]; then
-      echo "FAIL - ${name}: invalid host/port in collector configuration."
-      failures=$((failures + 1))
-      continue
-    fi
-    if getent ahostsv4 "${host}" >/dev/null 2>&1 || [[ "${host}" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
-      :
-    else
-      echo "FAIL - ${name}: target hostname cannot be resolved: ${host}"
-      failures=$((failures + 1))
-      continue
-    fi
-    if nc -z -w5 "${host}" "${port}" >/dev/null 2>&1; then
-      echo "PASS - ${name}: TCP ${port} reachable from RMM Agent."
-    elif [[ "${example_flag}" == "1" ]]; then
-      warning_message "${name}: TCP ${port} not reachable while example config is installed."
-    else
-      echo "FAIL - ${name}: TCP ${port} is not reachable from RMM Agent."
-      failures=$((failures + 1))
-    fi
-  done < <(grep -v '^#example' "${tmp_devices}")
-
-  rm -f "${tmp_devices}"
-
-  if (( target_count == 0 )); then
-    warning_message "No SSH-enabled Crestron targets are configured; field-device connectivity test is deferred."
-    return 0
-  fi
-  if (( failures > 0 && example_flag != 1 )); then
-    error_exit "Configured collector target connectivity failed for ${failures} target(s)."
-  fi
-  progress_message "Configured collector target connectivity test completed."
-}
-
-validate_collector_runtime() {
-  step_message 19 "Validate collector runtime and permissions"
-
-  verify_python_modules
-  python3 -m py_compile "${RMM_COLLECTOR}"
-  validate_config_json
-  validate_collector_identity_and_permissions
-
-  runuser -u "${COLLECTOR_USER}" -- "${COLLECTOR_WRAPPER}" --help >/dev/null
-  runuser -u "${COLLECTOR_USER}" -- test -r "${RMM_CONFIG}"
-  runuser -u "${COLLECTOR_USER}" -- test -w "${RMM_STATE_DIR}"
-  runuser -u "${COLLECTOR_USER}" -- test -w "${RMM_LOG_DIR}"
-  runuser -u "${COLLECTOR_USER}" -- test -w "${RMM_OUTPUT_DIR}"
-
-  progress_message "Collector runtime test passed. This is not a field device-connectivity test."
-}
-
 install_postreboot_validation() {
-  step_message 20 "Install post-reboot production validation"
+  step_message 16 "Install post-reboot production validation"
 
   cat > "${POSTREBOOT_VALIDATOR}" <<'POSTVALIDATOR'
 #!/usr/bin/env bash
@@ -1506,20 +1180,12 @@ MANUFACTURER_PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-packa
 MANUFACTURER_PACKAGE_VALIDATION_FILE="/var/lib/rswsolutionz-rmm/manufacturer-package-validation-5091126.txt"
 MANUFACTURER_BASELINE_SHA256_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126.sha256"
 SNAP_BASELINE_FILE="/var/lib/rswsolutionz-rmm/snap-baseline-5091126.txt"
+NETWORK_REQUIREMENTS_FILE="/var/lib/rswsolutionz-rmm/network-requirements-5091126.txt"
 LOG_DIR="/var/log/solutionz-rmm/setup"
 LOG_FILE="${LOG_DIR}/postreboot-validation.log"
 DOMOTZ_SNAP_NAME="domotzpro-agent-publicstore"
 SERIAL_SERVICE="serial-getty@ttyS0.service"
 SERIAL_DEVICE="/dev/ttyS0"
-COLLECTOR_USER="solutionz-rmm"
-COLLECTOR_GROUP="solutionz-rmm"
-COLLECTOR_WRAPPER="/usr/local/bin/solutionz-rmm-collector"
-COLLECTOR_CONFIG="/opt/solutionz-rmm/config.json"
-COLLECTOR_SSH_KEY="/var/lib/solutionz-rmm/.ssh/id_rsa"
-COLLECTOR_STATE_DIR="/opt/solutionz-rmm/state"
-COLLECTOR_LOG_DIR="/opt/solutionz-rmm/logs"
-COLLECTOR_OUTPUT_DIR="/opt/solutionz-rmm/output"
-ROLLBACK_DIR="/opt/solutionz-rmm/backups"
 LOCAL_CONFIG_TOOL="/usr/local/sbin/solutionz-rmm-local-config"
 NETPLAN_FILE="/etc/netplan/00-installer-config.yaml"
 GRUB_FILE="/etc/default/grub"
@@ -1539,10 +1205,6 @@ REQUIRED_PACKAGES=(
   openssh-server
   sudo
   python3
-  python3-pip
-  python3-requests
-  python3-psutil
-  python3-urllib3
 )
 
 mkdir -p "${LOG_DIR}"
@@ -1590,7 +1252,8 @@ state_value() {
   awk -F= -v key="${key}" '$1 == key {print substr($0, index($0,"=")+1); exit}' "${STATE_FILE}" 2>/dev/null || true
 }
 
-# Platform baseline
+# Platform baseline. Any Ubuntu 24.04.x Noble point release is supported,
+# including Ubuntu 24.04.4 LTS.
 if [[ -r /etc/os-release ]]; then
   # shellcheck disable=SC1091
   . /etc/os-release
@@ -1617,6 +1280,7 @@ model="$(cat /sys/class/dmi/id/product_name 2>/dev/null | xargs || true)"
 [[ -s "${MANUFACTURER_PACKAGE_BASELINE_FILE}" ]] && pass "Manufacturer package inventory exists." || fail "Manufacturer package inventory is missing."
 [[ -s "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" ]] && pass "Manufacturer required-package validation exists." || fail "Manufacturer required-package validation is missing."
 [[ -s "${MANUFACTURER_BASELINE_SHA256_FILE}" ]] && pass "Manufacturer baseline checksum record exists." || fail "Manufacturer baseline checksum record is missing."
+[[ -s "${NETWORK_REQUIREMENTS_FILE}" ]] && pass "Network requirements record exists." || fail "Network requirements record is missing."
 if [[ -s "${MANUFACTURER_BASELINE_SHA256_FILE}" ]]; then
   if sha256sum -c "${MANUFACTURER_BASELINE_SHA256_FILE}" >/dev/null 2>&1; then
     pass "Manufacturer baseline integrity validation passed."
@@ -1688,83 +1352,6 @@ pgrep -a agetty 2>/dev/null | grep -q 'ttyS0' && pass "agetty is running on ttyS
 if grep -Eq '^GRUB_CMDLINE_LINUX=.*net\.ifnames=0' "${GRUB_FILE}" && grep -Eq '^GRUB_CMDLINE_LINUX=.*biosdevname=0' "${GRUB_FILE}"; then pass "GRUB interface-naming parameters are present."; else fail "Required GRUB interface-naming parameters are missing."; fi
 if grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=.*console=ttyS0,115200n8' "${GRUB_FILE}"; then pass "GRUB serial-console parameter is present."; else fail "GRUB serial-console parameter is missing."; fi
 
-# Collector ownership/runtime
-if id "${COLLECTOR_USER}" >/dev/null 2>&1; then pass "Collector service account exists."; else fail "Collector service account is missing."; fi
-[[ -x "${COLLECTOR_WRAPPER}" ]] && pass "Collector wrapper is installed." || fail "Collector wrapper is missing."
-[[ -r "${COLLECTOR_CONFIG}" ]] && pass "Collector config exists." || fail "Collector config is missing."
-if runuser -u "${COLLECTOR_USER}" -- test -r "${COLLECTOR_CONFIG}"; then pass "Collector account can read config.json."; else fail "Collector account cannot read config.json."; fi
-for dir in "${COLLECTOR_STATE_DIR}" "${COLLECTOR_LOG_DIR}" "${COLLECTOR_OUTPUT_DIR}"; do
-  if runuser -u "${COLLECTOR_USER}" -- test -w "${dir}"; then pass "Collector account can write ${dir}."; else fail "Collector account cannot write ${dir}."; fi
-done
-if [[ -f "${COLLECTOR_SSH_KEY}" ]]; then
-  owner="$(stat -c '%U:%G' "${COLLECTOR_SSH_KEY}" 2>/dev/null || true)"
-  mode="$(stat -c '%a' "${COLLECTOR_SSH_KEY}" 2>/dev/null || true)"
-  [[ "${owner}" == "${COLLECTOR_USER}:${COLLECTOR_GROUP}" ]] && pass "Collector SSH key ownership is correct." || fail "Collector SSH key ownership is ${owner:-unknown}."
-  [[ "${mode}" == "600" ]] && pass "Collector SSH key mode is 600." || fail "Collector SSH key mode is ${mode:-unknown}; expected 600."
-else
-  fail "Collector SSH private key is missing."
-fi
-if runuser -u "${COLLECTOR_USER}" -- "${COLLECTOR_WRAPPER}" --help >/dev/null 2>&1; then pass "Collector runtime starts as the service account."; else fail "Collector runtime does not start as the service account."; fi
-if find "${ROLLBACK_DIR}" -maxdepth 1 -type d -name 'rollback-*' -print -quit 2>/dev/null | grep -q .; then pass "Collector rollback snapshot exists."; else fail "Collector rollback snapshot is missing."; fi
-
-# Configured monitored-device reachability. Example/no-target configurations warn,
-# but a populated production configuration must pass ICMP and configured SSH TCP.
-if [[ -r "${COLLECTOR_CONFIG}" ]]; then
-  tmp_devices="$(mktemp)"
-  if python3 - "${COLLECTOR_CONFIG}" >"${tmp_devices}" <<'PYTARGETS'
-import json, pathlib, sys
-path = pathlib.Path(sys.argv[1])
-with path.open("r", encoding="utf-8") as fh:
-    data = json.load(fh)
-common = data.get("common_tags", {})
-customer = str(common.get("customer", "") or "")
-deployment = str(common.get("deployment_id", "") or "")
-example = customer.strip().lower() in {"customer name", "example", "sample"} or deployment.strip() == "RMM-DEPLOY-001"
-print(f"#example\t{1 if example else 0}")
-for idx, dev in enumerate(data.get("crestron_devices", []), start=1):
-    if not isinstance(dev, dict):
-        continue
-    ssh = dev.get("ssh")
-    if not isinstance(ssh, dict) or not ssh.get("enabled", False):
-        continue
-    name = str(dev.get("device_name") or dev.get("name") or f"device-{idx}")
-    host = str(dev.get("host") or "").strip()
-    port = ssh.get("port", 22)
-    print("\t".join([name.replace("\t"," "), host.replace("\t"," "), str(port)]))
-PYTARGETS
-  then
-    example_flag="$(awk -F'\t' '$1=="#example" {print $2; exit}' "${tmp_devices}")"
-    target_count=0
-    while IFS=$'\t' read -r name host port; do
-      [[ "${name}" == "#example" ]] && continue
-      [[ -z "${name}${host}${port}" ]] && continue
-      target_count=$((target_count + 1))
-      if [[ -z "${host}" || ! "${port}" =~ ^[0-9]+$ ]]; then
-        [[ "${example_flag}" == "1" ]] && warn "${name}: example target host/port is incomplete." || fail "${name}: production target host/port is invalid."
-        continue
-      fi
-      if ping -c 2 -W 2 "${host}" >/dev/null 2>&1; then
-        pass "${name}: ICMP reachability passed."
-      elif [[ "${example_flag}" == "1" ]]; then
-        warn "${name}: ICMP unavailable while example config is installed."
-      else
-        fail "${name}: ICMP reachability failed."
-      fi
-      if nc -z -w5 "${host}" "${port}" >/dev/null 2>&1; then
-        pass "${name}: configured TCP ${port} is reachable."
-      elif [[ "${example_flag}" == "1" ]]; then
-        warn "${name}: TCP ${port} unavailable while example config is installed."
-      else
-        fail "${name}: configured TCP ${port} is unreachable."
-      fi
-    done < <(grep -v '^#example' "${tmp_devices}")
-    (( target_count == 0 )) && warn "No production AV targets are configured yet; monitored-device reachability is deferred."
-  else
-    fail "Collector config could not be parsed for monitored-device validation."
-  fi
-  rm -f "${tmp_devices}"
-fi
-
 echo "------------------------------------------------------------"
 echo "Production validation failures: ${failures}"
 echo "Production validation warnings: ${warnings}"
@@ -1830,7 +1417,7 @@ check_final_requirement() {
 }
 
 final_summary_check() {
-  step_message 21 "Run mandatory pre-reboot validation"
+  step_message 17 "Run mandatory pre-reboot validation"
 
   local failures=0
 
@@ -1869,11 +1456,6 @@ final_summary_check() {
   check_final_requirement "Network requirements record exists" test -s "${NETWORK_REQUIREMENTS_FILE}" || failures=$((failures + 1))
   check_final_requirement "Netplan generates successfully" netplan generate || failures=$((failures + 1))
   check_final_requirement "Domotz installed" snap list "${DOMOTZ_SNAP_NAME}" || failures=$((failures + 1))
-  check_final_requirement "Collector config valid" validate_config_json || failures=$((failures + 1))
-  check_final_requirement "Collector identity and permissions valid" validate_collector_identity_and_permissions || failures=$((failures + 1))
-  check_final_requirement "Collector runtime valid as service account" \
-    runuser -u "${COLLECTOR_USER}" -- "${COLLECTOR_WRAPPER}" --help || failures=$((failures + 1))
-  check_final_requirement "Collector rollback snapshot exists" bash -c "find '${RMM_BACKUP_DIR}' -maxdepth 1 -type d -name 'rollback-*' -print -quit | grep -q ." || failures=$((failures + 1))
   check_final_requirement "Post-reboot production validator installed" test -x "${POSTREBOOT_VALIDATOR}" || failures=$((failures + 1))
 
   local permission
@@ -1930,10 +1512,6 @@ main() {
   configure_grub_and_serial
   install_local_serial_config_tool
   update_banner
-  setup_collector_identity
-  deploy_xio_collector
-  validate_configured_collector_targets
-  validate_collector_runtime
   install_postreboot_validation
 
   if ! final_summary_check; then
@@ -1962,14 +1540,8 @@ main() {
   echo "  2. Open a serial terminal at 115200 baud, 8 data bits, no parity, 1 stop bit."
   echo "  3. Log in with an authorized local account."
   echo "  4. Run: sudo ${LOCAL_CONFIG_TOOL}"
-  echo
-  echo "Collector operator command after login/SSH:"
-  echo "  sudo -u ${COLLECTOR_USER} ${COLLECTOR_WRAPPER} stdout"
-  echo
-  echo "Collector SSH public key to install on supported target processors:"
-  echo "  ${COLLECTOR_SSH_KEY}.pub"
-  echo
   echo "Domotz update policy: not revision-pinned; installed revision recorded in ${SNAP_BASELINE_FILE}."
 }
 
 main "$@"
+

@@ -9,7 +9,9 @@ set -Eeuo pipefail
 #
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
-#   Ubuntu 24.04.3 LTS build-image baseline, install Domotz, deploy the Crestron 4-Series
+#   Ubuntu 24.04 LTS operating-system family, record the manufacturer-delivered
+#   package state, install/validate required components, install Domotz, and
+#   deploy the Crestron 4-Series
 #   XiO-style pull collector, configure the V1210 USB-C COM serial console,
 #   and install a serial-console local network configuration utility.
 #
@@ -29,8 +31,7 @@ RELEASE_DATE="2026-09-11"
 
 SUPPORTED_OS_ID="ubuntu"
 SUPPORTED_UBUNTU_VERSION_ID="24.04"
-SUPPORTED_UBUNTU_POINT_RELEASE="24.04.3"
-SUPPORTED_UBUNTU_PRETTY_FRAGMENT="24.04.3 LTS"
+SUPPORTED_UBUNTU_CODENAME="noble"
 SUPPORTED_VENDOR="Protectli"
 SUPPORTED_MODEL="V1210"
 
@@ -48,6 +49,10 @@ STATE_DIR="/var/lib/rswsolutionz-rmm"
 STATE_FILE="${STATE_DIR}/install.state"
 BASELINE_FILE="${STATE_DIR}/package-baseline-${REVISION}.tsv"
 OS_BASELINE_FILE="${STATE_DIR}/os-baseline-${REVISION}.txt"
+MANUFACTURER_BASELINE_FILE="${STATE_DIR}/manufacturer-baseline-${REVISION}.txt"
+MANUFACTURER_PACKAGE_BASELINE_FILE="${STATE_DIR}/manufacturer-packages-${REVISION}.tsv"
+MANUFACTURER_PACKAGE_VALIDATION_FILE="${STATE_DIR}/manufacturer-package-validation-${REVISION}.txt"
+MANUFACTURER_BASELINE_SHA256_FILE="${STATE_DIR}/manufacturer-baseline-${REVISION}.sha256"
 SNAP_BASELINE_FILE="${STATE_DIR}/snap-baseline-${REVISION}.txt"
 NETWORK_REQUIREMENTS_FILE="${STATE_DIR}/network-requirements-${REVISION}.txt"
 
@@ -104,6 +109,30 @@ REQUIRED_DOMOTZ_PERMISSIONS=(
   "raw-usb"
   "shutdown"
   "system-observe"
+)
+
+# Required Solutionz package set. The manufacturer-delivered state is captured
+# before apt modifies the appliance. Missing packages are reported separately
+# and only those missing packages are installed by this script.
+REQUIRED_PACKAGES=(
+  net-tools
+  openvswitch-switch
+  traceroute
+  dnsutils
+  curl
+  openssl
+  netcat-openbsd
+  nano
+  iputils-ping
+  ufw
+  snapd
+  openssh-server
+  sudo
+  python3
+  python3-pip
+  python3-requests
+  python3-psutil
+  python3-urllib3
 )
 
 # Solutionz RMM traffic model:
@@ -307,9 +336,9 @@ Solutionz RMM Agent Build - Revision ${REVISION}
 
   cat <<EOF
 This script will:
-  1. Validate Ubuntu 24.04.3 LTS and Protectli V1210 hardware.
-  2. Run preflight checks before modifying the system.
-  3. Install only required packages; no general apt upgrade is performed.
+  1. Validate the Ubuntu 24.04 LTS OS family and Protectli V1210 hardware.
+  2. Record the manufacturer-delivered OS/package state before modification.
+  3. Install only missing required packages; no general apt upgrade is performed.
   4. Verify SSH, TUN, Snap, Domotz, and required Domotz permissions.
   5. Configure UFW with inbound TCP 22 and TCP 3000 globally permitted on the Agent host firewall.
   6. Stage Netplan with eth0 as the RMM network interface and eth1 disabled.
@@ -366,10 +395,14 @@ preflight_checks() {
   [[ "${ID:-}" == "${SUPPORTED_OS_ID}" ]] || \
     error_exit "Unsupported OS ID '${ID:-unknown}'. Expected ${SUPPORTED_OS_ID}."
   [[ "${VERSION_ID:-}" == "${SUPPORTED_UBUNTU_VERSION_ID}" ]] || \
-    error_exit "Unsupported Ubuntu VERSION_ID '${VERSION_ID:-unknown}'. Expected ${SUPPORTED_UBUNTU_VERSION_ID}."
-  [[ "${VERSION:-}" == *"${SUPPORTED_UBUNTU_PRETTY_FRAGMENT}"* ]] || \
-    error_exit "Unsupported Ubuntu point release '${VERSION:-unknown}'. Approved build image is Ubuntu ${SUPPORTED_UBUNTU_POINT_RELEASE} LTS."
-  progress_message "Ubuntu ${SUPPORTED_UBUNTU_POINT_RELEASE} LTS build-image baseline verified."
+    error_exit "Unsupported Ubuntu VERSION_ID '${VERSION_ID:-unknown}'. Expected the Ubuntu ${SUPPORTED_UBUNTU_VERSION_ID} LTS family."
+
+  if [[ -n "${VERSION_CODENAME:-}" && "${VERSION_CODENAME}" != "${SUPPORTED_UBUNTU_CODENAME}" ]]; then
+    error_exit "Unsupported Ubuntu codename '${VERSION_CODENAME}'. Expected ${SUPPORTED_UBUNTU_CODENAME}."
+  fi
+
+  progress_message "Ubuntu ${SUPPORTED_UBUNTU_VERSION_ID} LTS OS family verified."
+  progress_message "Detected runtime release: ${PRETTY_NAME:-${VERSION:-unknown}}"
   cp -a /etc/os-release "${OS_BASELINE_FILE}"
   chmod 640 "${OS_BASELINE_FILE}"
 
@@ -427,73 +460,198 @@ preflight_checks() {
   fi
 }
 
+capture_manufacturer_baseline() {
+  CURRENT_STEP="1A - Capture manufacturer-delivered baseline"
+  echo "------------------------------------------------------------"
+  echo "Step 1A: Capture manufacturer-delivered baseline"
+  echo "------------------------------------------------------------"
+
+  progress_message "Recording manufacturer-delivered system state before package modification."
+
+  # Preserve the first manufacturer baseline across retries/reruns. Once the
+  # baseline exists, validate its checksum rather than replacing it with an
+  # already-modified system state.
+  if [[ -s "${MANUFACTURER_BASELINE_FILE}" && \
+        -s "${MANUFACTURER_PACKAGE_BASELINE_FILE}" && \
+        -s "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" ]]; then
+    if [[ ! -s "${MANUFACTURER_BASELINE_SHA256_FILE}" ]]; then
+      sha256sum \
+        "${MANUFACTURER_BASELINE_FILE}" \
+        "${MANUFACTURER_PACKAGE_BASELINE_FILE}" \
+        "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" \
+        > "${MANUFACTURER_BASELINE_SHA256_FILE}"
+      chmod 640 "${MANUFACTURER_BASELINE_SHA256_FILE}"
+      warning_message "Existing manufacturer baseline had no checksum record; checksum created without replacing the preserved baseline."
+    fi
+
+    if ! sha256sum -c "${MANUFACTURER_BASELINE_SHA256_FILE}" >/dev/null 2>&1; then
+      error_exit "Existing manufacturer baseline integrity validation failed. Do not overwrite the original baseline; investigate ${STATE_DIR}."
+    fi
+
+    progress_message "Existing manufacturer baseline is intact and will be preserved."
+    return 0
+  fi
+
+  # If a partial prior baseline exists, preserve it for investigation before
+  # creating a complete baseline set.
+  local partial_backup_dir=""
+  if [[ -e "${MANUFACTURER_BASELINE_FILE}" || \
+        -e "${MANUFACTURER_PACKAGE_BASELINE_FILE}" || \
+        -e "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" || \
+        -e "${MANUFACTURER_BASELINE_SHA256_FILE}" ]]; then
+    partial_backup_dir="${STATE_DIR}/manufacturer-baseline-partial-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "${partial_backup_dir}"
+    for existing in \
+      "${MANUFACTURER_BASELINE_FILE}" \
+      "${MANUFACTURER_PACKAGE_BASELINE_FILE}" \
+      "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" \
+      "${MANUFACTURER_BASELINE_SHA256_FILE}"; do
+      [[ -e "${existing}" ]] && cp -a "${existing}" "${partial_backup_dir}/"
+    done
+    warning_message "Partial manufacturer baseline records were preserved at ${partial_backup_dir} before recapture."
+  fi
+
+  {
+    echo "Solutionz RMM Manufacturer Baseline"
+    echo "Revision: ${REVISION}"
+    echo "Captured UTC: $(date -u +%FT%TZ)"
+    echo
+    echo "===== Operating System ====="
+    cat /etc/os-release 2>/dev/null || true
+    echo "Kernel: $(uname -r)"
+    echo "Architecture: $(uname -m)"
+    echo
+    echo "===== Protectli / DMI ====="
+    for field in sys_vendor product_name product_version board_name board_vendor bios_vendor bios_version bios_date; do
+      path="/sys/class/dmi/id/${field}"
+      if [[ -r "${path}" ]]; then
+        printf '%s: %s\n' "${field}" "$(tr -d '\0' < "${path}" | xargs)"
+      fi
+    done
+    echo
+    echo "===== Storage ====="
+    lsblk -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL 2>/dev/null || true
+    echo
+    echo "===== Network Interfaces ====="
+    ip -br link 2>/dev/null || true
+    ip -br addr 2>/dev/null || true
+    ip route 2>/dev/null || true
+    echo
+    echo "===== Snap Inventory ====="
+    if command -v snap >/dev/null 2>&1; then
+      snap list 2>/dev/null || true
+    else
+      echo "snap command not present at manufacturer-baseline capture"
+    fi
+  } > "${MANUFACTURER_BASELINE_FILE}"
+  chmod 640 "${MANUFACTURER_BASELINE_FILE}"
+
+  # Record every dpkg package exactly as received before this setup script
+  # performs apt-get update or installs anything.
+  dpkg-query -W -f='${Package}\t${Version}\t${db:Status-Abbrev}\n' 2>/dev/null \
+    | LC_ALL=C sort > "${MANUFACTURER_PACKAGE_BASELINE_FILE}"
+  chmod 640 "${MANUFACTURER_PACKAGE_BASELINE_FILE}"
+
+  local installed_count=0
+  local missing_count=0
+  local pkg version
+  {
+    echo "Solutionz RMM Manufacturer Required-Package Validation"
+    echo "Revision: ${REVISION}"
+    echo "Captured UTC: $(date -u +%FT%TZ)"
+    echo "Supported OS family: Ubuntu ${SUPPORTED_UBUNTU_VERSION_ID} LTS"
+    echo
+    for pkg in "${REQUIRED_PACKAGES[@]}"; do
+      if dpkg-query -W -f='${db:Status-Abbrev}' "${pkg}" 2>/dev/null | grep -q '^ii'; then
+        version="$(dpkg-query -W -f='${Version}' "${pkg}" 2>/dev/null || true)"
+        printf 'PASS\t%s\t%s\n' "${pkg}" "${version:-unknown}"
+        installed_count=$((installed_count + 1))
+      else
+        printf 'MISSING\t%s\t-\n' "${pkg}"
+        missing_count=$((missing_count + 1))
+      fi
+    done
+    echo
+    echo "installed_required_packages=${installed_count}"
+    echo "missing_required_packages=${missing_count}"
+    if (( missing_count == 0 )); then
+      echo "manufacturer_package_validation=PASS"
+    else
+      echo "manufacturer_package_validation=DEVIATION"
+    fi
+  } > "${MANUFACTURER_PACKAGE_VALIDATION_FILE}"
+  chmod 640 "${MANUFACTURER_PACKAGE_VALIDATION_FILE}"
+
+  sha256sum \
+    "${MANUFACTURER_BASELINE_FILE}" \
+    "${MANUFACTURER_PACKAGE_BASELINE_FILE}" \
+    "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" \
+    > "${MANUFACTURER_BASELINE_SHA256_FILE}"
+  chmod 640 "${MANUFACTURER_BASELINE_SHA256_FILE}"
+
+  if ! sha256sum -c "${MANUFACTURER_BASELINE_SHA256_FILE}" >/dev/null 2>&1; then
+    error_exit "Manufacturer baseline checksum validation failed immediately after capture."
+  fi
+
+  if (( missing_count == 0 )); then
+    progress_message "Manufacturer package validation passed: all required packages were already present."
+  else
+    warning_message "Manufacturer package validation found ${missing_count} missing required package(s). The deviation is recorded; the setup script will install only the missing packages."
+  fi
+
+  progress_message "Manufacturer baseline: ${MANUFACTURER_BASELINE_FILE}"
+  progress_message "Manufacturer package inventory: ${MANUFACTURER_PACKAGE_BASELINE_FILE}"
+  progress_message "Manufacturer package validation: ${MANUFACTURER_PACKAGE_VALIDATION_FILE}"
+  progress_message "Manufacturer baseline checksums: ${MANUFACTURER_BASELINE_SHA256_FILE}"
+}
+
 install_required_packages() {
-  step_message 2 "Install required packages without a general system upgrade"
+  step_message 2 "Validate/install missing required packages without a general system upgrade"
 
   export DEBIAN_FRONTEND=noninteractive
   export NEEDRESTART_MODE=a
 
-  progress_message "Updating package indexes..."
-  if ! apt-get update; then
-    error_exit "apt-get update failed. Review ${LOG_FILE} for repository, DNS, or network errors."
+  local -a missing_packages=()
+  local pkg
+  for pkg in "${REQUIRED_PACKAGES[@]}"; do
+    if ! dpkg-query -W -f='${db:Status-Abbrev}' "${pkg}" 2>/dev/null | grep -q '^ii'; then
+      missing_packages+=("${pkg}")
+    fi
+  done
+
+  if (( ${#missing_packages[@]} == 0 )); then
+    progress_message "All required packages were supplied by the manufacturer; apt package installation is not required."
+  else
+    warning_message "${#missing_packages[@]} required package(s) are missing from the manufacturer baseline: ${missing_packages[*]}"
+    progress_message "Updating package indexes only because required packages are missing..."
+    if ! apt-get update; then
+      error_exit "apt-get update failed. Review ${LOG_FILE} for repository, DNS, or network errors."
+    fi
+    progress_message "Package index update completed successfully."
+
+    progress_message "Installing only the missing approved package(s)..."
+    if ! apt-get install -y --no-install-recommends "${missing_packages[@]}"; then
+      error_exit "Required package installation failed. Review ${LOG_FILE} for the package that failed and the apt/dpkg error."
+    fi
+    progress_message "Missing required package installation completed successfully."
   fi
-  progress_message "Package index update completed successfully."
 
-  local packages=(
-    net-tools
-    openvswitch-switch
-    traceroute
-    dnsutils
-    curl
-    openssl
-    netcat-openbsd
-    nano
-    iputils-ping
-    ufw
-    snapd
-    openssh-server
-    sudo
-    python3
-    python3-pip
-    python3-requests
-    python3-psutil
-    python3-urllib3
-  )
-
-  # openvswitch-switch is retained from the established Solutionz RMM baseline.
-  # Its long-term dependency should remain documented/revalidated as the platform evolves.
-  progress_message "Installing approved dependency set..."
-  if ! apt-get install -y --no-install-recommends "${packages[@]}"; then
-    error_exit "Required package installation failed. Review ${LOG_FILE} for the package that failed and the apt/dpkg error."
-  fi
-  progress_message "Required package installation completed successfully."
-
-  progress_message "Recording installed package versions..."
+  progress_message "Recording final required-package versions after setup package handling..."
   : > "${BASELINE_FILE}"
-  for pkg in "${packages[@]}"; do
-    dpkg-query -W -f='${Package}\t${Version}\n' "${pkg}" >> "${BASELINE_FILE}"
+  for pkg in "${REQUIRED_PACKAGES[@]}"; do
+    if ! dpkg-query -W -f='${Package}\t${Version}\n' "${pkg}" >> "${BASELINE_FILE}" 2>/dev/null; then
+      error_exit "Required package ${pkg} is still missing after package handling."
+    fi
   done
   chmod 640 "${BASELINE_FILE}"
 }
 
 verify_required_packages() {
-  step_message 3 "Verify required packages"
-
-  local required=(
-    nano
-    iputils-ping
-    ufw
-    openssh-server
-    snapd
-    python3
-    python3-requests
-    python3-psutil
-    python3-urllib3
-  )
+  step_message 3 "Verify final required-package state"
 
   local pkg
-  for pkg in "${required[@]}"; do
-    dpkg -s "${pkg}" >/dev/null 2>&1 || error_exit "Required package missing after installation: ${pkg}"
+  for pkg in "${REQUIRED_PACKAGES[@]}"; do
+    dpkg -s "${pkg}" >/dev/null 2>&1 || error_exit "Required package missing after setup package handling: ${pkg}"
     progress_message "Verified: ${pkg}"
   done
 
@@ -1336,13 +1494,17 @@ set -uo pipefail
 REVISION="5091126"
 SUPPORTED_OS_ID="ubuntu"
 SUPPORTED_UBUNTU_VERSION_ID="24.04"
-SUPPORTED_UBUNTU_PRETTY_FRAGMENT="24.04.3 LTS"
+SUPPORTED_UBUNTU_CODENAME="noble"
 SUPPORTED_VENDOR="Protectli"
 SUPPORTED_MODEL="V1210"
 
 STATE_FILE="/var/lib/rswsolutionz-rmm/install.state"
 PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/package-baseline-5091126.tsv"
 OS_BASELINE_FILE="/var/lib/rswsolutionz-rmm/os-baseline-5091126.txt"
+MANUFACTURER_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126.txt"
+MANUFACTURER_PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-packages-5091126.tsv"
+MANUFACTURER_PACKAGE_VALIDATION_FILE="/var/lib/rswsolutionz-rmm/manufacturer-package-validation-5091126.txt"
+MANUFACTURER_BASELINE_SHA256_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126.sha256"
 SNAP_BASELINE_FILE="/var/lib/rswsolutionz-rmm/snap-baseline-5091126.txt"
 LOG_DIR="/var/log/solutionz-rmm/setup"
 LOG_FILE="${LOG_DIR}/postreboot-validation.log"
@@ -1361,6 +1523,27 @@ ROLLBACK_DIR="/opt/solutionz-rmm/backups"
 LOCAL_CONFIG_TOOL="/usr/local/sbin/solutionz-rmm-local-config"
 NETPLAN_FILE="/etc/netplan/00-installer-config.yaml"
 GRUB_FILE="/etc/default/grub"
+
+REQUIRED_PACKAGES=(
+  net-tools
+  openvswitch-switch
+  traceroute
+  dnsutils
+  curl
+  openssl
+  netcat-openbsd
+  nano
+  iputils-ping
+  ufw
+  snapd
+  openssh-server
+  sudo
+  python3
+  python3-pip
+  python3-requests
+  python3-psutil
+  python3-urllib3
+)
 
 mkdir -p "${LOG_DIR}"
 exec >> "${LOG_FILE}" 2>&1
@@ -1413,7 +1596,11 @@ if [[ -r /etc/os-release ]]; then
   . /etc/os-release
   [[ "${ID:-}" == "${SUPPORTED_OS_ID}" ]] && pass "Operating system is Ubuntu." || fail "Operating system ID is ${ID:-unknown}; expected Ubuntu."
   [[ "${VERSION_ID:-}" == "${SUPPORTED_UBUNTU_VERSION_ID}" ]] && pass "Ubuntu LTS family is ${SUPPORTED_UBUNTU_VERSION_ID}." || fail "Ubuntu VERSION_ID is ${VERSION_ID:-unknown}; expected ${SUPPORTED_UBUNTU_VERSION_ID}."
-  [[ "${VERSION:-}" == *"${SUPPORTED_UBUNTU_PRETTY_FRAGMENT}"* ]] && pass "Ubuntu 24.04.3 LTS build-image baseline is present." || fail "Ubuntu point-release baseline is ${VERSION:-unknown}; expected 24.04.3 LTS for this production build."
+  if [[ -n "${VERSION_CODENAME:-}" && "${VERSION_CODENAME}" != "${SUPPORTED_UBUNTU_CODENAME}" ]]; then
+    fail "Ubuntu codename is ${VERSION_CODENAME}; expected ${SUPPORTED_UBUNTU_CODENAME}."
+  else
+    pass "Ubuntu runtime release is supported: ${PRETTY_NAME:-${VERSION:-unknown}}"
+  fi
 else
   fail "/etc/os-release is unavailable."
 fi
@@ -1424,9 +1611,37 @@ model="$(cat /sys/class/dmi/id/product_name 2>/dev/null | xargs || true)"
 [[ "${model}" == "${SUPPORTED_MODEL}" ]] && pass "Hardware model is V1210." || fail "Hardware model is ${model:-unknown}; expected V1210."
 
 [[ "$(state_value revision)" == "${REVISION}" ]] && pass "State-file revision matches ${REVISION}." || fail "State-file revision does not match ${REVISION}."
-[[ -s "${PACKAGE_BASELINE_FILE}" ]] && pass "Package baseline record exists." || fail "Package baseline record is missing."
-[[ -s "${OS_BASELINE_FILE}" ]] && pass "Original OS build-image baseline record exists." || fail "Original OS build-image baseline record is missing."
+[[ -s "${PACKAGE_BASELINE_FILE}" ]] && pass "Final required-package baseline record exists." || fail "Final required-package baseline record is missing."
+[[ -s "${OS_BASELINE_FILE}" ]] && pass "Initial OS runtime baseline record exists." || fail "Initial OS runtime baseline record is missing."
+[[ -s "${MANUFACTURER_BASELINE_FILE}" ]] && pass "Manufacturer system baseline record exists." || fail "Manufacturer system baseline record is missing."
+[[ -s "${MANUFACTURER_PACKAGE_BASELINE_FILE}" ]] && pass "Manufacturer package inventory exists." || fail "Manufacturer package inventory is missing."
+[[ -s "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" ]] && pass "Manufacturer required-package validation exists." || fail "Manufacturer required-package validation is missing."
+[[ -s "${MANUFACTURER_BASELINE_SHA256_FILE}" ]] && pass "Manufacturer baseline checksum record exists." || fail "Manufacturer baseline checksum record is missing."
+if [[ -s "${MANUFACTURER_BASELINE_SHA256_FILE}" ]]; then
+  if sha256sum -c "${MANUFACTURER_BASELINE_SHA256_FILE}" >/dev/null 2>&1; then
+    pass "Manufacturer baseline integrity validation passed."
+  else
+    fail "Manufacturer baseline integrity validation failed."
+  fi
+fi
+if [[ -s "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" ]]; then
+  if grep -q '^manufacturer_package_validation=PASS$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}"; then
+    pass "Manufacturer-delivered required-package set was complete at baseline capture."
+  elif grep -q '^manufacturer_package_validation=DEVIATION$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}"; then
+    warn "Manufacturer-delivered package baseline had one or more missing required packages; the original deviation is preserved in the baseline report."
+  else
+    fail "Manufacturer required-package validation record does not contain a recognized PASS/DEVIATION result."
+  fi
+fi
 [[ -s "${SNAP_BASELINE_FILE}" ]] && pass "Domotz Snap audit record exists." || fail "Domotz Snap audit record is missing."
+
+for pkg in "${REQUIRED_PACKAGES[@]}"; do
+  if dpkg-query -W -f='${db:Status-Abbrev}' "${pkg}" 2>/dev/null | grep -q '^ii'; then
+    pass "Final required package installed: ${pkg}"
+  else
+    fail "Final required package missing: ${pkg}"
+  fi
+done
 
 # Network baseline
 check "eth0 exists" ip link show eth0
@@ -1624,8 +1839,8 @@ final_summary_check() {
   echo "FINAL PRE-REBOOT VALIDATION - REVISION ${REVISION}"
   echo "============================================================"
 
-  check_final_requirement "Ubuntu ${SUPPORTED_UBUNTU_POINT_RELEASE} LTS build-image baseline" \
-    bash -c ". /etc/os-release; [[ \"\$ID\" == ubuntu && \"\$VERSION_ID\" == ${SUPPORTED_UBUNTU_VERSION_ID} && \"\$VERSION\" == *\"${SUPPORTED_UBUNTU_PRETTY_FRAGMENT}\"* ]]" || failures=$((failures + 1))
+  check_final_requirement "Ubuntu ${SUPPORTED_UBUNTU_VERSION_ID} LTS OS family" \
+    bash -c ". /etc/os-release; [[ \"\$ID\" == ubuntu && \"\$VERSION_ID\" == ${SUPPORTED_UBUNTU_VERSION_ID} && ( -z \"\${VERSION_CODENAME:-}\" || \"\$VERSION_CODENAME\" == ${SUPPORTED_UBUNTU_CODENAME} ) ]]" || failures=$((failures + 1))
 
   check_final_requirement "V1210 ttyS0 serial device present" test -c "${SERIAL_DEVICE}" || failures=$((failures + 1))
   check_final_requirement "serial getty active" systemctl is-active --quiet "${SERIAL_SERVICE}" || failures=$((failures + 1))
@@ -1638,7 +1853,19 @@ final_summary_check() {
   check_final_requirement "DNS resolves api.snapcraft.io to IPv4" dns_resolves_ipv4 api.snapcraft.io || failures=$((failures + 1))
   check_final_requirement "DNS resolves archive.ubuntu.com to IPv4" dns_resolves_ipv4 archive.ubuntu.com || failures=$((failures + 1))
   check_final_requirement "NTP synchronization active" bash -c "[[ \"$(timedatectl show -p NTPSynchronized --value 2>/dev/null)\" == yes ]]" || failures=$((failures + 1))
-  check_final_requirement "OS build-image baseline record exists" test -s "${OS_BASELINE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Initial OS runtime baseline record exists" test -s "${OS_BASELINE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer system baseline record exists" test -s "${MANUFACTURER_BASELINE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer package inventory exists" test -s "${MANUFACTURER_PACKAGE_BASELINE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer required-package validation exists" test -s "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer baseline checksum record exists" test -s "${MANUFACTURER_BASELINE_SHA256_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer baseline integrity is valid" \
+    sha256sum -c "${MANUFACTURER_BASELINE_SHA256_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer package validation has a recognized result" \
+    grep -Eq '^manufacturer_package_validation=(PASS|DEVIATION)$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" || failures=$((failures + 1))
+  if grep -q '^manufacturer_package_validation=DEVIATION$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" 2>/dev/null; then
+    warning_message "Manufacturer package baseline contained a recorded deviation. Final required-package state is validated separately and must pass."
+  fi
+  check_final_requirement "Final required-package baseline record exists" test -s "${BASELINE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Network requirements record exists" test -s "${NETWORK_REQUIREMENTS_FILE}" || failures=$((failures + 1))
   check_final_requirement "Netplan generates successfully" netplan generate || failures=$((failures + 1))
   check_final_requirement "Domotz installed" snap list "${DOMOTZ_SNAP_NAME}" || failures=$((failures + 1))
@@ -1688,6 +1915,7 @@ main() {
 
   prompt_confirmation
   preflight_checks
+  capture_manufacturer_baseline
   install_required_packages
   verify_required_packages
   verify_ssh_service

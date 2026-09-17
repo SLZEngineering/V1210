@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+###############################################################################
+# Script: rswsolutionz_rmm_collector_check_5091126.sh
+# Company: Solutionz INC / RSW
+# Revision: 5091126
+# Purpose:
+#   Read-only health validation of the Solutionz RMM / Domotz collector
+#   appliance built by rswsolutionz_domotz_setup_rev5091126.sh.
+#
+# Important:
+#   - "Collector" in this script means the Domotz Network Collector running on
+#     the Solutionz RMM Agent. It does NOT refer to the removed Crestron
+#     4-Series RMM Collector.
+#   - No packages are installed and no configuration is changed.
+#   - Domotz is intentionally not revision-pinned. Current version/revision is
+#     reported for audit, not compared to a fixed approved revision.
+###############################################################################
+
+REVISION="5091126"
+SCRIPT_NAME="rswsolutionz_rmm_collector_check_5091126.sh"
+SETUP_SCRIPT="rswsolutionz_domotz_setup_rev5091126.sh"
+DOMOTZ_SNAP_NAME="domotzpro-agent-publicstore"
+STATE_DIR="/var/lib/rswsolutionz-rmm"
+STATE_FILE="${STATE_DIR}/install.state"
+SNAP_BASELINE_FILE="${STATE_DIR}/snap-baseline-${REVISION}.txt"
+NETWORK_REQUIREMENTS_FILE="${STATE_DIR}/network-requirements-${REVISION}.txt"
+LOG_DIR="/var/log/solutionz-rmm/checks/collector"
+RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+LOG_FILE="${LOG_DIR}/collector-check-${REVISION}-${RUN_TIMESTAMP}.log"
+LATEST_LOG="${LOG_DIR}/latest.log"
+RESULT_DIR="${STATE_DIR}/check-results"
+RESULT_FILE="${RESULT_DIR}/collector-check-${REVISION}.result"
+
+REQUIRED_DOMOTZ_PERMISSIONS=(
+  firewall-control
+  network-observe
+  raw-usb
+  shutdown
+  system-observe
+)
+
+PASS_COUNT=0
+WARN_COUNT=0
+FAIL_COUNT=0
+
+pass() { echo "PASS - $*"; PASS_COUNT=$((PASS_COUNT + 1)); }
+warn() { echo "WARN - $*"; WARN_COUNT=$((WARN_COUNT + 1)); }
+fail() { echo "FAIL - $*"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
+
+section() {
+  echo
+  echo "==============================================================================="
+  echo "$*"
+  echo "==============================================================================="
+}
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "ERROR: Run this script with sudo or as root." >&2
+    exit 2
+  fi
+}
+
+init_logging() {
+  install -d -m 750 "${LOG_DIR}" "${RESULT_DIR}"
+  touch "${LOG_FILE}"
+  chmod 640 "${LOG_FILE}"
+  ln -sfn "$(basename "${LOG_FILE}")" "${LATEST_LOG}"
+  exec > >(tee -a "${LOG_FILE}") 2>&1
+}
+
+state_value() {
+  local key="$1"
+  awk -F= -v key="${key}" '$1 == key {print substr($0, index($0,"=")+1); exit}' "${STATE_FILE}" 2>/dev/null || true
+}
+
+check_build_state() {
+  section "BUILD STATE"
+
+  if [[ ! -s "${STATE_FILE}" ]]; then
+    fail "Setup state file is missing: ${STATE_FILE}"
+    return
+  fi
+
+  local status revision script
+  status="$(head -n1 "${STATE_FILE}" 2>/dev/null || true)"
+  revision="$(state_value revision)"
+  script="$(state_value script)"
+
+  echo "State: ${status:-unknown}"
+  echo "Recorded revision: ${revision:-not-recorded}"
+  echo "Recorded setup script: ${script:-not-recorded}"
+
+  [[ "${revision}" == "${REVISION}" ]] \
+    && pass "Build-state revision matches ${REVISION}." \
+    || fail "Build-state revision '${revision:-missing}' does not match ${REVISION}."
+
+  if [[ -n "${script}" && "${script}" != "${SETUP_SCRIPT}" ]]; then
+    warn "State file references '${script}', while the current baseline setup filename is '${SETUP_SCRIPT}'."
+  else
+    pass "Build state references the current setup baseline."
+  fi
+
+  case "${status}" in
+    phase2_system_validated)
+      pass "Post-reboot production validation passed."
+      ;;
+    phase1_complete)
+      warn "Phase 1 is complete, but post-reboot validation has not yet recorded phase2_system_validated."
+      ;;
+    phase1_failed|phase2_validation_failed)
+      fail "Build state reports ${status}."
+      ;;
+    *)
+      warn "Unrecognized build state: ${status:-empty}."
+      ;;
+  esac
+
+  [[ -s "${NETWORK_REQUIREMENTS_FILE}" ]] \
+    && pass "Revision ${REVISION} network-requirements record exists." \
+    || fail "Network-requirements record is missing: ${NETWORK_REQUIREMENTS_FILE}"
+}
+
+check_snap_platform() {
+  section "SNAP / DOMOTZ COLLECTOR INSTALLATION"
+
+  if ! command -v snap >/dev/null 2>&1; then
+    fail "snap command is unavailable."
+    return
+  fi
+
+  systemctl is-active --quiet snapd.service \
+    && pass "snapd service is active." \
+    || fail "snapd service is not active."
+
+  systemctl is-active --quiet snapd.socket \
+    && pass "snapd socket is active." \
+    || fail "snapd socket is not active."
+
+  if snap list "${DOMOTZ_SNAP_NAME}" >/dev/null 2>&1; then
+    pass "Domotz Network Collector Snap is installed."
+    echo
+    snap list "${DOMOTZ_SNAP_NAME}" || true
+  else
+    fail "Domotz Network Collector Snap is not installed: ${DOMOTZ_SNAP_NAME}"
+    return
+  fi
+
+  if [[ -s "${SNAP_BASELINE_FILE}" ]]; then
+    pass "Domotz installation audit record exists: ${SNAP_BASELINE_FILE}"
+    echo "Recorded at setup:"
+    cat "${SNAP_BASELINE_FILE}" || true
+  else
+    fail "Domotz installation audit record is missing: ${SNAP_BASELINE_FILE}"
+  fi
+
+  echo
+  echo "Current Snap tracking information:"
+  snap info "${DOMOTZ_SNAP_NAME}" 2>/dev/null | sed -n '1,45p' || warn "Unable to read snap info for ${DOMOTZ_SNAP_NAME}."
+}
+
+check_domotz_services() {
+  section "DOMOTZ COLLECTOR SERVICES"
+
+  local service_lines
+  service_lines="$(snap services "${DOMOTZ_SNAP_NAME}" 2>/dev/null | awk -v p="${DOMOTZ_SNAP_NAME}." '$1 ~ "^" p {print}' || true)"
+
+  if [[ -z "${service_lines}" ]]; then
+    fail "No Domotz Snap services were reported by 'snap services'."
+    return
+  fi
+
+  echo "${service_lines}"
+  echo
+
+  local name startup current notes service_count=0
+  while read -r name startup current notes; do
+    [[ -z "${name}" ]] && continue
+    service_count=$((service_count + 1))
+
+    if [[ "${current}" == "active" ]]; then
+      pass "Domotz service ${name} is active."
+    else
+      fail "Domotz service ${name} is '${current:-unknown}'."
+    fi
+
+    if [[ "${startup}" == "enabled" ]]; then
+      pass "Domotz service ${name} is enabled for startup."
+    else
+      warn "Domotz service ${name} startup state is '${startup:-unknown}'."
+    fi
+  done <<< "${service_lines}"
+
+  (( service_count > 0 )) || fail "Domotz service list could not be parsed."
+}
+
+check_domotz_permissions() {
+  section "DOMOTZ SNAP PERMISSIONS"
+
+  local permission
+  for permission in "${REQUIRED_DOMOTZ_PERMISSIONS[@]}"; do
+    if snap connections "${DOMOTZ_SNAP_NAME}" 2>/dev/null | awk -v p="${permission}" '
+      $1 == p && $3 != "-" {found=1}
+      END {exit found ? 0 : 1}
+    '; then
+      pass "Required Domotz permission ${permission} is connected."
+    else
+      fail "Required Domotz permission ${permission} is not connected."
+    fi
+  done
+}
+
+check_runtime_prerequisites() {
+  section "LOCAL COLLECTOR RUNTIME"
+
+  if [[ -c /dev/net/tun ]]; then
+    pass "TUN device is available."
+  else
+    fail "TUN device is unavailable."
+  fi
+
+  if grep -qxF 'tun' /etc/modules 2>/dev/null; then
+    pass "TUN module is configured for persistence."
+  else
+    fail "TUN module is not recorded in /etc/modules."
+  fi
+
+  if ss -lnt 2>/dev/null | awk '$4 ~ /:3000$/ {found=1} END {exit found ? 0 : 1}'; then
+    pass "TCP 3000 is listening locally."
+
+    if command -v curl >/dev/null 2>&1; then
+      local http_code
+      http_code="$(curl -sS --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/ 2>/dev/null || true)"
+      if [[ "${http_code}" =~ ^[1-4][0-9][0-9]$ ]]; then
+        pass "Local Domotz HTTP service responded on 127.0.0.1:3000 (HTTP ${http_code})."
+      else
+        warn "TCP 3000 is listening, but the local HTTP request did not return a normal HTTP response (code '${http_code:-none}')."
+      fi
+    fi
+  else
+    warn "TCP 3000 is not currently listening. The Domotz collector may still require activation or service-state review."
+  fi
+}
+
+check_removed_legacy_collector() {
+  section "LEGACY CRESTRON COLLECTOR ARTIFACTS"
+
+  local found=0
+  local legacy_paths=(
+    /opt/solutionz-rmm/crestron_4series_xio_style_collector.py
+    /opt/solutionz-rmm/crestron_4series_rmm_collector.py
+    /usr/local/bin/solutionz-rmm-collector
+    /etc/sudoers.d/solutionz-rmm-collector
+  )
+
+  local path
+  for path in "${legacy_paths[@]}"; do
+    if [[ -e "${path}" || -L "${path}" ]]; then
+      warn "Legacy removed collector artifact is still present: ${path}"
+      found=1
+    fi
+  done
+
+  if (( found == 0 )); then
+    pass "No removed Crestron collector artifacts were detected."
+  else
+    warn "Revision ${REVISION} no longer deploys the Crestron 4-Series collector. Existing artifacts are not used by this check and should be reviewed before production cleanup."
+  fi
+}
+
+write_result() {
+  local result="PASS"
+  (( FAIL_COUNT > 0 )) && result="FAIL"
+
+  {
+    echo "result=${result}"
+    echo "revision=${REVISION}"
+    echo "script=${SCRIPT_NAME}"
+    echo "timestamp_utc=$(date -u +%FT%TZ)"
+    echo "passes=${PASS_COUNT}"
+    echo "warnings=${WARN_COUNT}"
+    echo "failures=${FAIL_COUNT}"
+    echo "log=${LOG_FILE}"
+  } > "${RESULT_FILE}"
+  chmod 640 "${RESULT_FILE}"
+}
+
+summary() {
+  section "COLLECTOR HEALTH SUMMARY"
+  echo "Revision: ${REVISION}"
+  echo "PASS: ${PASS_COUNT}"
+  echo "WARN: ${WARN_COUNT}"
+  echo "FAIL: ${FAIL_COUNT}"
+  echo "Log: ${LOG_FILE}"
+  echo "Result file: ${RESULT_FILE}"
+  echo "Domotz revision policy: current/stable Snap release; revision is reported, not pinned."
+
+  write_result
+
+  if (( FAIL_COUNT == 0 )); then
+    echo "RESULT: PASS"
+    return 0
+  fi
+
+  echo "RESULT: FAIL"
+  return 1
+}
+
+main() {
+  require_root
+  init_logging
+
+  echo "Solutionz RMM Collector Health Check"
+  echo "Revision: ${REVISION}"
+  echo "Compatible setup: ${SETUP_SCRIPT}"
+  echo "Time: $(date -u +%FT%TZ)"
+  echo "Host: $(hostname)"
+
+  check_build_state
+  check_snap_platform
+  check_domotz_services
+  check_domotz_permissions
+  check_runtime_prerequisites
+  check_removed_legacy_collector
+  summary
+}
+
+main "$@"

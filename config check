@@ -1,0 +1,558 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+###############################################################################
+# Script: rswsolutionz_rmm_config_check_5091126.sh
+# Company: Solutionz INC / RSW
+# Revision: 5091126
+# Purpose:
+#   Read-only compliance/configuration validation for a Protectli V1210 built
+#   with rswsolutionz_domotz_setup_rev5091126.sh.
+#
+# Baseline principles:
+#   - Ubuntu 24.04 LTS / Noble is the controlled OS family. 24.04.x point
+#     releases, including 24.04.4 LTS, are supported.
+#   - Manufacturer package state is preserved and validated separately from the
+#     final Solutionz required-package baseline.
+#   - Domotz is not revision-pinned; current revision is reported for audit.
+#   - Crestron 4-Series collector components are not part of this baseline.
+###############################################################################
+
+REVISION="5091126"
+SCRIPT_NAME="rswsolutionz_rmm_config_check_5091126.sh"
+SETUP_SCRIPT="rswsolutionz_domotz_setup_rev5091126.sh"
+SUPPORTED_OS_ID="ubuntu"
+SUPPORTED_UBUNTU_VERSION_ID="24.04"
+SUPPORTED_UBUNTU_CODENAME="noble"
+SUPPORTED_VENDOR="Protectli"
+SUPPORTED_MODEL="V1210"
+DOMOTZ_SNAP_NAME="domotzpro-agent-publicstore"
+
+STATE_DIR="/var/lib/rswsolutionz-rmm"
+STATE_FILE="${STATE_DIR}/install.state"
+PACKAGE_BASELINE_FILE="${STATE_DIR}/package-baseline-${REVISION}.tsv"
+OS_BASELINE_FILE="${STATE_DIR}/os-baseline-${REVISION}.txt"
+MANUFACTURER_BASELINE_FILE="${STATE_DIR}/manufacturer-baseline-${REVISION}.txt"
+MANUFACTURER_PACKAGE_BASELINE_FILE="${STATE_DIR}/manufacturer-packages-${REVISION}.tsv"
+MANUFACTURER_PACKAGE_VALIDATION_FILE="${STATE_DIR}/manufacturer-package-validation-${REVISION}.txt"
+MANUFACTURER_BASELINE_SHA256_FILE="${STATE_DIR}/manufacturer-baseline-${REVISION}.sha256"
+SNAP_BASELINE_FILE="${STATE_DIR}/snap-baseline-${REVISION}.txt"
+NETWORK_REQUIREMENTS_FILE="${STATE_DIR}/network-requirements-${REVISION}.txt"
+
+NETPLAN_FILE="/etc/netplan/00-installer-config.yaml"
+CLOUD_INIT_NETWORK_DISABLE="/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
+RESOLV_FILE="/etc/resolv.conf"
+RESOLV_TARGET="/run/systemd/resolve/resolv.conf"
+GRUB_FILE="/etc/default/grub"
+HOSTS_FILE="/etc/hosts"
+SERIAL_DEVICE="/dev/ttyS0"
+SERIAL_SERVICE="serial-getty@ttyS0.service"
+SERIAL_DROPIN_FILE="/etc/systemd/system/serial-getty@ttyS0.service.d/override.conf"
+LOCAL_CONFIG_TOOL="/usr/local/sbin/solutionz-rmm-local-config"
+POSTREBOOT_VALIDATOR="/usr/local/sbin/rswsolutionz-rmm-postreboot-validate"
+POSTREBOOT_SERVICE="rswsolutionz-rmm-postreboot-validation.service"
+
+LOG_DIR="/var/log/solutionz-rmm/checks/configuration"
+RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+LOG_FILE="${LOG_DIR}/config-check-${REVISION}-${RUN_TIMESTAMP}.log"
+LATEST_LOG="${LOG_DIR}/latest.log"
+RESULT_DIR="${STATE_DIR}/check-results"
+RESULT_FILE="${RESULT_DIR}/config-check-${REVISION}.result"
+
+REQUIRED_PACKAGES=(
+  net-tools
+  openvswitch-switch
+  traceroute
+  dnsutils
+  curl
+  openssl
+  netcat-openbsd
+  nano
+  iputils-ping
+  ufw
+  snapd
+  openssh-server
+  sudo
+  python3
+)
+
+REQUIRED_DOMOTZ_PERMISSIONS=(
+  firewall-control
+  network-observe
+  raw-usb
+  shutdown
+  system-observe
+)
+
+PASS_COUNT=0
+WARN_COUNT=0
+FAIL_COUNT=0
+
+pass() { echo "PASS - $*"; PASS_COUNT=$((PASS_COUNT + 1)); }
+warn() { echo "WARN - $*"; WARN_COUNT=$((WARN_COUNT + 1)); }
+fail() { echo "FAIL - $*"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
+
+section() {
+  echo
+  echo "==============================================================================="
+  echo "$*"
+  echo "==============================================================================="
+}
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "ERROR: Run this script with sudo or as root." >&2
+    exit 2
+  fi
+}
+
+init_logging() {
+  install -d -m 750 "${LOG_DIR}" "${RESULT_DIR}"
+  touch "${LOG_FILE}"
+  chmod 640 "${LOG_FILE}"
+  ln -sfn "$(basename "${LOG_FILE}")" "${LATEST_LOG}"
+  exec > >(tee -a "${LOG_FILE}") 2>&1
+}
+
+state_value() {
+  local key="$1"
+  awk -F= -v key="${key}" '$1 == key {print substr($0, index($0,"=")+1); exit}' "${STATE_FILE}" 2>/dev/null || true
+}
+
+dns_ipv4() {
+  local host="$1"
+  getent ahostsv4 "${host}" 2>/dev/null | awk '{print $1}' | grep -Eq '^[0-9]+(\.[0-9]+){3}$'
+}
+
+check_build_state() {
+  section "SETUP REVISION / BUILD STATE"
+
+  if [[ ! -s "${STATE_FILE}" ]]; then
+    fail "Setup state file is missing: ${STATE_FILE}"
+    return
+  fi
+
+  local status revision script failures warnings
+  status="$(head -n1 "${STATE_FILE}" 2>/dev/null || true)"
+  revision="$(state_value revision)"
+  script="$(state_value script)"
+  failures="$(state_value failures)"
+  warnings="$(state_value warnings)"
+
+  echo "State: ${status:-unknown}"
+  echo "Recorded revision: ${revision:-not-recorded}"
+  echo "Recorded setup script: ${script:-not-recorded}"
+  [[ -n "${failures}" ]] && echo "Recorded validation failures: ${failures}"
+  [[ -n "${warnings}" ]] && echo "Recorded validation warnings: ${warnings}"
+
+  [[ "${revision}" == "${REVISION}" ]] \
+    && pass "State-file revision matches ${REVISION}." \
+    || fail "State-file revision '${revision:-missing}' does not match ${REVISION}."
+
+  if [[ -n "${script}" && "${script}" != "${SETUP_SCRIPT}" ]]; then
+    warn "State file references '${script}', while current baseline setup filename is '${SETUP_SCRIPT}'."
+  else
+    pass "State file references the current setup baseline."
+  fi
+
+  case "${status}" in
+    phase2_system_validated) pass "Post-reboot production validation passed." ;;
+    phase1_complete) warn "Phase 1 is complete, but phase2_system_validated has not yet been recorded." ;;
+    phase1_failed|phase2_validation_failed) fail "Build state reports ${status}." ;;
+    *) warn "Unrecognized build state: ${status:-empty}." ;;
+  esac
+}
+
+check_platform() {
+  section "PLATFORM BASELINE"
+
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    [[ "${ID:-}" == "${SUPPORTED_OS_ID}" ]] \
+      && pass "Operating system is Ubuntu." \
+      || fail "Operating system ID '${ID:-unknown}' is not Ubuntu."
+
+    [[ "${VERSION_ID:-}" == "${SUPPORTED_UBUNTU_VERSION_ID}" ]] \
+      && pass "Ubuntu controlled OS family is ${SUPPORTED_UBUNTU_VERSION_ID} LTS." \
+      || fail "Ubuntu VERSION_ID '${VERSION_ID:-unknown}' is outside the ${SUPPORTED_UBUNTU_VERSION_ID} LTS family."
+
+    if [[ -z "${VERSION_CODENAME:-}" || "${VERSION_CODENAME}" == "${SUPPORTED_UBUNTU_CODENAME}" ]]; then
+      pass "Ubuntu codename is Noble / compatible with the controlled 24.04 LTS family."
+    else
+      fail "Ubuntu codename '${VERSION_CODENAME}' is not '${SUPPORTED_UBUNTU_CODENAME}'."
+    fi
+
+    echo "Runtime release: ${PRETTY_NAME:-${VERSION:-unknown}}"
+  else
+    fail "/etc/os-release is unavailable."
+  fi
+
+  local vendor model arch
+  vendor="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null | xargs || true)"
+  model="$(cat /sys/class/dmi/id/product_name 2>/dev/null | xargs || true)"
+  arch="$(uname -m)"
+
+  [[ "${vendor,,}" == *"${SUPPORTED_VENDOR,,}"* ]] \
+    && pass "Hardware vendor is Protectli." \
+    || fail "Hardware vendor '${vendor:-unknown}' does not match Protectli."
+
+  [[ "${model}" == "${SUPPORTED_MODEL}" ]] \
+    && pass "Hardware model is V1210." \
+    || fail "Hardware model '${model:-unknown}' does not match V1210."
+
+  [[ "${arch}" == "x86_64" ]] \
+    && pass "Architecture is x86_64." \
+    || fail "Architecture is '${arch}', expected x86_64."
+
+  echo "Kernel: $(uname -r)"
+}
+
+check_baseline_records() {
+  section "MANUFACTURER / SOLUTIONZ BASELINE RECORDS"
+
+  local records=(
+    "${OS_BASELINE_FILE}:OS runtime baseline"
+    "${MANUFACTURER_BASELINE_FILE}:Manufacturer system baseline"
+    "${MANUFACTURER_PACKAGE_BASELINE_FILE}:Manufacturer package inventory"
+    "${MANUFACTURER_PACKAGE_VALIDATION_FILE}:Manufacturer package validation"
+    "${MANUFACTURER_BASELINE_SHA256_FILE}:Manufacturer baseline checksum record"
+    "${PACKAGE_BASELINE_FILE}:Final Solutionz required-package baseline"
+    "${SNAP_BASELINE_FILE}:Domotz Snap audit record"
+    "${NETWORK_REQUIREMENTS_FILE}:Network requirements record"
+  )
+
+  local item path description
+  for item in "${records[@]}"; do
+    path="${item%%:*}"
+    description="${item#*:}"
+    [[ -s "${path}" ]] && pass "${description} exists." || fail "${description} is missing: ${path}"
+  done
+
+  if [[ -L "${OS_BASELINE_FILE}" ]]; then
+    fail "OS baseline is a symbolic link; Revision ${REVISION} requires a regular baseline file."
+  elif [[ -f "${OS_BASELINE_FILE}" ]]; then
+    pass "OS baseline is a regular file."
+  fi
+
+  if [[ -s "${MANUFACTURER_BASELINE_SHA256_FILE}" ]]; then
+    if sha256sum -c "${MANUFACTURER_BASELINE_SHA256_FILE}" >/dev/null 2>&1; then
+      pass "Manufacturer baseline integrity checksum passes."
+    else
+      fail "Manufacturer baseline integrity checksum fails."
+    fi
+  fi
+
+  if [[ -s "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" ]]; then
+    if grep -q '^manufacturer_package_validation=PASS$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}"; then
+      pass "Manufacturer supplied every required package at baseline capture."
+    elif grep -q '^manufacturer_package_validation=DEVIATION$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}"; then
+      warn "Manufacturer baseline recorded missing required package(s). Final Solutionz package state must still pass."
+    else
+      fail "Manufacturer package-validation result is not recognized."
+    fi
+  fi
+}
+
+check_required_packages() {
+  section "FINAL REQUIRED PACKAGE STATE"
+
+  local pkg version
+  for pkg in "${REQUIRED_PACKAGES[@]}"; do
+    if dpkg-query -W -f='${db:Status-Abbrev}' "${pkg}" 2>/dev/null | grep -q '^ii'; then
+      version="$(dpkg-query -W -f='${Version}' "${pkg}" 2>/dev/null || true)"
+      pass "Required package installed: ${pkg} ${version:-unknown}."
+    else
+      fail "Required package is missing: ${pkg}."
+    fi
+  done
+}
+
+check_netplan_file() {
+  python3 - "${NETPLAN_FILE}" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+lines = text.splitlines()
+
+if not re.search(r"(?m)^\s*renderer:\s*networkd\s*$", text):
+    raise SystemExit("renderer networkd missing")
+
+def block(name):
+    start = None
+    indent = None
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)" + re.escape(name) + r":\s*$", line)
+        if m:
+            start = i
+            indent = len(m.group(1))
+            break
+    if start is None:
+        raise SystemExit(f"{name} block missing")
+    out = []
+    for line in lines[start + 1:]:
+        if not line.strip():
+            continue
+        current = len(line) - len(line.lstrip())
+        if current <= indent:
+            break
+        out.append(line.strip())
+    return set(out)
+
+eth0 = block("eth0")
+eth1 = block("eth1")
+req0 = {"dhcp4: true", "dhcp6: false", "accept-ra: false"}
+req1 = {"dhcp4: false", "dhcp6: false", "accept-ra: false", "optional: true"}
+
+if not req0.issubset(eth0):
+    raise SystemExit("eth0 baseline values missing")
+if not req1.issubset(eth1):
+    raise SystemExit("eth1 baseline values missing")
+PY
+}
+
+check_network_configuration() {
+  section "NETWORK CONFIGURATION"
+
+  if [[ -s "${NETPLAN_FILE}" ]]; then
+    pass "Solutionz Netplan file exists."
+    if check_netplan_file >/dev/null 2>&1; then
+      pass "Netplan matches Revision ${REVISION}: eth0 DHCP, eth1 disabled/no DHCP."
+    else
+      fail "Netplan does not match the Revision ${REVISION} eth0/eth1 baseline."
+    fi
+  else
+    fail "Netplan file is missing: ${NETPLAN_FILE}"
+  fi
+
+  netplan generate >/dev/null 2>&1 \
+    && pass "Netplan generates successfully." \
+    || fail "Netplan generation failed."
+
+  if [[ -s "${CLOUD_INIT_NETWORK_DISABLE}" ]] && grep -q 'network:.*config: disabled' "${CLOUD_INIT_NETWORK_DISABLE}"; then
+    pass "cloud-init network ownership is disabled."
+  else
+    fail "cloud-init network-disable configuration is missing or incorrect."
+  fi
+
+  ip link show eth0 >/dev/null 2>&1 && pass "eth0 exists." || fail "eth0 is missing."
+  ip link show eth1 >/dev/null 2>&1 && pass "eth1 exists." || fail "eth1 is missing on the V1210."
+
+  local addr defaults
+  addr="$(ip -o -4 addr show dev eth0 scope global 2>/dev/null | awk 'NR==1 {print $4}')"
+  defaults="$(ip -4 route show default 2>/dev/null || true)"
+
+  [[ -n "${addr}" ]] && pass "eth0 has IPv4 address ${addr}." || fail "eth0 has no global IPv4 address."
+  grep -q ' dev eth0 ' <<< "${defaults}" && pass "Default IPv4 route uses eth0." || fail "Default IPv4 route does not use eth0."
+  if grep -q ' dev eth1 ' <<< "${defaults}"; then fail "eth1 has a default route."; else pass "eth1 has no default route."; fi
+
+  systemctl is-active --quiet systemd-resolved \
+    && pass "systemd-resolved is active." \
+    || fail "systemd-resolved is not active."
+
+  if [[ -L "${RESOLV_FILE}" && "$(readlink -f "${RESOLV_FILE}" 2>/dev/null || true)" == "${RESOLV_TARGET}" ]]; then
+    pass "resolv.conf points to ${RESOLV_TARGET}."
+  else
+    fail "resolv.conf does not point to ${RESOLV_TARGET}."
+  fi
+
+  for host in api.snapcraft.io archive.ubuntu.com security.ubuntu.com; do
+    dns_ipv4 "${host}" && pass "DNS resolves ${host} to IPv4." || fail "DNS does not resolve ${host} to IPv4."
+  done
+}
+
+check_ssh_and_firewall() {
+  section "SSH / FIREWALL CONFIGURATION"
+
+  systemctl is-enabled --quiet ssh 2>/dev/null && pass "SSH is enabled." || fail "SSH is not enabled."
+  systemctl is-active --quiet ssh && pass "SSH is active." || fail "SSH is not active."
+  ss -lnt 2>/dev/null | awk '$4 ~ /:22$/ {found=1} END {exit found ? 0 : 1}' \
+    && pass "TCP 22 is listening locally." \
+    || fail "TCP 22 is not listening locally."
+
+  if ufw status | grep -q '^Status: active'; then pass "UFW is active."; else fail "UFW is not active."; fi
+
+  if ufw status verbose | grep -Eq '^Default: deny \(incoming\), allow \(outgoing\)'; then
+    pass "UFW defaults are deny incoming / allow outgoing."
+  else
+    fail "UFW default policy does not match deny incoming / allow outgoing."
+  fi
+
+  ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW' \
+    && pass "UFW globally permits inbound TCP 22." \
+    || fail "Global TCP 22 UFW allowance is missing."
+
+  ufw status | grep -Eq '^3000/tcp[[:space:]]+ALLOW' \
+    && pass "UFW globally permits inbound TCP 3000." \
+    || fail "Global TCP 3000 UFW allowance is missing."
+
+  if ss -lnt 2>/dev/null | awk '$4 ~ /:3000$/ {found=1} END {exit found ? 0 : 1}'; then
+    pass "TCP 3000 is currently listening locally."
+  else
+    warn "TCP 3000 is not currently listening; activation or Domotz service state may need review."
+  fi
+}
+
+check_domotz_configuration() {
+  section "DOMOTZ / SNAP CONFIGURATION"
+
+  systemctl is-active --quiet snapd.service && pass "snapd service is active." || fail "snapd service is not active."
+  systemctl is-active --quiet snapd.socket && pass "snapd socket is active." || fail "snapd socket is not active."
+  [[ -c /dev/net/tun ]] && pass "TUN device is available." || fail "TUN device is unavailable."
+  grep -qxF 'tun' /etc/modules 2>/dev/null && pass "TUN is configured for persistence." || fail "TUN is not recorded in /etc/modules."
+
+  if snap list "${DOMOTZ_SNAP_NAME}" >/dev/null 2>&1; then
+    pass "Domotz Snap is installed."
+    snap list "${DOMOTZ_SNAP_NAME}" || true
+  else
+    fail "Domotz Snap is not installed."
+    return
+  fi
+
+  local permission
+  for permission in "${REQUIRED_DOMOTZ_PERMISSIONS[@]}"; do
+    if snap connections "${DOMOTZ_SNAP_NAME}" 2>/dev/null | awk -v p="${permission}" '$1 == p && $3 != "-" {found=1} END {exit found ? 0 : 1}'; then
+      pass "Domotz permission ${permission} is connected."
+    else
+      fail "Domotz permission ${permission} is not connected."
+    fi
+  done
+
+  if [[ -s "${SNAP_BASELINE_FILE}" ]]; then
+    local recorded current
+    recorded="$(awk 'NR==2 {print $3}' "${SNAP_BASELINE_FILE}" 2>/dev/null || true)"
+    current="$(snap list "${DOMOTZ_SNAP_NAME}" 2>/dev/null | awk 'NR==2 {print $3}')"
+    if [[ -n "${recorded}" && -n "${current}" && "${recorded}" != "${current}" ]]; then
+      warn "Domotz Snap revision changed from setup-recorded ${recorded} to current ${current}. This is allowed because Domotz is not revision-pinned."
+    elif [[ -n "${current}" ]]; then
+      pass "Current Domotz revision ${current} matches the setup audit record or no comparison was needed."
+    fi
+  fi
+}
+
+check_serial_recovery() {
+  section "LOCAL RECOVERY / USB-C COM"
+
+  [[ -c "${SERIAL_DEVICE}" ]] && pass "V1210 serial device ${SERIAL_DEVICE} exists." || fail "V1210 serial device ${SERIAL_DEVICE} is missing."
+  systemctl is-enabled --quiet "${SERIAL_SERVICE}" 2>/dev/null && pass "Serial getty is enabled." || fail "Serial getty is not enabled."
+  systemctl is-active --quiet "${SERIAL_SERVICE}" && pass "Serial getty is active." || fail "Serial getty is not active."
+  pgrep -a agetty 2>/dev/null | grep -q 'ttyS0' && pass "agetty is running on ttyS0." || fail "agetty is not running on ttyS0."
+  [[ -s "${SERIAL_DROPIN_FILE}" ]] && pass "Serial getty override file exists." || fail "Serial getty override file is missing."
+  [[ -x "${LOCAL_CONFIG_TOOL}" ]] && pass "USB-C COM local configuration utility is installed." || fail "USB-C COM local configuration utility is missing."
+
+  if grep -Eq '^GRUB_CMDLINE_LINUX=.*net\.ifnames=0' "${GRUB_FILE}" 2>/dev/null \
+     && grep -Eq '^GRUB_CMDLINE_LINUX=.*biosdevname=0' "${GRUB_FILE}" 2>/dev/null; then
+    pass "GRUB interface-naming parameters are present."
+  else
+    fail "Required GRUB interface-naming parameters are missing."
+  fi
+
+  grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=.*console=tty0' "${GRUB_FILE}" 2>/dev/null \
+    && pass "Monitor console parameter console=tty0 is present." \
+    || fail "Monitor console parameter console=tty0 is missing."
+
+  grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=.*console=ttyS0,115200n8' "${GRUB_FILE}" 2>/dev/null \
+    && pass "USB-C COM serial-console parameter is present at 115200 8N1." \
+    || fail "USB-C COM serial-console GRUB parameter is missing."
+}
+
+check_hostname_and_validator() {
+  section "HOST IDENTITY / PRODUCTION VALIDATOR"
+
+  grep -qxF $'127.0.1.1\tsolz-rmm solzrmm' "${HOSTS_FILE}" 2>/dev/null \
+    && pass "Solutionz hosts-file entry is normalized." \
+    || fail "Expected Solutionz hosts-file entry is missing or changed."
+
+  [[ -x "${POSTREBOOT_VALIDATOR}" ]] \
+    && pass "Post-reboot production validator is installed." \
+    || fail "Post-reboot production validator is missing."
+
+  systemctl is-enabled --quiet "${POSTREBOOT_SERVICE}" 2>/dev/null \
+    && pass "Post-reboot production validation service is enabled." \
+    || fail "Post-reboot production validation service is not enabled."
+}
+
+check_legacy_collector_artifacts() {
+  section "REMOVED CRESTRON COLLECTOR ARTIFACTS"
+
+  local legacy=(
+    /opt/solutionz-rmm/crestron_4series_xio_style_collector.py
+    /opt/solutionz-rmm/crestron_4series_rmm_collector.py
+    /usr/local/bin/solutionz-rmm-collector
+    /etc/sudoers.d/solutionz-rmm-collector
+  )
+  local path found=0
+  for path in "${legacy[@]}"; do
+    if [[ -e "${path}" || -L "${path}" ]]; then
+      warn "Legacy collector artifact is present but is no longer part of Revision ${REVISION}: ${path}"
+      found=1
+    fi
+  done
+  (( found == 0 )) && pass "No removed Crestron collector artifacts were detected."
+}
+
+write_result() {
+  local result="PASS"
+  (( FAIL_COUNT > 0 )) && result="FAIL"
+  {
+    echo "result=${result}"
+    echo "revision=${REVISION}"
+    echo "script=${SCRIPT_NAME}"
+    echo "timestamp_utc=$(date -u +%FT%TZ)"
+    echo "passes=${PASS_COUNT}"
+    echo "warnings=${WARN_COUNT}"
+    echo "failures=${FAIL_COUNT}"
+    echo "log=${LOG_FILE}"
+  } > "${RESULT_FILE}"
+  chmod 640 "${RESULT_FILE}"
+}
+
+summary() {
+  section "CONFIGURATION COMPLIANCE SUMMARY"
+  echo "Revision: ${REVISION}"
+  echo "PASS: ${PASS_COUNT}"
+  echo "WARN: ${WARN_COUNT}"
+  echo "FAIL: ${FAIL_COUNT}"
+  echo "Log: ${LOG_FILE}"
+  echo "Result file: ${RESULT_FILE}"
+  echo "Controlled OS family: Ubuntu 24.04 LTS / Noble, including Ubuntu 24.04.4 LTS."
+  echo "Domotz revision policy: not pinned; current revision is audited."
+
+  write_result
+
+  if (( FAIL_COUNT == 0 )); then
+    echo "RESULT: PASS"
+    return 0
+  fi
+
+  echo "RESULT: FAIL"
+  return 1
+}
+
+main() {
+  require_root
+  init_logging
+
+  echo "Solutionz RMM Configuration Compliance Check"
+  echo "Revision: ${REVISION}"
+  echo "Compatible setup: ${SETUP_SCRIPT}"
+  echo "Time: $(date -u +%FT%TZ)"
+  echo "Host: $(hostname)"
+
+  check_build_state
+  check_platform
+  check_baseline_records
+  check_required_packages
+  check_network_configuration
+  check_ssh_and_firewall
+  check_domotz_configuration
+  check_serial_recovery
+  check_hostname_and_validator
+  check_legacy_collector_artifacts
+  summary
+}
+
+main "$@"

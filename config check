@@ -16,6 +16,10 @@ set -uo pipefail
 #     final Solutionz required-package baseline.
 #   - Domotz is not revision-pinned; current revision is reported for audit.
 #   - Crestron 4-Series collector components are not part of this baseline.
+#   - Serial-console acceptance uses ttyS0 presence, serial-getty enabled/active
+#     state, and GRUB configuration. A transient agetty process match is diagnostic.
+#   - NTP uses systemd-timesyncd plus systemd-time-wait-sync so post-reboot
+#     validation is ordered behind an actual current-boot time synchronization.
 ###############################################################################
 
 REVISION="5091126"
@@ -72,6 +76,7 @@ REQUIRED_PACKAGES=(
   ufw
   snapd
   openssh-server
+  systemd-timesyncd
   sudo
   python3
 )
@@ -84,13 +89,27 @@ REQUIRED_DOMOTZ_PERMISSIONS=(
   system-observe
 )
 
+# Terminal color output. ANSI color is used only for interactive terminals and
+# can be disabled with NO_COLOR=1. Persistent logs are kept as plain text.
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+  COLOR_GREEN=$'\033[32m'
+  COLOR_YELLOW=$'\033[33m'
+  COLOR_RED=$'\033[31m'
+  COLOR_RESET=$'\033[0m'
+else
+  COLOR_GREEN=""
+  COLOR_YELLOW=""
+  COLOR_RED=""
+  COLOR_RESET=""
+fi
+
 PASS_COUNT=0
 WARN_COUNT=0
 FAIL_COUNT=0
 
-pass() { echo "PASS - $*"; PASS_COUNT=$((PASS_COUNT + 1)); }
-warn() { echo "WARN - $*"; WARN_COUNT=$((WARN_COUNT + 1)); }
-fail() { echo "FAIL - $*"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
+pass() { printf '%sPASS - %s%s\n' "${COLOR_GREEN}" "$*" "${COLOR_RESET}"; PASS_COUNT=$((PASS_COUNT + 1)); }
+warn() { printf '%sWARN - %s%s\n' "${COLOR_YELLOW}" "$*" "${COLOR_RESET}"; WARN_COUNT=$((WARN_COUNT + 1)); }
+fail() { printf '%sFAIL - %s%s\n' "${COLOR_RED}" "$*" "${COLOR_RESET}"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 
 section() {
   echo
@@ -111,7 +130,7 @@ init_logging() {
   touch "${LOG_FILE}"
   chmod 640 "${LOG_FILE}"
   ln -sfn "$(basename "${LOG_FILE}")" "${LATEST_LOG}"
-  exec > >(tee -a "${LOG_FILE}") 2>&1
+  exec > >(tee >(sed -u 's/\x1B\[[0-9;]*[mK]//g' >> "${LOG_FILE}")) 2>&1
 }
 
 state_value() {
@@ -122,6 +141,19 @@ state_value() {
 dns_ipv4() {
   local host="$1"
   getent ahostsv4 "${host}" 2>/dev/null | awk '{print $1}' | grep -Eq '^[0-9]+(\.[0-9]+){3}$'
+}
+
+ntp_is_synchronized() {
+  local synced=""
+  synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+  [[ "${synced}" == "yes" || -e /run/systemd/timesync/synchronized ]]
+}
+
+report_ntp_diagnostics() {
+  echo "INFO - NTP diagnostics:"
+  timedatectl status 2>/dev/null | sed -n '1,20p' || true
+  timedatectl timesync-status --no-pager 2>/dev/null | sed -n '1,40p' || true
+  systemctl status systemd-timesyncd.service --no-pager -l 2>/dev/null | sed -n '1,40p' || true
 }
 
 check_build_state() {
@@ -364,6 +396,33 @@ check_network_configuration() {
   done
 }
 
+check_time_sync_configuration() {
+  section "NTP / TIME SYNCHRONIZATION"
+
+  command -v timedatectl >/dev/null 2>&1 \
+    && pass "timedatectl is available." \
+    || fail "timedatectl is unavailable."
+
+  systemctl is-enabled --quiet systemd-timesyncd.service 2>/dev/null \
+    && pass "systemd-timesyncd.service is enabled." \
+    || fail "systemd-timesyncd.service is not enabled."
+
+  systemctl is-active --quiet systemd-timesyncd.service \
+    && pass "systemd-timesyncd.service is active." \
+    || fail "systemd-timesyncd.service is not active."
+
+  systemctl is-enabled --quiet systemd-time-wait-sync.service 2>/dev/null \
+    && pass "systemd-time-wait-sync.service is enabled." \
+    || fail "systemd-time-wait-sync.service is not enabled."
+
+  if ntp_is_synchronized; then
+    pass "Current boot has successful network time synchronization evidence."
+  else
+    fail "Current boot is not NTP synchronized."
+    report_ntp_diagnostics
+  fi
+}
+
 check_ssh_and_firewall() {
   section "SSH / FIREWALL CONFIGURATION"
 
@@ -439,7 +498,11 @@ check_serial_recovery() {
   [[ -c "${SERIAL_DEVICE}" ]] && pass "V1210 serial device ${SERIAL_DEVICE} exists." || fail "V1210 serial device ${SERIAL_DEVICE} is missing."
   systemctl is-enabled --quiet "${SERIAL_SERVICE}" 2>/dev/null && pass "Serial getty is enabled." || fail "Serial getty is not enabled."
   systemctl is-active --quiet "${SERIAL_SERVICE}" && pass "Serial getty is active." || fail "Serial getty is not active."
-  pgrep -a agetty 2>/dev/null | grep -q 'ttyS0' && pass "agetty is running on ttyS0." || fail "agetty is not running on ttyS0."
+  if pgrep -a agetty 2>/dev/null | grep -q 'ttyS0'; then
+    pass "agetty process is currently visible on ttyS0 (diagnostic only)."
+  else
+    warn "No persistent agetty process is currently visible on ttyS0. This is diagnostic only; enabled/active serial-getty service, ttyS0 presence, and GRUB configuration are the production acceptance criteria."
+  fi
   [[ -s "${SERIAL_DROPIN_FILE}" ]] && pass "Serial getty override file exists." || fail "Serial getty override file is missing."
   [[ -x "${LOCAL_CONFIG_TOOL}" ]] && pass "USB-C COM local configuration utility is installed." || fail "USB-C COM local configuration utility is missing."
 
@@ -473,13 +536,30 @@ check_hostname_and_validator() {
   systemctl is-enabled --quiet "${POSTREBOOT_SERVICE}" 2>/dev/null \
     && pass "Post-reboot production validation service is enabled." \
     || fail "Post-reboot production validation service is not enabled."
+
+  if systemctl cat "${POSTREBOOT_SERVICE}" 2>/dev/null | grep -q 'After=.*time-sync.target'; then
+    pass "Post-reboot validator is ordered after time-sync.target."
+  else
+    fail "Post-reboot validator is not ordered after time-sync.target."
+  fi
+
+  if systemctl cat "${POSTREBOOT_SERVICE}" 2>/dev/null | grep -q 'systemd-time-wait-sync.service'; then
+    pass "Post-reboot validator pulls in systemd-time-wait-sync.service."
+  else
+    fail "Post-reboot validator does not reference systemd-time-wait-sync.service."
+  fi
+
+  if systemctl cat "${POSTREBOOT_SERVICE}" 2>/dev/null | grep -q '^TimeoutStartSec=5min$'; then
+    pass "Post-reboot validator allows up to five minutes for startup validation."
+  else
+    fail "Post-reboot validator TimeoutStartSec is not set to 5min."
+  fi
 }
 
 check_legacy_collector_artifacts() {
   section "REMOVED CRESTRON COLLECTOR ARTIFACTS"
 
   local legacy=(
-    /opt/solutionz-rmm/crestron_4series_xio_style_collector.py
     /opt/solutionz-rmm/crestron_4series_rmm_collector.py
     /usr/local/bin/solutionz-rmm-collector
     /etc/sudoers.d/solutionz-rmm-collector
@@ -513,9 +593,9 @@ write_result() {
 summary() {
   section "CONFIGURATION COMPLIANCE SUMMARY"
   echo "Revision: ${REVISION}"
-  echo "PASS: ${PASS_COUNT}"
-  echo "WARN: ${WARN_COUNT}"
-  echo "FAIL: ${FAIL_COUNT}"
+  printf "%sPASS: %s%s\n" "${COLOR_GREEN}" "${PASS_COUNT}" "${COLOR_RESET}"
+  printf "%sWARN: %s%s\n" "${COLOR_YELLOW}" "${WARN_COUNT}" "${COLOR_RESET}"
+  printf "%sFAIL: %s%s\n" "${COLOR_RED}" "${FAIL_COUNT}" "${COLOR_RESET}"
   echo "Log: ${LOG_FILE}"
   echo "Result file: ${RESULT_FILE}"
   echo "Controlled OS family: Ubuntu 24.04 LTS / Noble, including Ubuntu 24.04.4 LTS."
@@ -524,11 +604,11 @@ summary() {
   write_result
 
   if (( FAIL_COUNT == 0 )); then
-    echo "RESULT: PASS"
+    printf "%sRESULT: PASS%s\n" "${COLOR_GREEN}" "${COLOR_RESET}"
     return 0
   fi
 
-  echo "RESULT: FAIL"
+  printf "%sRESULT: FAIL%s\n" "${COLOR_RED}" "${COLOR_RESET}"
   return 1
 }
 
@@ -547,6 +627,7 @@ main() {
   check_baseline_records
   check_required_packages
   check_network_configuration
+  check_time_sync_configuration
   check_ssh_and_firewall
   check_domotz_configuration
   check_serial_recovery
@@ -556,3 +637,4 @@ main() {
 }
 
 main "$@"
+

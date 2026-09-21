@@ -24,6 +24,12 @@ set -Eeuo pipefail
 #   - Ubuntu 24.04 LTS is the controlled OS family. Supported Noble point
 #     releases include Ubuntu 24.04.4 LTS.
 #   - Network changes are staged and take effect after manual reboot.
+#   - NTP synchronization is standardized on systemd-timesyncd. The setup enables
+#     systemd-time-wait-sync so time-sync.target represents an actual successful
+#     current-boot synchronization event, and validators wait/retry before failing.
+#   - Serial-console acceptance is based on ttyS0 presence, serial-getty systemd
+#     enabled/active state, and GRUB configuration; a transient agetty process
+#     match is diagnostic only and is not a production failure criterion.
 ###############################################################################
 
 REVISION="5091126"
@@ -78,6 +84,23 @@ POSTREBOOT_LOG="${LOG_DIR}/postreboot-validation.log"
 NON_INTERACTIVE=0
 CURRENT_STEP="startup"
 
+# Terminal color output. ANSI color is used only for interactive terminals and
+# can be disabled by setting NO_COLOR=1. Log files remain plain text because
+# init_logging strips ANSI escape sequences before writing to disk.
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+  COLOR_GREEN=$'\033[32m'
+  COLOR_YELLOW=$'\033[33m'
+  COLOR_RED=$'\033[31m'
+  COLOR_CYAN=$'\033[36m'
+  COLOR_RESET=$'\033[0m'
+else
+  COLOR_GREEN=""
+  COLOR_YELLOW=""
+  COLOR_RED=""
+  COLOR_CYAN=""
+  COLOR_RESET=""
+fi
+
 REQUIRED_DOMOTZ_PERMISSIONS=(
   "firewall-control"
   "network-observe"
@@ -102,6 +125,7 @@ REQUIRED_PACKAGES=(
   ufw
   snapd
   openssh-server
+  systemd-timesyncd
   sudo
   python3
 )
@@ -113,8 +137,16 @@ REQUIRED_PACKAGES=(
 # - Host UFW permits inbound TCP 22 and TCP 3000 from any reachable source, per
 #   the requested Solutionz baseline. Perimeter/network policy remains responsible
 #   for preventing unsolicited Internet exposure.
-# - Outbound requirements include TCP 443, 5671, 32700-57699, 4505-4506,
-#   55022, 11371; UDP 123; DNS; and ICMP as required for monitoring/reachability.
+# - UFW uses "default allow outgoing". Therefore outbound TCP and UDP traffic is
+#   permitted without separate per-port UFW allow rules. Network/perimeter firewalls
+#   must still permit the required traffic described below.
+# - Required outbound TCP: 443, 5671, 32700-57699, 4505-4506, 55022, 11371.
+# - Required/expected UDP: 53 for DNS when UDP transport is used; 123 for NTP;
+#   67/68 for DHCP when eth0 obtains addressing by DHCP; and UDP 161 from the RMM
+#   Agent to monitored devices when SNMP polling is configured.
+# - DNS may also use TCP 53 for fallback/large responses.
+# - Additional TCP/UDP ports may be required by specific monitored AV devices or
+#   manufacturer protocols. ICMP is used for monitoring/reachability where allowed.
 
 usage() {
   cat <<EOF
@@ -123,6 +155,7 @@ Usage:
 
 Options:
   --non-interactive             Skip the two manual confirmation prompts.
+  --easter-egg                  Display the non-operational 5091126 Easter egg and exit.
   -h, --help                    Show this help.
 
 Domotz update model:
@@ -131,11 +164,30 @@ Domotz update model:
 EOF
 }
 
+show_easter_egg() {
+  printf '%s\n' "${COLOR_CYAN}"
+  cat <<'EASTER_EGG'
+╔══════════════════════════════════════════════════════╗
+║              SOLUTIONZ RMM - REV 5091126            ║
+║                                                      ║
+║  If you found this, you actually read the script.   ║
+║  Statistically, that already puts you ahead.        ║
+║                                                      ║
+║  Monitor everything. Trust nothing. Check the logs. ║
+╚══════════════════════════════════════════════════════╝
+EASTER_EGG
+  printf '%s' "${COLOR_RESET}"
+}
+
 parse_args() {
   while (($#)); do
     case "$1" in
       --non-interactive)
         NON_INTERACTIVE=1
+        ;;
+      --easter-egg)
+        show_easter_egg
+        exit 0
         ;;
       -h|--help)
         usage
@@ -163,15 +215,17 @@ init_logging() {
   chmod 750 "${LOG_DIR}" "${STATE_DIR}"
   touch "${LOG_FILE}"
   chmod 640 "${LOG_FILE}"
-  exec > >(tee -ia "${LOG_FILE}") 2>&1
+  # Preserve color in the terminal while keeping the persistent log free of
+  # ANSI escape sequences.
+  exec > >(tee -i >(sed -u 's/\x1B\[[0-9;]*[mK]//g' >> "${LOG_FILE}")) 2>&1
 }
 
 progress_message() {
-  echo " [+] $1"
+  printf ' %s[+] %s%s\n' "${COLOR_GREEN}" "$1" "${COLOR_RESET}"
 }
 
 warning_message() {
-  echo " [!] WARNING: $1"
+  printf ' %s[!] WARNING: %s%s\n' "${COLOR_YELLOW}" "$1" "${COLOR_RESET}"
 }
 
 step_message() {
@@ -215,37 +269,57 @@ Solutionz RMM Agent Network Requirements - Revision 5091126
 Traffic model
 - Monitoring traffic originates from the RMM Agent to monitored AV devices.
 - RMM/Domotz cloud sessions are initiated outbound by the RMM Agent.
-- No unsolicited Internet-initiated inbound connection is required.
+- No unsolicited Internet-initiated inbound connection is required for normal
+  RMM/Domotz cloud communication.
 
-Outbound/cloud and platform requirements
-- TCP 443
-- TCP 5671
-- TCP 32700-57699
-- TCP 4505-4506
-- TCP 55022
-- TCP 11371
-- UDP 123
-- DNS
-- ICMP as required for monitoring/reachability
+Outbound TCP - cloud/platform
+- TCP 443          Domotz portal/API/orchestration and Ubuntu/Canonical/Snap HTTPS
+- TCP 5671         Domotz secure messaging/orchestration
+- TCP 32700-57699  Domotz remote relay/secure remote connectivity
+- TCP 4505-4506    Domotz provisioning
+- TCP 55022        Domotz tunnel/remote support
+- TCP 11371        Key-server/package provisioning or maintenance where required
+- TCP 53           DNS fallback/large responses when the resolver requires TCP
 
-Local monitoring traffic
-- ICMP to monitored AV device addresses
-- TCP/UDP as required by each monitored device and protocol, including HTTP/HTTPS,
-  SNMP, SSH, and manufacturer-specific services.
+Outbound/local UDP
+- UDP 53           DNS queries when the resolver uses UDP transport
+- UDP 123          NTP/time synchronization
+- UDP 67/68        DHCP client/server exchange when eth0 is configured for DHCP
+- UDP 161          SNMP polling from the RMM Agent to monitored devices when SNMP
+                   monitoring is configured
+- Additional UDP   As required by a specific monitored-device manufacturer protocol
+
+Other required traffic
+- ICMP             Device heartbeat/reachability, response-time and packet-loss tests
+                   where the routed network/security policy permits ICMP
+
+Local monitored-device traffic
+- HTTP/HTTPS       TCP 80/443 when used by the monitored device
+- SSH              TCP 22 when used for device monitoring/management
+- SNMP             UDP 161 when SNMP polling is configured
+- Manufacturer-specific TCP/UDP ports as required by the monitored device profile
+- Routed networks/VLAN ACLs must permit the RMM Agent to reach each monitored
+  device on the protocol/port required for that device.
 
 Agent host firewall inbound allowances
-- TCP 22 - SSH administration
-- TCP 3000 - Local Domotz Agent service
+- TCP 22           SSH administration
+- TCP 3000         Local Domotz Agent service
 
 UFW baseline
 - Default incoming: deny
 - Default outgoing: allow
 - TCP 22: allow from any reachable source
 - TCP 3000: allow from any reachable source
+- No separate outbound TCP/UDP UFW rules are created because the host baseline is
+  default-allow for outbound traffic. This does not override upstream firewall, ACL,
+  VLAN, proxy, or perimeter-security restrictions.
 
-Note: Global host-firewall allowance does not mean these ports should be exposed
-through an Internet perimeter firewall or NAT. No unsolicited Internet inbound
-connection is required for normal RMM/Domotz cloud communication.
+Security boundary note
+- Global TCP 22/TCP 3000 allowance on the RMM Agent host does not mean either port
+  should be published through Internet NAT or permitted as unsolicited Internet
+  inbound traffic. Perimeter policy remains responsible for preventing that exposure.
+- Upstream firewalls must allow the required outbound TCP/UDP traffic and the local
+  monitoring traffic needed for the monitored AV devices.
 EOF
   chmod 640 "${NETWORK_REQUIREMENTS_FILE}"
   progress_message "Recorded network requirements: ${NETWORK_REQUIREMENTS_FILE}"
@@ -261,12 +335,12 @@ record_failure_and_exit() {
     "exit_code=${rc}" \
     "line=${line}" \
     "command=${command}"
-  echo " [!] INSTALLATION FAILED"
-  echo " [!] Step: ${CURRENT_STEP}"
-  echo " [!] Line: ${line}"
-  echo " [!] Exit code: ${rc}"
-  echo " [!] Command: ${command}"
-  echo " [!] Log: ${LOG_FILE}"
+  printf ' %s[!] INSTALLATION FAILED%s\n' "${COLOR_RED}" "${COLOR_RESET}"
+  printf ' %s[!] Step: %s%s\n' "${COLOR_RED}" "${CURRENT_STEP}" "${COLOR_RESET}"
+  printf ' %s[!] Line: %s%s\n' "${COLOR_RED}" "${line}" "${COLOR_RESET}"
+  printf ' %s[!] Exit code: %s%s\n' "${COLOR_RED}" "${rc}" "${COLOR_RESET}"
+  printf ' %s[!] Command: %s%s\n' "${COLOR_RED}" "${command}" "${COLOR_RESET}"
+  printf ' %s[!] Log: %s%s\n' "${COLOR_RED}" "${LOG_FILE}" "${COLOR_RESET}"
   exit "${rc}"
 }
 
@@ -281,7 +355,7 @@ error_exit() {
   local message="$1"
   trap - ERR
   set +e
-  echo " [!] ERROR: ${message}"
+  printf ' %s[!] ERROR: %s%s\n' "${COLOR_RED}" "${message}" "${COLOR_RESET}"
   write_state "phase1_failed" "error=${message}"
   exit 1
 }
@@ -311,7 +385,7 @@ This script will:
   2. Record the manufacturer-delivered OS/package state before modification.
   3. Install only missing required packages; no general apt upgrade is performed.
   4. Verify SSH, TUN, Snap, Domotz, and required Domotz permissions.
-  5. Configure UFW with inbound TCP 22 and TCP 3000 globally permitted on the Agent host firewall.
+  5. Configure UFW with inbound TCP 22/TCP 3000 permitted and default-allow outbound TCP/UDP traffic.
   6. Stage Netplan with eth0 as the RMM network interface and eth1 disabled.
   7. Repair and validate system DNS behavior.
   8. Normalize Solutionz hostname entries.
@@ -351,6 +425,44 @@ read_dmi_value() {
 dns_resolves_ipv4() {
   local host="$1"
   getent ahostsv4 "${host}" 2>/dev/null | awk '{print $1}' | grep -Eq '^[0-9]+(\.[0-9]+){3}$'
+}
+
+ntp_is_synchronized() {
+  local synced=""
+  synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+
+  # systemd-timesyncd creates this runtime marker only after a successful sync.
+  # /run is recreated at boot, so this is fresh evidence for the current boot.
+  if [[ "${synced}" == "yes" || -e /run/systemd/timesync/synchronized ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+wait_for_ntp_sync() {
+  local attempts="${1:-36}"
+  local delay_seconds="${2:-5}"
+  local attempt
+
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if ntp_is_synchronized; then
+      return 0
+    fi
+
+    if (( attempt < attempts )); then
+      sleep "${delay_seconds}"
+    fi
+  done
+
+  return 1
+}
+
+report_ntp_diagnostics() {
+  echo "INFO - NTP diagnostics:"
+  timedatectl status 2>/dev/null | sed -n '1,20p' || true
+  timedatectl timesync-status --no-pager 2>/dev/null | sed -n '1,40p' || true
+  systemctl status systemd-timesyncd.service --no-pager -l 2>/dev/null | sed -n '1,40p' || true
 }
 
 preflight_checks() {
@@ -649,6 +761,50 @@ verify_ssh_service() {
   progress_message "SSH service is enabled and active."
 }
 
+configure_time_sync() {
+  CURRENT_STEP="4A - Enable and verify NTP time synchronization"
+  echo "------------------------------------------------------------"
+  echo "Step 4A: Enable and verify NTP time synchronization"
+  echo "------------------------------------------------------------"
+
+  command -v timedatectl >/dev/null 2>&1 || error_exit "timedatectl is unavailable; NTP synchronization cannot be managed."
+  systemctl list-unit-files systemd-timesyncd.service >/dev/null 2>&1 || \
+    error_exit "systemd-timesyncd.service is unavailable; the required systemd-timesyncd package is not installed correctly."
+
+  # Revision 5091126 standardizes Ubuntu time synchronization on
+  # systemd-timesyncd. timedatectl enables network time, while the explicit
+  # service commands make the runtime/startup state deterministic.
+  timedatectl set-ntp true >/dev/null 2>&1 || \
+    error_exit "Unable to enable network time synchronization with timedatectl."
+  systemctl enable systemd-timesyncd.service >/dev/null 2>&1 || \
+    error_exit "systemd-timesyncd.service could not be enabled."
+  systemctl restart systemd-timesyncd.service >/dev/null 2>&1 || \
+    error_exit "systemd-timesyncd.service could not be started/restarted."
+
+  # time-sync.target does not itself guarantee accurate synchronization.
+  # systemd-time-wait-sync.service is what delays time-sync.target until
+  # systemd-timesyncd has successfully synchronized to a remote reference.
+  if systemctl list-unit-files systemd-time-wait-sync.service >/dev/null 2>&1; then
+    systemctl enable systemd-time-wait-sync.service >/dev/null 2>&1 || \
+      error_exit "systemd-time-wait-sync.service could not be enabled."
+  else
+    error_exit "systemd-time-wait-sync.service is unavailable on this Ubuntu 24.04 LTS installation."
+  fi
+
+  systemctl is-enabled --quiet systemd-timesyncd.service || \
+    error_exit "systemd-timesyncd.service is not enabled after configuration."
+  systemctl is-active --quiet systemd-timesyncd.service || \
+    error_exit "systemd-timesyncd.service is not active after configuration."
+
+  progress_message "NTP service configured. Waiting up to 180 seconds for initial synchronization."
+  if wait_for_ntp_sync 36 5; then
+    progress_message "System clock is synchronized to a network time source."
+  else
+    report_ntp_diagnostics
+    warning_message "System clock has not synchronized within 180 seconds. Final pre-reboot validation will retry; UDP 123, DNS, DHCP-provided NTP, and upstream firewall policy should be reviewed if it remains unsynchronized."
+  fi
+}
+
 configure_tun() {
   step_message 5 "Load and validate TUN support"
 
@@ -739,7 +895,7 @@ configure_ufw() {
   ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW' || error_exit "Expected global SSH UFW rule was not found."
   ufw status | grep -Eq '^3000/tcp[[:space:]]+ALLOW' || error_exit "Expected global TCP 3000 UFW rule was not found."
 
-  progress_message "UFW validated: inbound TCP 22 and TCP 3000 are globally permitted; outbound traffic is allowed."
+  progress_message "UFW validated: inbound TCP 22/TCP 3000 are permitted; outbound TCP/UDP traffic is allowed by default."
   ufw status verbose
 }
 
@@ -900,10 +1056,19 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now "${SERIAL_SERVICE}"
+  systemctl is-enabled "${SERIAL_SERVICE}" >/dev/null 2>&1 || \
+    error_exit "${SERIAL_SERVICE} is not enabled."
   systemctl is-active "${SERIAL_SERVICE}" >/dev/null 2>&1 || \
     error_exit "${SERIAL_SERVICE} is not active."
 
-  pgrep -a agetty | grep -q 'ttyS0' || error_exit "agetty is not running on ttyS0."
+  # The systemd unit state is authoritative for the serial-console acceptance
+  # check. An agetty process may be transient or respawn around login/session
+  # changes, so pgrep is diagnostic only and must not fail the production build.
+  if pgrep -a agetty 2>/dev/null | grep -q 'ttyS0'; then
+    progress_message "agetty process currently visible on ttyS0."
+  else
+    warning_message "No persistent agetty process is currently visible on ttyS0; ${SERIAL_SERVICE} is enabled/active and remains the authoritative check."
+  fi
 
   update-grub
   progress_message "V1210 USB-C COM console configured for 115200 8N1."
@@ -1214,6 +1379,7 @@ REQUIRED_PACKAGES=(
   ufw
   snapd
   openssh-server
+  systemd-timesyncd
   sudo
   python3
 )
@@ -1256,6 +1422,37 @@ check() {
 dns_resolves_ipv4() {
   local host="$1"
   getent ahostsv4 "${host}" 2>/dev/null | awk '{print $1}' | grep -Eq '^[0-9]+(\.[0-9]+){3}$'
+}
+
+ntp_is_synchronized() {
+  local synced=""
+  synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+  [[ "${synced}" == "yes" || -e /run/systemd/timesync/synchronized ]]
+}
+
+wait_for_ntp_sync() {
+  local attempts="${1:-36}"
+  local delay_seconds="${2:-5}"
+  local attempt
+
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if ntp_is_synchronized; then
+      return 0
+    fi
+    if (( attempt < attempts )); then
+      sleep "${delay_seconds}"
+    fi
+  done
+
+  return 1
+}
+
+report_ntp_diagnostics() {
+  echo "INFO - NTP diagnostics:"
+  timedatectl status 2>/dev/null | sed -n '1,20p' || true
+  timedatectl timesync-status --no-pager 2>/dev/null | sed -n '1,40p' || true
+  systemctl status systemd-timesyncd.service --no-pager -l 2>/dev/null | sed -n '1,40p' || true
+  journalctl -u systemd-timesyncd.service -n 30 --no-pager 2>/dev/null || true
 }
 
 state_value() {
@@ -1330,8 +1527,36 @@ check "Netplan configuration generates successfully" netplan generate
 if dns_resolves_ipv4 api.snapcraft.io; then pass "DNS resolves api.snapcraft.io to IPv4."; else fail "DNS does not resolve api.snapcraft.io to IPv4."; fi
 if dns_resolves_ipv4 archive.ubuntu.com; then pass "DNS resolves archive.ubuntu.com to IPv4."; else fail "DNS does not resolve archive.ubuntu.com to IPv4."; fi
 if dns_resolves_ipv4 security.ubuntu.com; then pass "DNS resolves security.ubuntu.com to IPv4."; else fail "DNS does not resolve security.ubuntu.com to IPv4."; fi
-ntp_sync="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
-[[ "${ntp_sync}" == "yes" ]] && pass "System clock is NTP synchronized." || fail "System clock is not NTP synchronized."
+
+if command -v timedatectl >/dev/null 2>&1; then
+  if systemctl is-enabled --quiet systemd-timesyncd.service 2>/dev/null; then
+    pass "systemd-timesyncd.service is enabled."
+  else
+    fail "systemd-timesyncd.service is not enabled."
+  fi
+
+  if systemctl is-active --quiet systemd-timesyncd.service; then
+    pass "systemd-timesyncd.service is active."
+  else
+    fail "systemd-timesyncd.service is not active."
+  fi
+
+  if systemctl is-enabled --quiet systemd-time-wait-sync.service 2>/dev/null; then
+    pass "systemd-time-wait-sync.service is enabled for accurate time-sync.target ordering."
+  else
+    fail "systemd-time-wait-sync.service is not enabled."
+  fi
+
+  echo "INFO - Waiting up to 180 seconds for current-boot NTP synchronization evidence."
+  if wait_for_ntp_sync 36 5; then
+    pass "System clock is synchronized to a network time source."
+  else
+    fail "System clock did not synchronize within 180 seconds."
+    report_ntp_diagnostics
+  fi
+else
+  fail "timedatectl is unavailable; NTP synchronization cannot be validated."
+fi
 
 # SSH and firewall
 check "SSH service is active" systemctl is-active --quiet ssh
@@ -1358,7 +1583,9 @@ done
 [[ -c "${SERIAL_DEVICE}" ]] && pass "V1210 ttyS0 serial device is present." || fail "V1210 ttyS0 serial device is missing."
 check "Serial console service is active" systemctl is-active --quiet "${SERIAL_SERVICE}"
 check "Serial console service is enabled" systemctl is-enabled --quiet "${SERIAL_SERVICE}"
-pgrep -a agetty 2>/dev/null | grep -q 'ttyS0' && pass "agetty is running on ttyS0." || fail "agetty is not running on ttyS0."
+# Do not require a persistent pgrep match for agetty. The systemd serial-getty
+# unit may respawn around login/session changes; enabled+active unit state,
+# ttyS0 presence, and GRUB console configuration are the production criteria.
 [[ -x "${LOCAL_CONFIG_TOOL}" ]] && pass "USB-C COM local configuration utility is installed." || fail "USB-C COM local configuration utility is missing."
 if grep -Eq '^GRUB_CMDLINE_LINUX=.*net\.ifnames=0' "${GRUB_FILE}" && grep -Eq '^GRUB_CMDLINE_LINUX=.*biosdevname=0' "${GRUB_FILE}"; then pass "GRUB interface-naming parameters are present."; else fail "Required GRUB interface-naming parameters are missing."; fi
 if grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=.*console=ttyS0,115200n8' "${GRUB_FILE}"; then pass "GRUB serial-console parameter is present."; else fail "GRUB serial-console parameter is missing."; fi
@@ -1400,13 +1627,14 @@ POSTVALIDATOR
   cat > "${POSTREBOOT_SERVICE}" <<EOF
 [Unit]
 Description=Solutionz RMM Post-Reboot Production Validation
-After=network-online.target ssh.service snapd.service
-Wants=network-online.target
+After=network-online.target systemd-timesyncd.service time-sync.target ssh.service snapd.service
+Wants=network-online.target systemd-timesyncd.service systemd-time-wait-sync.service time-sync.target
 
 [Service]
 Type=oneshot
 ExecStart=${POSTREBOOT_VALIDATOR}
 RemainAfterExit=yes
+TimeoutStartSec=5min
 
 [Install]
 WantedBy=multi-user.target
@@ -1420,10 +1648,10 @@ check_final_requirement() {
   local description="$1"
   shift
   if "$@"; then
-    echo "PASS - ${description}"
+    printf '%sPASS - %s%s\n' "${COLOR_GREEN}" "${description}" "${COLOR_RESET}"
     return 0
   fi
-  echo "FAIL - ${description}"
+  printf '%sFAIL - %s%s\n' "${COLOR_RED}" "${description}" "${COLOR_RESET}"
   return 1
 }
 
@@ -1442,6 +1670,8 @@ final_summary_check() {
 
   check_final_requirement "V1210 ttyS0 serial device present" test -c "${SERIAL_DEVICE}" || failures=$((failures + 1))
   check_final_requirement "serial getty active" systemctl is-active --quiet "${SERIAL_SERVICE}" || failures=$((failures + 1))
+  check_final_requirement "serial getty enabled" systemctl is-enabled --quiet "${SERIAL_SERVICE}" || failures=$((failures + 1))
+  check_final_requirement "GRUB serial console configured for ttyS0 at 115200 8N1"     grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=.*console=ttyS0,115200n8' "${GRUB_FILE}" || failures=$((failures + 1))
   check_final_requirement "USB-C COM local config utility installed" test -x "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Protectli V1210 hardware" bash -c 'vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null); model=$(cat /sys/class/dmi/id/product_name 2>/dev/null); [[ "${vendor,,}" == *protectli* && "$model" == "V1210" ]]' || failures=$((failures + 1))
   check_final_requirement "SSH active" systemctl is-active --quiet ssh || failures=$((failures + 1))
@@ -1450,7 +1680,14 @@ final_summary_check() {
   check_final_requirement "UFW globally permits TCP 3000" bash -c "ufw status | grep -Eq '^3000/tcp[[:space:]]+ALLOW'" || failures=$((failures + 1))
   check_final_requirement "DNS resolves api.snapcraft.io to IPv4" dns_resolves_ipv4 api.snapcraft.io || failures=$((failures + 1))
   check_final_requirement "DNS resolves archive.ubuntu.com to IPv4" dns_resolves_ipv4 archive.ubuntu.com || failures=$((failures + 1))
-  check_final_requirement "NTP synchronization active" bash -c "[[ \"$(timedatectl show -p NTPSynchronized --value 2>/dev/null)\" == yes ]]" || failures=$((failures + 1))
+  check_final_requirement "systemd-timesyncd enabled" systemctl is-enabled --quiet systemd-timesyncd.service || failures=$((failures + 1))
+  check_final_requirement "systemd-timesyncd active" systemctl is-active --quiet systemd-timesyncd.service || failures=$((failures + 1))
+  check_final_requirement "systemd-time-wait-sync enabled" systemctl is-enabled --quiet systemd-time-wait-sync.service || failures=$((failures + 1))
+  echo "INFO - Waiting up to 180 seconds for NTP synchronization before Phase 1 completion."
+  if ! check_final_requirement "NTP synchronization active" wait_for_ntp_sync 36 5; then
+    failures=$((failures + 1))
+    report_ntp_diagnostics
+  fi
   check_final_requirement "Initial OS runtime baseline record exists" test -s "${OS_BASELINE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Manufacturer system baseline record exists" test -s "${MANUFACTURER_BASELINE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Manufacturer package inventory exists" test -s "${MANUFACTURER_PACKAGE_BASELINE_FILE}" || failures=$((failures + 1))
@@ -1475,9 +1712,9 @@ final_summary_check() {
       $1 == p && $3 != "-" {found=1}
       END {exit found ? 0 : 1}
     '; then
-      echo "PASS - Domotz permission ${permission} connected"
+      printf '%sPASS - Domotz permission %s connected%s\n' "${COLOR_GREEN}" "${permission}" "${COLOR_RESET}"
     else
-      echo "FAIL - Domotz permission ${permission} not connected"
+      printf '%sFAIL - Domotz permission %s not connected%s\n' "${COLOR_RED}" "${permission}" "${COLOR_RESET}"
       failures=$((failures + 1))
     fi
   done
@@ -1512,6 +1749,7 @@ main() {
   install_required_packages
   verify_required_packages
   verify_ssh_service
+  configure_time_sync
   configure_tun
   ensure_snapd
   install_domotz
@@ -1536,12 +1774,12 @@ main() {
 
   echo
   echo "------------------------------------------------------------"
-  echo " [+] Phase 1 completed successfully."
-  echo " [+] Completion Time: $(date -u +%FT%TZ)"
-  echo " [+] Hostname: $(hostname)"
-  echo " [+] Script Revision: ${REVISION}"
-  echo " [+] State File: ${STATE_FILE}"
-  echo " [+] Log File: ${LOG_FILE}"
+  progress_message "Phase 1 completed successfully."
+  progress_message "Completion Time: $(date -u +%FT%TZ)"
+  progress_message "Hostname: $(hostname)"
+  progress_message "Script Revision: ${REVISION}"
+  progress_message "State File: ${STATE_FILE}"
+  progress_message "Log File: ${LOG_FILE}"
   echo "------------------------------------------------------------"
   echo "Manual reboot is required."
   echo "After reboot, systemd will run the post-reboot validation automatically."
@@ -1555,5 +1793,4 @@ main() {
 }
 
 main "$@"
-
 

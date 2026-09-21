@@ -18,8 +18,8 @@ set -uo pipefail
 #   - TCP 32700-57699 is a firewall policy range. A remote endpoint does not
 #     necessarily listen on every port at all times, so representative probes
 #     are diagnostic only and cannot certify the entire range by themselves.
-#   - NTP validation uses the system's actual synchronization state. Merely
-#     sending a UDP packet would not prove that UDP/123 works.
+#   - NTP validation uses current-boot synchronization evidence from
+#     systemd-timesyncd/timedatectl. Merely sending UDP/123 would not prove sync.
 ###############################################################################
 
 REVISION="5091126"
@@ -59,15 +59,29 @@ CANONICAL_HTTPS_HOSTS=(
   storage.snapcraftcontent.com
 )
 
+# Terminal color output. ANSI color is used only for interactive terminals and
+# can be disabled with NO_COLOR=1. Persistent logs are kept as plain text.
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+  COLOR_GREEN=$'\033[32m'
+  COLOR_YELLOW=$'\033[33m'
+  COLOR_RED=$'\033[31m'
+  COLOR_RESET=$'\033[0m'
+else
+  COLOR_GREEN=""
+  COLOR_YELLOW=""
+  COLOR_RED=""
+  COLOR_RESET=""
+fi
+
 PASS_COUNT=0
 WARN_COUNT=0
 FAIL_COUNT=0
 DEVICE_TARGETS=()
 TCP_TARGETS=()
 
-pass() { echo "PASS - $*"; PASS_COUNT=$((PASS_COUNT + 1)); }
-warn() { echo "WARN - $*"; WARN_COUNT=$((WARN_COUNT + 1)); }
-fail() { echo "FAIL - $*"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
+pass() { printf '%sPASS - %s%s\n' "${COLOR_GREEN}" "$*" "${COLOR_RESET}"; PASS_COUNT=$((PASS_COUNT + 1)); }
+warn() { printf '%sWARN - %s%s\n' "${COLOR_YELLOW}" "$*" "${COLOR_RESET}"; WARN_COUNT=$((WARN_COUNT + 1)); }
+fail() { printf '%sFAIL - %s%s\n' "${COLOR_RED}" "$*" "${COLOR_RESET}"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 info() { echo "INFO - $*"; }
 
 section() {
@@ -134,7 +148,7 @@ init_logging() {
   touch "${LOG_FILE}"
   chmod 640 "${LOG_FILE}"
   ln -sfn "$(basename "${LOG_FILE}")" "${LATEST_LOG}"
-  exec > >(tee -a "${LOG_FILE}") 2>&1
+  exec > >(tee >(sed -u 's/\x1B\[[0-9;]*[mK]//g' >> "${LOG_FILE}")) 2>&1
 }
 
 state_value() {
@@ -150,6 +164,36 @@ dns_ipv4() {
 tcp_open() {
   local host="$1" port="$2"
   nc -z -w7 "${host}" "${port}" >/dev/null 2>&1
+}
+
+ntp_is_synchronized() {
+  local synced=""
+  synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+  [[ "${synced}" == "yes" || -e /run/systemd/timesync/synchronized ]]
+}
+
+wait_for_ntp_sync() {
+  local attempts="${1:-36}"
+  local delay_seconds="${2:-5}"
+  local attempt
+
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if ntp_is_synchronized; then
+      return 0
+    fi
+    if (( attempt < attempts )); then
+      sleep "${delay_seconds}"
+    fi
+  done
+
+  return 1
+}
+
+report_ntp_diagnostics() {
+  info "NTP diagnostics follow."
+  timedatectl status 2>/dev/null | sed -n '1,20p' || true
+  timedatectl timesync-status --no-pager 2>/dev/null | sed -n '1,40p' || true
+  systemctl status systemd-timesyncd.service --no-pager -l 2>/dev/null | sed -n '1,40p' || true
 }
 
 check_revision_and_tools() {
@@ -331,15 +375,21 @@ check_icmp_and_time() {
     fail "ICMP reachability to ${DOMOTZ_ECHO_HOST} failed."
   fi
 
-  local ntp_sync
-  ntp_sync="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
-  if [[ "${ntp_sync}" == "yes" ]]; then
-    pass "System clock is NTP synchronized; this validates working time synchronization rather than merely transmitting a UDP/123 packet."
-  else
-    fail "System clock is not reported as NTP synchronized."
-  fi
+  systemctl is-active --quiet systemd-timesyncd.service \
+    && pass "systemd-timesyncd.service is active." \
+    || fail "systemd-timesyncd.service is not active."
 
-  timedatectl status 2>/dev/null | sed -n '1,20p' || true
+  systemctl is-enabled --quiet systemd-time-wait-sync.service 2>/dev/null \
+    && pass "systemd-time-wait-sync.service is enabled." \
+    || fail "systemd-time-wait-sync.service is not enabled."
+
+  info "Waiting up to 180 seconds for current-boot NTP synchronization evidence."
+  if wait_for_ntp_sync 36 5; then
+    pass "System clock is synchronized to a network time source; this validates working time synchronization rather than merely transmitting a UDP/123 packet."
+  else
+    fail "System clock did not synchronize within 180 seconds."
+    report_ntp_diagnostics
+  fi
 }
 
 check_monitored_devices() {
@@ -399,9 +449,9 @@ write_result() {
 summary() {
   section "CONNECTIVITY CHECK SUMMARY"
   echo "Revision: ${REVISION}"
-  echo "PASS: ${PASS_COUNT}"
-  echo "WARN: ${WARN_COUNT}"
-  echo "FAIL: ${FAIL_COUNT}"
+  printf "%sPASS: %s%s\n" "${COLOR_GREEN}" "${PASS_COUNT}" "${COLOR_RESET}"
+  printf "%sWARN: %s%s\n" "${COLOR_YELLOW}" "${WARN_COUNT}" "${COLOR_RESET}"
+  printf "%sFAIL: %s%s\n" "${COLOR_RED}" "${FAIL_COUNT}" "${COLOR_RESET}"
   echo "Log: ${LOG_FILE}"
   echo "Result file: ${RESULT_FILE}"
   echo "Internet inbound requirement: NONE for normal RMM/Domotz cloud communication."
@@ -410,11 +460,11 @@ summary() {
   write_result
 
   if (( FAIL_COUNT == 0 )); then
-    echo "RESULT: PASS"
+    printf "%sRESULT: PASS%s\n" "${COLOR_GREEN}" "${COLOR_RESET}"
     return 0
   fi
 
-  echo "RESULT: FAIL"
+  printf "%sRESULT: FAIL%s\n" "${COLOR_RED}" "${COLOR_RESET}"
   return 1
 }
 

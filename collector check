@@ -41,13 +41,27 @@ REQUIRED_DOMOTZ_PERMISSIONS=(
   system-observe
 )
 
+# Terminal color output. ANSI color is used only for interactive terminals and
+# can be disabled with NO_COLOR=1. Persistent logs are kept as plain text.
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+  COLOR_GREEN=$'\033[32m'
+  COLOR_YELLOW=$'\033[33m'
+  COLOR_RED=$'\033[31m'
+  COLOR_RESET=$'\033[0m'
+else
+  COLOR_GREEN=""
+  COLOR_YELLOW=""
+  COLOR_RED=""
+  COLOR_RESET=""
+fi
+
 PASS_COUNT=0
 WARN_COUNT=0
 FAIL_COUNT=0
 
-pass() { echo "PASS - $*"; PASS_COUNT=$((PASS_COUNT + 1)); }
-warn() { echo "WARN - $*"; WARN_COUNT=$((WARN_COUNT + 1)); }
-fail() { echo "FAIL - $*"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
+pass() { printf '%sPASS - %s%s\n' "${COLOR_GREEN}" "$*" "${COLOR_RESET}"; PASS_COUNT=$((PASS_COUNT + 1)); }
+warn() { printf '%sWARN - %s%s\n' "${COLOR_YELLOW}" "$*" "${COLOR_RESET}"; WARN_COUNT=$((WARN_COUNT + 1)); }
+fail() { printf '%sFAIL - %s%s\n' "${COLOR_RED}" "$*" "${COLOR_RESET}"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 
 section() {
   echo
@@ -68,7 +82,7 @@ init_logging() {
   touch "${LOG_FILE}"
   chmod 640 "${LOG_FILE}"
   ln -sfn "$(basename "${LOG_FILE}")" "${LATEST_LOG}"
-  exec > >(tee -a "${LOG_FILE}") 2>&1
+  exec > >(tee >(sed -u 's/\x1B\[[0-9;]*[mK]//g' >> "${LOG_FILE}")) 2>&1
 }
 
 state_value() {
@@ -249,7 +263,6 @@ check_removed_legacy_collector() {
 
   local found=0
   local legacy_paths=(
-    /opt/solutionz-rmm/crestron_4series_xio_style_collector.py
     /opt/solutionz-rmm/crestron_4series_rmm_collector.py
     /usr/local/bin/solutionz-rmm-collector
     /etc/sudoers.d/solutionz-rmm-collector
@@ -290,9 +303,9 @@ write_result() {
 summary() {
   section "COLLECTOR HEALTH SUMMARY"
   echo "Revision: ${REVISION}"
-  echo "PASS: ${PASS_COUNT}"
-  echo "WARN: ${WARN_COUNT}"
-  echo "FAIL: ${FAIL_COUNT}"
+  printf "%sPASS: %s%s\n" "${COLOR_GREEN}" "${PASS_COUNT}" "${COLOR_RESET}"
+  printf "%sWARN: %s%s\n" "${COLOR_YELLOW}" "${WARN_COUNT}" "${COLOR_RESET}"
+  printf "%sFAIL: %s%s\n" "${COLOR_RED}" "${FAIL_COUNT}" "${COLOR_RESET}"
   echo "Log: ${LOG_FILE}"
   echo "Result file: ${RESULT_FILE}"
   echo "Domotz revision policy: current/stable Snap release; revision is reported, not pinned."
@@ -300,11 +313,11 @@ summary() {
   write_result
 
   if (( FAIL_COUNT == 0 )); then
-    echo "RESULT: PASS"
+    printf "%sRESULT: PASS%s\n" "${COLOR_GREEN}" "${COLOR_RESET}"
     return 0
   fi
 
-  echo "RESULT: FAIL"
+  printf "%sRESULT: FAIL%s\n" "${COLOR_RED}" "${COLOR_RESET}"
   return 1
 }
 
@@ -328,3 +341,4 @@ main() {
 }
 
 main "$@"
+

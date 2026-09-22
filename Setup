@@ -24,9 +24,9 @@ set -Eeuo pipefail
 #   - Ubuntu 24.04 LTS is the controlled OS family. Supported Noble point
 #     releases include Ubuntu 24.04.4 LTS.
 #   - Network changes are staged and take effect after manual reboot.
-#   - NTP synchronization is standardized on systemd-timesyncd. The setup enables
-#     systemd-time-wait-sync so time-sync.target represents an actual successful
-#     current-boot synchronization event, and validators wait/retry before failing.
+#   - NTP synchronization is standardized on systemd-timesyncd. Phase 2 is not
+#     gated by time-sync.target; validators perform a bounded 180-second current-boot
+#     synchronization check so NTP failure is reported instead of blocking validation.
 #   - Serial-console acceptance is based on ttyS0 presence, serial-getty systemd
 #     enabled/active state, and GRUB configuration; a transient agetty process
 #     match is diagnostic only and is not a production failure criterion.
@@ -781,16 +781,12 @@ configure_time_sync() {
   systemctl restart systemd-timesyncd.service >/dev/null 2>&1 || \
     error_exit "systemd-timesyncd.service could not be started/restarted."
 
-  # time-sync.target does not itself guarantee accurate synchronization.
-  # systemd-time-wait-sync.service is what delays time-sync.target until
-  # systemd-timesyncd has successfully synchronized to a remote reference.
-  if systemctl list-unit-files systemd-time-wait-sync.service >/dev/null 2>&1; then
-    systemctl enable systemd-time-wait-sync.service >/dev/null 2>&1 || \
-      error_exit "systemd-time-wait-sync.service could not be enabled."
-  else
-    error_exit "systemd-time-wait-sync.service is unavailable on this Ubuntu 24.04 LTS installation."
-  fi
-
+  # Phase 2 must never be blocked behind time-sync.target. On networks where
+  # UDP/123 is delayed or blocked, systemd-time-wait-sync can hold time-sync.target
+  # indefinitely and prevent the post-reboot validator from running at all.
+  # Revision 5091126 therefore lets the validator start after network-online and
+  # systemd-timesyncd, then performs its own bounded 180-second synchronization
+  # wait and records a PASS/FAIL result in install.state.
   systemctl is-enabled --quiet systemd-timesyncd.service || \
     error_exit "systemd-timesyncd.service is not enabled after configuration."
   systemctl is-active --quiet systemd-timesyncd.service || \
@@ -1541,11 +1537,7 @@ if command -v timedatectl >/dev/null 2>&1; then
     fail "systemd-timesyncd.service is not active."
   fi
 
-  if systemctl is-enabled --quiet systemd-time-wait-sync.service 2>/dev/null; then
-    pass "systemd-time-wait-sync.service is enabled for accurate time-sync.target ordering."
-  else
-    fail "systemd-time-wait-sync.service is not enabled."
-  fi
+  echo "INFO - Phase 2 does not depend on time-sync.target or systemd-time-wait-sync.service; NTP synchronization is validated with a bounded 180-second runtime check."
 
   echo "INFO - Waiting up to 180 seconds for current-boot NTP synchronization evidence."
   if wait_for_ntp_sync 36 5; then
@@ -1627,8 +1619,11 @@ POSTVALIDATOR
   cat > "${POSTREBOOT_SERVICE}" <<EOF
 [Unit]
 Description=Solutionz RMM Post-Reboot Production Validation
-After=network-online.target systemd-timesyncd.service time-sync.target ssh.service snapd.service
-Wants=network-online.target systemd-timesyncd.service systemd-time-wait-sync.service time-sync.target
+# Do not order this service after time-sync.target. If NTP cannot synchronize,
+# time-sync.target may be delayed and Phase 2 would never run, leaving the build
+# stuck at phase1_complete. The validator itself performs a bounded NTP wait.
+After=network-online.target systemd-timesyncd.service ssh.service snapd.service
+Wants=network-online.target systemd-timesyncd.service
 
 [Service]
 Type=oneshot

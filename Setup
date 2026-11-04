@@ -1,29 +1,72 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-
 ###############################################################################
-# Script: rswsolutionz_domotz_setup_rev5091126.sh
+# Script: setup
 # Company: Solutionz INC / RSW
-# Revision: 5091126
-# Release Date: 2026-09-11
+# Revision: V06.100626N
+# Created by Reiko Seneathia Williams
+# Release Date: 2026-10-06
+# Dual-Homed WAN/LAN + Auto-Validation Update: 2026-10-18
+# Security Hardening Update: 2026-11-03
+# Live Network Discovery Update: 2026-11-03
+# Integrated Domotz Activation Update: 2026-11-04
 #
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
 #   Ubuntu 24.04 LTS operating-system family, record the manufacturer-delivered
 #   package state, install/validate required components, install Domotz, configure
-#   the V1210 USB-C COM serial console, and install a serial-console local network
-#   configuration utility.
+#   the V1210 USB-C COM serial console, and automatically generate and validate a
+#   dual-homed network design in which eth0 is the WAN/cloud interface and eth1 is
+#   the AV/control LAN interface. The script supports DHCP or true static WAN,
+#   DHCP/static/native LAN addressing, 802.1Q VLANs on eth1, automatic post-change
+#   validation, and rollback when a network change is locally invalid.
 #
 # Important:
 #   - General "apt upgrade -y" is intentionally NOT used.
 #   - Domotz is intentionally not revision-pinned. The installed Snap revision
 #     is recorded for audit, and updates are governed by operating policy.
 #   - The V1210 USB-C port labeled COM is a serial console, not USB Ethernet.
-#     This script exposes a login shell on ttyS0 and installs
-#     /usr/local/sbin/solutionz-rmm-local-config for direct laptop configuration.
+#     This script exposes an authenticated login on ttyS0 and automatically
+#     launches the Solutionz local configuration menu after a successful USB-C
+#     COM login. Technicians do not need to type a Linux command to open it.
 #   - Ubuntu 24.04 LTS is the controlled OS family. Supported Noble point
 #     releases include Ubuntu 24.04.4 LTS.
-#   - Network changes are staged and take effect after manual reboot.
+#   - Network changes are staged and take effect after manual reboot unless the
+#     onsite network utility explicitly applies a validated change.
+#   - Netplan/VLAN configuration can be generated automatically from a JSON
+#     network profile. VLAN IDs are never guessed from a switch trunk; they must
+#     be supplied in the profile or guided wizard.
+#   - eth0 is the WAN/cloud interface. It may use DHCP (including MAC-reserved or
+#     port-policy DHCP) or a true static IPv4 configuration and is the only
+#     interface permitted to own the IPv4 default route and system DNS.
+#   - eth1 is the AV/control LAN interface. It may use untagged DHCP/static IPv4,
+#     act as an unnumbered 802.1Q trunk parent, or carry both native and tagged LAN
+#     networks. eth1 and all VLANs linked to eth1 are prohibited from installing
+#     a default route or DHCP-provided DNS.
+#   - The RMM Agent is not a WAN-to-LAN router. IPv4 forwarding is explicitly
+#     disabled and validated. Local Domotz/RMM processes can communicate through
+#     both interfaces, but traffic is not forwarded between them.
+#   - After every onsite network change the same installed network validator runs
+#     automatically. Locally invalid addressing/VLAN/default-route changes are
+#     rolled back. Upstream DNS/cloud-connectivity failures are reported without
+#     discarding an otherwise valid customer-provided addressing configuration.
+#   - USB-C COM remains the independent recovery/configuration path when either
+#     Ethernet interface is unavailable or being reconfigured.
+#   - Security hardening enforces UFW deny-incoming/deny-routed defaults while
+#     preserving Domotz-required inbound TCP 22 and TCP 3000; disables IP
+#     forwarding, redirects, source routing and proxy ARP; hardens SSH; enables
+#     auditd/AppArmor; restricts the field-tech path; and maintains a SHA-256
+#     integrity baseline that is revalidated around approved network changes.
+#   - Live network discovery reads the running kernel/network state before the
+#     technician is asked to configure anything. It reports MAC, carrier, link
+#     state, negotiated speed, active IPv4, DHCP-vs-manual indication, gateway,
+#     default route, DNS and live VLAN state without treating Netplan as observed
+#     state. Netplan remains the persistent configuration mechanism across reboot.
+#     A true static address that has never been configured or delivered by DHCP
+#     cannot be inferred safely and is therefore never guessed.
+#   - Secure Boot, TPM-backed disk encryption, CIS remediation, SIEM/EDR and
+#     custom AppArmor application profiles are not auto-enabled by this build.
+#     They remain Phase-2 controls requiring V1210/Domotz compatibility testing.
 #   - NTP synchronization is standardized on systemd-timesyncd. Phase 2 is not
 #     gated by time-sync.target; validators perform a bounded 180-second current-boot
 #     synchronization check so NTP failure is reported instead of blocking validation.
@@ -32,9 +75,12 @@ set -Eeuo pipefail
 #     match is diagnostic only and is not a production failure criterion.
 ###############################################################################
 
-REVISION="5091126"
-SCRIPT_NAME="rswsolutionz_domotz_setup_rev5091126.sh"
-RELEASE_DATE="2026-09-11"
+REVISION="V06.100626N"
+SCRIPT_NAME="setup"
+RELEASE_DATE="2026-10-06"
+NETWORK_FEATURE_UPDATE_DATE="2026-10-18"
+SECURITY_FEATURE_UPDATE_DATE="2026-11-03"
+LIVE_DISCOVERY_UPDATE_DATE="2026-11-03"
 
 SUPPORTED_OS_ID="ubuntu"
 SUPPORTED_UBUNTU_VERSION_ID="24.04"
@@ -62,12 +108,39 @@ MANUFACTURER_PACKAGE_VALIDATION_FILE="${STATE_DIR}/manufacturer-package-validati
 MANUFACTURER_BASELINE_SHA256_FILE="${STATE_DIR}/manufacturer-baseline-${REVISION}.sha256"
 SNAP_BASELINE_FILE="${STATE_DIR}/snap-baseline-${REVISION}.txt"
 NETWORK_REQUIREMENTS_FILE="${STATE_DIR}/network-requirements-${REVISION}.txt"
+NETWORK_PROFILE_DIR="/etc/solutionz-rmm"
+NETWORK_PROFILE_FILE="${NETWORK_PROFILE_DIR}/network-profile.json"
+NETWORK_PROFILE_TOOL="/usr/local/sbin/solutionz-rmm-network-profile"
+NETWORK_PROFILE_RESULT_FILE="${STATE_DIR}/network-profile-${REVISION}.result"
+NETWORK_PROFILE_SOURCE=""
+
+PRIMARY_IFACE="eth0"
+SECONDARY_IFACE="eth1"
+WAN_IFACE="eth0"
+LAN_IFACE="eth1"
 
 NETPLAN_FILE="/etc/netplan/00-installer-config.yaml"
+NETWORK_VALIDATOR="/usr/local/sbin/solutionz-rmm-network-validate"
+NETWORK_VALIDATION_RESULT_FILE="${STATE_DIR}/network-validation-${REVISION}.result"
+LIVE_DISCOVERY_TOOL="/usr/local/sbin/solutionz-rmm-live-network-discovery"
+LIVE_DISCOVERY_RESULT_FILE="${STATE_DIR}/network-live-discovery-${REVISION}.result"
+IP_FORWARD_SYSCTL_FILE="/etc/sysctl.d/90-solutionz-rmm-no-forwarding.conf"
+SECURITY_SYSCTL_FILE="/etc/sysctl.d/91-solutionz-rmm-security.conf"
+SSH_HARDENING_FILE="/etc/ssh/sshd_config.d/99-solutionz-rmm-hardening.conf"
+AUDIT_RULES_FILE="/etc/audit/rules.d/99-solutionz-rmm.rules"
+SECURITY_VALIDATOR="/usr/local/sbin/solutionz-rmm-security-validate"
+SECURITY_VALIDATION_RESULT_FILE="${STATE_DIR}/security-validation-${REVISION}.result"
+INTEGRITY_TOOL="/usr/local/sbin/solutionz-rmm-integrity-baseline"
+SECURITY_BASELINE_FILE="${STATE_DIR}/security-baseline-${REVISION}.sha256"
+SECURITY_APT_POLICY_FILE="/etc/apt/apt.conf.d/52solutionz-rmm-security-updates"
+INSTALLED_SCRIPT_COPY="/usr/local/share/solutionz-rmm/${REVISION}"
+FIELD_TECH_GROUP="solutionz-rmm-tech"
+ENGINEERING_GROUP="solutionz-rmm-engineering"
 GRUB_FILE="/etc/default/grub"
 MOTD_FILE="/etc/update-motd.d/slz-rsw-login"
 SERIAL_PROFILE_FILE="/etc/profile.d/solutionz-rmm-serial.sh"
 LOCAL_CONFIG_TOOL="/usr/local/sbin/solutionz-rmm-local-config"
+LOCAL_CONFIG_SUDOERS_FILE="/etc/sudoers.d/solutionz-rmm-local-config"
 
 SERIAL_DEVICE="/dev/ttyS0"
 SERIAL_SERVICE="serial-getty@ttyS0.service"
@@ -80,8 +153,23 @@ RESOLV_FILE="/etc/resolv.conf"
 POSTREBOOT_VALIDATOR="/usr/local/sbin/rswsolutionz-rmm-postreboot-validate"
 POSTREBOOT_SERVICE="/etc/systemd/system/rswsolutionz-rmm-postreboot-validation.service"
 POSTREBOOT_LOG="${LOG_DIR}/postreboot-validation.log"
+PHASE1_FAILURE_RESULT_FILE="${STATE_DIR}/phase1-failure-${REVISION}.result"
+PREREBOOT_RESULT_FILE="${STATE_DIR}/prereboot-validation-${REVISION}.result"
+POSTREBOOT_RESULT_FILE="${STATE_DIR}/postreboot-validation-${REVISION}.result"
+
+DOMOTZ_ACTIVATION_HELPER="/usr/local/sbin/solutionz-domotz-activate"
+DOMOTZ_ACTIVATION_SERVICE="/etc/systemd/system/solutionz-domotz-activate.service"
+DOMOTZ_ACTIVATION_TIMER="/etc/systemd/system/solutionz-domotz-activate.timer"
+DOMOTZ_ACTIVATION_CONFIG="/etc/solutionz-rmm/domotz-activation.json"
+DOMOTZ_ACTIVATION_STATE_DIR="/var/lib/solutionz-domotz-activation"
+DOMOTZ_ACTIVATION_RESULT="${DOMOTZ_ACTIVATION_STATE_DIR}/result.json"
+SETUP_COMMAND="/usr/local/sbin/solutionz-rmm-setup"
 
 NON_INTERACTIVE=0
+NO_POWEROFF=0
+RUN_MODE="install"
+TOTAL_INSTALL_STEPS=18
+PRE_REBOOT_FAILED_CHECKS=()
 CURRENT_STEP="startup"
 
 # Terminal color output. ANSI color is used only for interactive terminals and
@@ -128,6 +216,9 @@ REQUIRED_PACKAGES=(
   systemd-timesyncd
   sudo
   python3
+  auditd
+  apparmor
+  unattended-upgrades
 )
 
 # Solutionz RMM traffic model:
@@ -155,28 +246,27 @@ Usage:
 
 Options:
   --non-interactive             Skip the two manual confirmation prompts.
-  --easter-egg                  Display the non-operational 5091126 Easter egg and exit.
+  --network-profile <json>      Generate dual-homed WAN/LAN/VLAN Netplan
+                                from the supplied validated JSON profile.
+  --prepare-deployment          After Phase 2 passes, configure/arm Domotz
+                                activation for the next boot and power off.
+  --activation-status           Show build state and Domotz activation status.
+  --no-poweroff                 With --prepare-deployment, arm for the next
+                                boot but leave the appliance powered on.
   -h, --help                    Show this help.
+
+One-file deployment flow:
+  1) Run Setup normally to build and validate Phase 1.
+  2) Reboot once; Phase 2 validation runs automatically.
+  3) Run: sudo solutionz-rmm-setup --prepare-deployment
+     The same Setup source configures and arms activation, then powers off.
+  4) On the customer network, power on. Activation is attempted locally through
+     127.0.0.1:3000 only after the collector and network are ready.
 
 Domotz update model:
   Domotz is not revision-pinned by this script. New installations use the
   Snap Store stable/default release and the installed revision is logged.
 EOF
-}
-
-show_easter_egg() {
-  printf '%s\n' "${COLOR_CYAN}"
-  cat <<'EASTER_EGG'
-╔══════════════════════════════════════════════════════╗
-║              SOLUTIONZ RMM - REV 5091126            ║
-║                                                      ║
-║  If you found this, you actually read the script.   ║
-║  Statistically, that already puts you ahead.        ║
-║                                                      ║
-║  Monitor everything. Trust nothing. Check the logs. ║
-╚══════════════════════════════════════════════════════╝
-EASTER_EGG
-  printf '%s' "${COLOR_RESET}"
 }
 
 parse_args() {
@@ -185,9 +275,22 @@ parse_args() {
       --non-interactive)
         NON_INTERACTIVE=1
         ;;
-      --easter-egg)
-        show_easter_egg
-        exit 0
+      --network-profile)
+        shift
+        [[ $# -gt 0 ]] || { echo "--network-profile requires a JSON file path." >&2; exit 2; }
+        NETWORK_PROFILE_SOURCE="$1"
+        ;;
+      --network-profile=*)
+        NETWORK_PROFILE_SOURCE="${1#*=}"
+        ;;
+      --prepare-deployment)
+        RUN_MODE="prepare_deployment"
+        ;;
+      --activation-status)
+        RUN_MODE="activation_status"
+        ;;
+      --no-poweroff)
+        NO_POWEROFF=1
         ;;
       -h|--help)
         usage
@@ -215,9 +318,14 @@ init_logging() {
   chmod 750 "${LOG_DIR}" "${STATE_DIR}"
   touch "${LOG_FILE}"
   chmod 640 "${LOG_FILE}"
-  # Preserve color in the terminal while keeping the persistent log free of
-  # ANSI escape sequences.
+
+  # Display command output normally while also preserving a plain-text copy in
+  # the installation log. Nothing is intentionally hidden from the console.
   exec > >(tee -i >(sed -u 's/\x1B\[[0-9;]*[mK]//g' >> "${LOG_FILE}")) 2>&1
+}
+
+info_message() {
+  printf ' %s[i] %s%s\n' "${COLOR_CYAN}" "$1" "${COLOR_RESET}"
 }
 
 progress_message() {
@@ -229,10 +337,18 @@ warning_message() {
 }
 
 step_message() {
-  CURRENT_STEP="$1 - $2"
-  echo "------------------------------------------------------------"
-  echo "Step $1: $2"
-  echo "------------------------------------------------------------"
+  local step="$1"
+  local description="$2"
+  local percent=$(( (step - 1) * 100 / TOTAL_INSTALL_STEPS ))
+  CURRENT_STEP="${step} - ${description}"
+
+  printf '\n%s[%3d%%] Step %02d/%02d | %s%s\n' \
+    "${COLOR_CYAN}" "${percent}" "${step}" "${TOTAL_INSTALL_STEPS}" \
+    "${description}" "${COLOR_RESET}"
+}
+
+completion_message() {
+  printf '\n%s[100%%] Installation phase complete%s\n' "${COLOR_GREEN}" "${COLOR_RESET}"
 }
 
 write_state() {
@@ -264,15 +380,24 @@ backup_previous_state() {
 
 record_network_requirements() {
   cat > "${NETWORK_REQUIREMENTS_FILE}" <<'EOF'
-Solutionz RMM Agent Network Requirements - Revision 5091126
+Solutionz RMM Agent Network Requirements - Revision V06.100626N
+
+Dual-homed interface model
+- eth0 = WAN/cloud uplink. eth0 is the only interface allowed to own the IPv4
+  default route and system DNS.
+- eth1 = AV/control LAN. eth1 has no default route. Tagged AV/control VLANs are
+  created on eth1 and likewise have no default route.
+- IPv4 forwarding between WAN and LAN is disabled. The collector is not a router.
+- USB-C COM is the independent recovery/configuration path.
 
 Traffic model
-- Monitoring traffic originates from the RMM Agent to monitored AV devices.
-- RMM/Domotz cloud sessions are initiated outbound by the RMM Agent.
+- Domotz/RMM cloud sessions originate outbound through WAN/eth0.
+- Monitoring traffic originates locally from the RMM Agent through LAN/eth1 or
+  an eth1 VLAN toward monitored AV devices.
 - No unsolicited Internet-initiated inbound connection is required for normal
   RMM/Domotz cloud communication.
 
-Outbound TCP - cloud/platform
+Outbound TCP - WAN/cloud
 - TCP 443          Domotz portal/API/orchestration and Ubuntu/Canonical/Snap HTTPS
 - TCP 5671         Domotz secure messaging/orchestration
 - TCP 32700-57699  Domotz remote relay/secure remote connectivity
@@ -282,24 +407,23 @@ Outbound TCP - cloud/platform
 - TCP 53           DNS fallback/large responses when the resolver requires TCP
 
 Outbound/local UDP
-- UDP 53           DNS queries when the resolver uses UDP transport
+- UDP 53           DNS queries when UDP transport is used
 - UDP 123          NTP/time synchronization
-- UDP 67/68        DHCP client/server exchange when eth0 is configured for DHCP
-- UDP 161          SNMP polling from the RMM Agent to monitored devices when SNMP
-                   monitoring is configured
-- Additional UDP   As required by a specific monitored-device manufacturer protocol
+- UDP 67/68        DHCP on eth0 and/or eth1/VLANs when DHCP is selected
+- UDP 161          SNMP polling from LAN/eth1 or an eth1 VLAN to monitored devices
+- Additional UDP   As required by manufacturer-specific monitored-device protocols
 
 Other required traffic
-- ICMP             Device heartbeat/reachability, response-time and packet-loss tests
-                   where the routed network/security policy permits ICMP
+- ICMP             Device heartbeat/reachability, latency and packet-loss testing
+                   where the customer security policy permits ICMP
 
-Local monitored-device traffic
-- HTTP/HTTPS       TCP 80/443 when used by the monitored device
+Local monitored-device traffic - LAN side
+- HTTP/HTTPS       TCP 80/443 when used by monitored devices
 - SSH              TCP 22 when used for device monitoring/management
 - SNMP             UDP 161 when SNMP polling is configured
-- Manufacturer-specific TCP/UDP ports as required by the monitored device profile
-- Routed networks/VLAN ACLs must permit the RMM Agent to reach each monitored
-  device on the protocol/port required for that device.
+- Manufacturer-specific TCP/UDP ports as required by each monitored device
+- LAN/VLAN ACLs must permit the RMM Agent to reach each monitored device on the
+  protocol/port required for that device.
 
 Agent host firewall inbound allowances
 - TCP 22           SSH administration
@@ -308,21 +432,50 @@ Agent host firewall inbound allowances
 UFW baseline
 - Default incoming: deny
 - Default outgoing: allow
-- TCP 22: allow from any reachable source
-- TCP 3000: allow from any reachable source
-- No separate outbound TCP/UDP UFW rules are created because the host baseline is
-  default-allow for outbound traffic. This does not override upstream firewall, ACL,
-  VLAN, proxy, or perimeter-security restrictions.
+- Default routed/forwarded traffic: deny
+- TCP 22: allow from any reachable source because Domotz/SSH requires it
+- TCP 3000: allow from any reachable source because the Domotz Agent service requires it
+- Host UFW allowances do not publish either service through Internet NAT.
+- UFW logging is enabled at a low level for host-firewall audit visibility.
+
+Host security baseline
+- IPv4 forwarding is disabled and eth0/eth1 are not permitted to become bridge members.
+- ICMP redirects and source routing are disabled; martian packet logging is enabled.
+- SSH root login is disabled; MaxAuthTries=3; LoginGraceTime=30; X11 forwarding is disabled.
+- Domotz-sensitive global SSH tunneling/authentication settings are not disabled until regression tested.
+- Dedicated solutionz-rmm-tech and solutionz-rmm-engineering groups separate controlled field configuration from engineering administration.
+- The field configuration menu does not expose an unrestricted Linux shell option.
+- auditd records changes to Solutionz-controlled network, SSH, firewall, sysctl, systemd, utility and state paths.
+- AppArmor remains enabled as an OS mandatory-access-control layer.
+- A SHA-256 integrity baseline protects Solutionz scripts and security/network configuration files.
+- The security validator flags unexpected network-reachable TCP listeners beyond approved TCP 22/3000.
+- Security updates use a controlled maintenance policy: unattended installation and automatic reboot are disabled.
+
+Automatic WAN/LAN/VLAN behavior
+- Netplan is generated from /etc/solutionz-rmm/network-profile.json.
+- Default profile: WAN eth0 DHCP; LAN eth1 DHCP with DHCP routes and DNS ignored.
+- WAN eth0 supports DHCP or true static IPv4. Static WAN requires gateway and DNS.
+- LAN eth1 supports DHCP, static IPv4, or unnumbered trunk-parent mode.
+- Tagged VLANs are IEEE 802.1Q subinterfaces linked to eth1, not eth0.
+- VLANs support DHCP or static IPv4, but may not own a default route or DNS.
+- VLAN IDs are never guessed; customer/engineering values must be supplied.
+- Exactly one IPv4 default route is allowed and it must use eth0.
+- DHCP on eth1/VLAN interfaces suppresses DHCP-provided routes and DNS.
+- IPv4 forwarding must remain disabled (net.ipv4.ip_forward=0).
+- After every network change, automatic validation verifies the active WAN/LAN
+  profile. Local configuration failures trigger rollback to the previous Netplan.
+- DNS/Domotz reachability failures are reported separately so a valid customer
+  static configuration is not discarded merely because an upstream firewall is
+  still blocking a required service.
 
 Security boundary note
 - Global TCP 22/TCP 3000 allowance on the RMM Agent host does not mean either port
-  should be published through Internet NAT or permitted as unsolicited Internet
-  inbound traffic. Perimeter policy remains responsible for preventing that exposure.
-- Upstream firewalls must allow the required outbound TCP/UDP traffic and the local
-  monitoring traffic needed for the monitored AV devices.
+  should be exposed through Internet NAT. Perimeter policy remains responsible.
+- Upstream firewalls must allow required WAN/cloud traffic and LAN monitoring
+  traffic for the monitored AV devices.
 EOF
   chmod 640 "${NETWORK_REQUIREMENTS_FILE}"
-  progress_message "Recorded network requirements: ${NETWORK_REQUIREMENTS_FILE}"
+  progress_message "Recorded dual-homed WAN/LAN network requirements: ${NETWORK_REQUIREMENTS_FILE}"
 }
 
 record_failure_and_exit() {
@@ -331,16 +484,36 @@ record_failure_and_exit() {
   local command="$3"
   trap - ERR
   set +e
+
+  {
+    echo "result=FAIL"
+    echo "phase=phase1_installation"
+    echo "revision=${REVISION}"
+    echo "script=${SCRIPT_NAME}"
+    echo "timestamp_utc=$(date -u +%FT%TZ)"
+    echo "step=${CURRENT_STEP}"
+    echo "line=${line}"
+    echo "exit_code=${rc}"
+    echo "command=${command}"
+    echo "log=${LOG_FILE}"
+  } > "${PHASE1_FAILURE_RESULT_FILE}"
+  chmod 640 "${PHASE1_FAILURE_RESULT_FILE}"
+
   write_state "phase1_failed" \
     "exit_code=${rc}" \
     "line=${line}" \
-    "command=${command}"
-  printf ' %s[!] INSTALLATION FAILED%s\n' "${COLOR_RED}" "${COLOR_RESET}"
-  printf ' %s[!] Step: %s%s\n' "${COLOR_RED}" "${CURRENT_STEP}" "${COLOR_RESET}"
-  printf ' %s[!] Line: %s%s\n' "${COLOR_RED}" "${line}" "${COLOR_RESET}"
-  printf ' %s[!] Exit code: %s%s\n' "${COLOR_RED}" "${rc}" "${COLOR_RESET}"
-  printf ' %s[!] Command: %s%s\n' "${COLOR_RED}" "${command}" "${COLOR_RESET}"
-  printf ' %s[!] Log: %s%s\n' "${COLOR_RED}" "${LOG_FILE}" "${COLOR_RESET}"
+    "command=${command}" \
+    "result_file=${PHASE1_FAILURE_RESULT_FILE}" \
+    "log=${LOG_FILE}"
+
+  printf ' %s[!] INSTALLATION FAILED%s\n' "${COLOR_RED}" "${COLOR_RESET}" >&${UI_FD}
+  printf ' %s[!] Step: %s%s\n' "${COLOR_RED}" "${CURRENT_STEP}" "${COLOR_RESET}" >&${UI_FD}
+  printf ' %s[!] Line: %s%s\n' "${COLOR_RED}" "${line}" "${COLOR_RESET}" >&${UI_FD}
+  printf ' %s[!] Exit code: %s%s\n' "${COLOR_RED}" "${rc}" "${COLOR_RESET}" >&${UI_FD}
+  printf ' %s[!] Command: %s%s\n' "${COLOR_RED}" "${command}" "${COLOR_RESET}" >&${UI_FD}
+  printf ' %s[!] Failure result: %s%s\n' "${COLOR_RED}" "${PHASE1_FAILURE_RESULT_FILE}" "${COLOR_RESET}" >&${UI_FD}
+  printf ' %s[!] Log: %s%s\n' "${COLOR_RED}" "${LOG_FILE}" "${COLOR_RESET}" >&${UI_FD}
+  append_ui_log "INSTALLATION FAILED | step=${CURRENT_STEP} | line=${line} | exit_code=${rc} | command=${command} | result=${PHASE1_FAILURE_RESULT_FILE} | log=${LOG_FILE}"
   exit "${rc}"
 }
 
@@ -355,8 +528,29 @@ error_exit() {
   local message="$1"
   trap - ERR
   set +e
-  printf ' %s[!] ERROR: %s%s\n' "${COLOR_RED}" "${message}" "${COLOR_RESET}"
-  write_state "phase1_failed" "error=${message}"
+
+  {
+    echo "result=FAIL"
+    echo "phase=phase1_installation"
+    echo "revision=${REVISION}"
+    echo "script=${SCRIPT_NAME}"
+    echo "timestamp_utc=$(date -u +%FT%TZ)"
+    echo "step=${CURRENT_STEP}"
+    echo "error=${message}"
+    echo "log=${LOG_FILE}"
+  } > "${PHASE1_FAILURE_RESULT_FILE}"
+  chmod 640 "${PHASE1_FAILURE_RESULT_FILE}"
+
+  printf ' %s[!] ERROR: %s%s\n' "${COLOR_RED}" "${message}" "${COLOR_RESET}" >&${UI_FD}
+  printf ' %s[!] Step: %s%s\n' "${COLOR_RED}" "${CURRENT_STEP}" "${COLOR_RESET}" >&${UI_FD}
+  printf ' %s[!] Failure result: %s%s\n' "${COLOR_RED}" "${PHASE1_FAILURE_RESULT_FILE}" "${COLOR_RESET}" >&${UI_FD}
+  printf ' %s[!] Log: %s%s\n' "${COLOR_RED}" "${LOG_FILE}" "${COLOR_RESET}" >&${UI_FD}
+  append_ui_log "ERROR | step=${CURRENT_STEP} | message=${message} | result=${PHASE1_FAILURE_RESULT_FILE} | log=${LOG_FILE}"
+
+  write_state "phase1_failed" \
+    "error=${message}" \
+    "result_file=${PHASE1_FAILURE_RESULT_FILE}" \
+    "log=${LOG_FILE}"
   exit 1
 }
 
@@ -377,38 +571,43 @@ prompt_confirmation() {
 |_____/  \____/  |_____| \____/    |_|   |_|  \____/ |_|   \_| /_____|
 
 Solutionz RMM Agent Build - Revision ${REVISION}
-\e[0m"
+Created by Reiko Seneathia Williams
+\e[0m" >&${UI_FD}
 
-  cat <<EOF
+  cat >&${UI_FD} <<EOF
 This script will:
   1. Validate the Ubuntu 24.04 LTS OS family and Protectli V1210 hardware.
   2. Record the manufacturer-delivered OS/package state before modification.
   3. Install only missing required packages; no general apt upgrade is performed.
   4. Verify SSH, TUN, Snap, Domotz, and required Domotz permissions.
   5. Configure UFW with inbound TCP 22/TCP 3000 permitted and default-allow outbound TCP/UDP traffic.
-  6. Stage Netplan with eth0 as the RMM network interface and eth1 disabled.
-  7. Repair and validate system DNS behavior.
-  8. Normalize Solutionz hostname entries.
-  9. Configure GRUB interface naming and the V1210 USB-C COM serial console.
- 10. Install a direct serial-console network configuration utility.
- 11. Install post-reboot production validation.
- 12. Stage all changes without automatically rebooting.
+  6. Stage dual-homed networking: eth0 WAN/cloud default route and eth1 AV/control LAN with no default route.
+  7. Generate optional 802.1Q LAN VLANs on eth1 from a guided or saved profile.
+  8. Disable IPv4 forwarding so the collector does not route between WAN and LAN.
+  9. Repair and validate system DNS behavior.
+ 10. Normalize Solutionz hostname entries.
+ 11. Configure GRUB interface naming and the V1210 USB-C COM serial console.
+ 12. Install the USB-C COM WAN/LAN/VLAN utility with automatic post-change validation and rollback.
+ 13. Install post-reboot production validation.
+ 14. Stage all changes without automatically rebooting.
 
 USB-C COM direct laptop configuration:
   After reboot, connect a laptop to the V1210 USB-C port labeled COM.
   Use 115200 baud, 8 data bits, no parity, 1 stop bit (8N1).
-  Log in normally, then run:
-      sudo ${LOCAL_CONFIG_TOOL}
+  Log in normally. When the login is through ttyS0, the Solutionz RMM local
+  configuration menu launches automatically. No Linux command is required.
 
 Domotz note:
   Domotz is intentionally not revision-pinned. The installed Snap revision is
   recorded for audit and support.
 EOF
 
-  read -r -p "Type 'yes' to proceed: " confirmation1
+  printf "Type 'yes' to proceed: " >&${UI_FD}
+  read -r confirmation1
   [[ "${confirmation1}" == "yes" ]] || error_exit "Confirmation not received."
 
-  read -r -p "Type 'yes' again to confirm production configuration changes: " confirmation2
+  printf "Type 'yes' again to confirm production configuration changes: " >&${UI_FD}
+  read -r confirmation2
   [[ "${confirmation2}" == "yes" ]] || error_exit "Second confirmation not received."
 }
 
@@ -771,7 +970,7 @@ configure_time_sync() {
   systemctl list-unit-files systemd-timesyncd.service >/dev/null 2>&1 || \
     error_exit "systemd-timesyncd.service is unavailable; the required systemd-timesyncd package is not installed correctly."
 
-  # Revision 5091126 standardizes Ubuntu time synchronization on
+  # Revision V06.100626N standardizes Ubuntu time synchronization on
   # systemd-timesyncd. timedatectl enables network time, while the explicit
   # service commands make the runtime/startup state deterministic.
   timedatectl set-ntp true >/dev/null 2>&1 || \
@@ -784,7 +983,7 @@ configure_time_sync() {
   # Phase 2 must never be blocked behind time-sync.target. On networks where
   # UDP/123 is delayed or blocked, systemd-time-wait-sync can hold time-sync.target
   # indefinitely and prevent the post-reboot validator from running at all.
-  # Revision 5091126 therefore lets the validator start after network-online and
+  # Revision V06.100626N therefore lets the validator start after network-online and
   # systemd-timesyncd, then performs its own bounded 180-second synchronization
   # wait and records a PASS/FAIL result in install.state.
   systemctl is-enabled --quiet systemd-timesyncd.service || \
@@ -832,7 +1031,7 @@ install_domotz() {
 
   if (( installed == 0 )); then
     if ! snap install "${DOMOTZ_SNAP_NAME}"; then
-      error_exit "Domotz Snap installation failed."
+error_exit "Domotz Snap installation failed."
     fi
   fi
 
@@ -864,7 +1063,7 @@ configure_domotz_permissions() {
 }
 
 configure_ufw() {
-  step_message 9 "Configure and verify UFW"
+  step_message 9 "Configure firewall and host security baseline"
 
   if ! ufw default deny incoming; then
     error_exit "Unable to set UFW default incoming policy."
@@ -872,6 +1071,10 @@ configure_ufw() {
   if ! ufw default allow outgoing; then
     error_exit "Unable to set UFW default outgoing policy. RMM/Domotz and monitoring traffic must be able to originate from the Agent."
   fi
+  if ! ufw default deny routed; then
+    error_exit "Unable to set UFW default routed/forwarded policy to deny."
+  fi
+  ufw logging low >/dev/null 2>&1 || warning_message "Unable to set UFW logging level to low; continuing with existing UFW logging policy."
 
   # Production requirement supplied by Solutionz: SSH and local Domotz service
   # ports are permitted globally on the Agent host firewall. This does not mean
@@ -890,28 +1093,984 @@ configure_ufw() {
   ufw status | grep -q "Status: active" || error_exit "UFW did not become active."
   ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW' || error_exit "Expected global SSH UFW rule was not found."
   ufw status | grep -Eq '^3000/tcp[[:space:]]+ALLOW' || error_exit "Expected global TCP 3000 UFW rule was not found."
+  grep -Eq '^DEFAULT_FORWARD_POLICY="?DROP"?$' /etc/default/ufw || error_exit "UFW routed/forwarded default policy is not DROP."
 
-  progress_message "UFW validated: inbound TCP 22/TCP 3000 are permitted; outbound TCP/UDP traffic is allowed by default."
+  progress_message "UFW validated: inbound TCP 22/TCP 3000 are permitted, routed traffic is denied, and outbound TCP/UDP traffic is allowed by default."
   ufw status verbose
 }
 
-write_netplan_config() {
-  cat > "${NETPLAN_FILE}" <<'YAML'
-network:
-  version: 2
-  renderer: networkd
-  ethernets:
-    eth0:
-      dhcp4: true
-      dhcp6: false
-      accept-ra: false
+install_security_integrity_tool() {
+  install -d -m 755 /usr/local/sbin
+  install -d -m 750 /usr/local/share/solutionz-rmm
+  cat > "${INTEGRITY_TOOL}" <<'INTEGRITYTOOL'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+REVISION="V06.100626N"
+BASELINE="/var/lib/rswsolutionz-rmm/security-baseline-V06.100626N.sha256"
+FILES=(
+  "/usr/local/share/solutionz-rmm/V06.100626N"
+  "/usr/local/sbin/solutionz-rmm-network-profile"
+  "/usr/local/sbin/solutionz-rmm-network-validate"
+  "/usr/local/sbin/solutionz-rmm-live-network-discovery"
+  "/usr/local/sbin/solutionz-rmm-security-validate"
+  "/usr/local/sbin/solutionz-rmm-integrity-baseline"
+  "/usr/local/sbin/solutionz-rmm-local-config"
+  "/usr/local/sbin/rswsolutionz-rmm-postreboot-validate"
+  "/etc/solutionz-rmm/network-profile.json"
+  "/etc/netplan/00-installer-config.yaml"
+  "/etc/ssh/sshd_config.d/99-solutionz-rmm-hardening.conf"
+  "/etc/sysctl.d/90-solutionz-rmm-no-forwarding.conf"
+  "/etc/sysctl.d/91-solutionz-rmm-security.conf"
+  "/etc/audit/rules.d/99-solutionz-rmm.rules"
+  "/etc/apt/apt.conf.d/52solutionz-rmm-security-updates"
+  "/etc/default/ufw"
+  "/etc/ufw/user.rules"
+  "/etc/profile.d/solutionz-rmm-serial.sh"
+  "/etc/sudoers.d/solutionz-rmm-local-config"
+)
+usage(){ echo "Usage: $(basename "$0") --refresh|--verify"; }
+case "${1:-}" in
+  --refresh)
+    install -d -m 750 "$(dirname "$BASELINE")"
+    tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+    for f in "${FILES[@]}"; do
+      [[ -e "$f" ]] || { echo "ERROR - Required integrity target missing: $f" >&2; exit 1; }
+      sha256sum "$f" >> "$tmp"
+    done
+    install -o root -g root -m 640 "$tmp" "$BASELINE"
+    echo "Security integrity baseline refreshed: $BASELINE"
+    ;;
+  --verify)
+    [[ -s "$BASELINE" ]] || { echo "ERROR - Security integrity baseline missing: $BASELINE" >&2; exit 1; }
+    sha256sum -c "$BASELINE"
+    ;;
+  *) usage; exit 2 ;;
+esac
+INTEGRITYTOOL
+  chmod 750 "${INTEGRITY_TOOL}"
+  chown root:root "${INTEGRITY_TOOL}"
+}
 
-    eth1:
-      dhcp4: false
-      dhcp6: false
-      accept-ra: false
-      optional: true
-YAML
+install_security_validator() {
+  install -d -m 755 /usr/local/sbin
+  cat > "${SECURITY_VALIDATOR}" <<'SECURITYVALIDATOR'
+#!/usr/bin/env bash
+set -uo pipefail
+REVISION="V06.100626N"
+RESULT="/var/lib/rswsolutionz-rmm/security-validation-V06.100626N.result"
+SYSCTL_FILE="/etc/sysctl.d/91-solutionz-rmm-security.conf"
+SSH_FILE="/etc/ssh/sshd_config.d/99-solutionz-rmm-hardening.conf"
+AUDIT_FILE="/etc/audit/rules.d/99-solutionz-rmm.rules"
+APT_POLICY="/etc/apt/apt.conf.d/52solutionz-rmm-security-updates"
+INTEGRITY="/usr/local/sbin/solutionz-rmm-integrity-baseline"
+BASELINE="/var/lib/rswsolutionz-rmm/security-baseline-V06.100626N.sha256"
+TECH_GROUP="solutionz-rmm-tech"
+ENG_GROUP="solutionz-rmm-engineering"
+LOCALCFG="/usr/local/sbin/solutionz-rmm-local-config"
+LIVE="/usr/local/sbin/solutionz-rmm-live-network-discovery"
+LIVE_RESULT="/var/lib/rswsolutionz-rmm/network-live-discovery-V06.100626N.result"
+F=(); W=()
+pass(){ echo "PASS - $*"; }
+fail(){ echo "FAIL - $*"; F+=("$*"); }
+warn(){ echo "WARN - $*"; W+=("$*"); }
+check_sysctl(){ local k="$1" v="$2" a; a="$(sysctl -n "$k" 2>/dev/null || true)"; [[ "$a" == "$v" ]] && pass "$k=$v" || fail "$k is '${a:-missing}', expected '$v'"; }
+mkdir -p "$(dirname "$RESULT")"
+
+echo "============================================================"
+echo "Solutionz RMM Security Validation"
+echo "Revision: $REVISION"
+echo "Time: $(date -u +%FT%TZ)"
+echo "============================================================"
+
+[[ -s "$SYSCTL_FILE" ]] && pass "Security sysctl policy installed." || fail "Security sysctl policy missing."
+check_sysctl net.ipv4.ip_forward 0
+check_sysctl net.ipv4.conf.all.accept_redirects 0
+check_sysctl net.ipv4.conf.default.accept_redirects 0
+check_sysctl net.ipv4.conf.all.send_redirects 0
+check_sysctl net.ipv4.conf.default.send_redirects 0
+check_sysctl net.ipv4.conf.all.accept_source_route 0
+check_sysctl net.ipv4.conf.default.accept_source_route 0
+check_sysctl net.ipv4.icmp_echo_ignore_broadcasts 1
+check_sysctl net.ipv4.conf.all.log_martians 1
+check_sysctl net.ipv4.conf.default.log_martians 1
+check_sysctl net.ipv4.conf.all.proxy_arp 0
+check_sysctl net.ipv4.conf.default.proxy_arp 0
+check_sysctl net.ipv6.conf.all.forwarding 0
+check_sysctl net.ipv6.conf.default.forwarding 0
+check_sysctl net.ipv6.conf.all.accept_redirects 0
+check_sysctl net.ipv6.conf.default.accept_redirects 0
+check_sysctl net.ipv6.conf.all.accept_source_route 0
+check_sysctl net.ipv6.conf.default.accept_source_route 0
+
+for iface in eth0 eth1; do
+  if ip -o link show dev "$iface" 2>/dev/null | grep -q ' master '; then
+    fail "$iface is enslaved to a bridge/bond/master; WAN/LAN bridging is prohibited."
+  else
+    pass "$iface is not attached to a bridge/bond/master."
+  fi
+done
+
+ufw status 2>/dev/null | grep -q 'Status: active' && pass "UFW active." || fail "UFW inactive."
+ufw status 2>/dev/null | grep -Eq '^22/tcp[[:space:]]+ALLOW' && pass "Domotz-required TCP 22 permitted." || fail "Required UFW TCP 22 rule missing."
+ufw status 2>/dev/null | grep -Eq '^3000/tcp[[:space:]]+ALLOW' && pass "Domotz-required TCP 3000 permitted." || fail "Required UFW TCP 3000 rule missing."
+grep -Eq '^DEFAULT_INPUT_POLICY="?DROP"?$' /etc/default/ufw 2>/dev/null && pass "UFW default inbound policy is DROP." || fail "UFW default inbound policy is not DROP."
+grep -Eq '^DEFAULT_OUTPUT_POLICY="?ACCEPT"?$' /etc/default/ufw 2>/dev/null && pass "UFW default outbound policy is ACCEPT." || fail "UFW default outbound policy is not ACCEPT."
+grep -Eq '^DEFAULT_FORWARD_POLICY="?DROP"?$' /etc/default/ufw 2>/dev/null && pass "UFW forwarded/routed policy is DROP." || fail "UFW forwarded/routed policy is not DROP."
+
+if command -v sshd >/dev/null 2>&1 && sshd -t >/dev/null 2>&1; then
+  pass "sshd configuration parses successfully."
+  SSH_EFFECTIVE="$(sshd -T 2>/dev/null || true)"
+  grep -q '^permitrootlogin no$' <<<"$SSH_EFFECTIVE" && pass "SSH root login disabled." || fail "SSH PermitRootLogin is not 'no'."
+  grep -q '^maxauthtries 3$' <<<"$SSH_EFFECTIVE" && pass "SSH MaxAuthTries=3." || fail "SSH MaxAuthTries is not 3."
+  grep -q '^logingracetime 30$' <<<"$SSH_EFFECTIVE" && pass "SSH LoginGraceTime=30." || fail "SSH LoginGraceTime is not 30 seconds."
+  grep -q '^x11forwarding no$' <<<"$SSH_EFFECTIVE" && pass "SSH X11 forwarding disabled." || fail "SSH X11Forwarding is not disabled."
+else
+  fail "sshd configuration validation failed."
+fi
+getent group "$TECH_GROUP" >/dev/null 2>&1 && pass "Restricted field-tech group exists." || fail "Field-tech group missing."
+getent group "$ENG_GROUP" >/dev/null 2>&1 && pass "Engineering group exists." || fail "Engineering group missing."
+if [[ -x "$LOCALCFG" ]] && ! grep -q 'Open Linux shell' "$LOCALCFG"; then
+  pass "Field configuration menu does not expose an unrestricted Linux shell option."
+else
+  fail "Field configuration menu exposes or cannot verify Linux shell access."
+fi
+[[ -x "$LIVE" ]] && pass "Live network discovery utility installed." || fail "Live network discovery utility missing."
+[[ -s "$LIVE_RESULT" ]] && pass "Live network discovery result record exists." || warn "Live network discovery result record is not present yet."
+
+systemctl is-active --quiet auditd 2>/dev/null && pass "auditd active." || fail "auditd inactive."
+[[ -s "$AUDIT_FILE" ]] && pass "Solutionz audit rules installed." || fail "Solutionz audit rules missing."
+if command -v auditctl >/dev/null 2>&1; then
+  auditctl -l 2>/dev/null | grep -q 'solutionz_netplan' && pass "Solutionz audit rules loaded." || warn "Solutionz audit rules are not visible in auditctl output; verify after reboot."
+fi
+systemctl is-active --quiet apparmor 2>/dev/null && pass "AppArmor service active." || fail "AppArmor service inactive."
+[[ -s "$APT_POLICY" ]] && grep -q 'Automatic-Reboot "false"' "$APT_POLICY" && pass "Controlled security-update policy installed with automatic reboot disabled." || fail "Controlled security-update policy missing/invalid."
+grep -q 'APT::Periodic::Unattended-Upgrade "0"' "$APT_POLICY" 2>/dev/null && pass "Unattended package installation disabled; security updates require an approved maintenance action." || fail "Unattended package installation is not disabled by Solutionz policy."
+
+if [[ -x "$INTEGRITY" && -s "$BASELINE" ]]; then
+  "$INTEGRITY" --verify >/dev/null 2>&1 && pass "Security integrity baseline validates." || fail "Security integrity baseline validation failed."
+else
+  fail "Security integrity baseline/tool missing."
+fi
+
+ss -lntH 2>/dev/null | while read -r state recvq sendq local peer rest; do
+  port="${local##*:}"; addr="${local%:*}"
+  [[ "$port" =~ ^[0-9]+$ ]] || continue
+  case "$addr" in 127.*|'[::1]'|'::1') continue ;; esac
+  case "$port" in 22|3000) ;; *) echo "UNAPPROVED_LISTENER|$local" ;; esac
+done > /tmp/solutionz-rmm-listeners.$$
+if [[ -s /tmp/solutionz-rmm-listeners.$$ ]]; then
+  while IFS='|' read -r _ l; do warn "Unexpected network-reachable TCP listener detected: $l"; done < /tmp/solutionz-rmm-listeners.$$
+else
+  pass "No unexpected network-reachable TCP listeners detected beyond approved TCP 22/3000."
+fi
+rm -f /tmp/solutionz-rmm-listeners.$$
+ss -lntH 2>/dev/null | awk '$4 ~ /:22$/ {f=1} END{exit f?0:1}' && pass "TCP 22 is listening." || fail "TCP 22 is not listening."
+ss -lntH 2>/dev/null | awk '$4 ~ /:3000$/ {f=1} END{exit f?0:1}' && pass "TCP 3000 is listening." || warn "TCP 3000 is not currently listening; Domotz activation/service state may not yet expose it."
+
+if command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -Eiq '\b(masquerade|snat|dnat)\b'; then
+  warn "NAT rule detected. IPv4 forwarding remains the enforcement boundary; review rule ownership before production acceptance."
+else
+  pass "No NAT action detected in the active nftables ruleset."
+fi
+
+[[ -e /dev/tpmrm0 || -e /dev/tpm0 ]] && pass "TPM device present for future measured-boot/attestation use." || warn "TPM device not visible; hardware-backed security remains a future-phase item."
+if command -v mokutil >/dev/null 2>&1; then
+  mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled' && pass "Secure Boot enabled." || warn "Secure Boot is not enabled; enable only after V1210 regression validation."
+else
+  warn "Secure Boot state not evaluated because mokutil is not installed."
+fi
+
+f=${#F[@]}; w=${#W[@]}; r=PASS; (( f > 0 )) && r=FAIL
+{
+  echo "result=$r"
+  echo "revision=$REVISION"
+  echo "timestamp_utc=$(date -u +%FT%TZ)"
+  echo "failures=$f"
+  echo "warnings=$w"
+  echo "security_baseline=$BASELINE"
+  echo
+  echo "FAILED_CHECKS:"
+  (( f > 0 )) && printf -- '- %s\n' "${F[@]}" || echo '- none'
+  echo
+  echo "WARNING_CHECKS:"
+  (( w > 0 )) && printf -- '- %s\n' "${W[@]}" || echo '- none'
+} > "$RESULT"
+chmod 640 "$RESULT"
+(( f == 0 ))
+SECURITYVALIDATOR
+  chmod 750 "${SECURITY_VALIDATOR}"
+  chown root:root "${SECURITY_VALIDATOR}"
+}
+
+configure_security_hardening() {
+  progress_message "Applying Solutionz host security hardening baseline."
+
+  install -d -m 750 /usr/local/share/solutionz-rmm
+  if [[ -r "$0" ]]; then
+    install -o root -g root -m 640 "$0" "${INSTALLED_SCRIPT_COPY}"
+  else
+    warning_message "Unable to preserve an installed copy of the setup script for integrity validation."
+  fi
+
+  groupadd -f "${FIELD_TECH_GROUP}"
+  groupadd -f "${ENGINEERING_GROUP}"
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]] && id "${SUDO_USER}" >/dev/null 2>&1; then
+    usermod -aG "${ENGINEERING_GROUP}" "${SUDO_USER}" || warning_message "Unable to add ${SUDO_USER} to ${ENGINEERING_GROUP}."
+  fi
+
+  cat > "${SECURITY_SYSCTL_FILE}" <<'EOF'
+# Solutionz RMM host-network hardening. Do not enable IP forwarding on the dual-homed collector.
+net.ipv4.ip_forward=0
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.default.accept_source_route=0
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.conf.all.log_martians=1
+net.ipv4.conf.default.log_martians=1
+net.ipv4.conf.all.proxy_arp=0
+net.ipv4.conf.default.proxy_arp=0
+net.ipv6.conf.all.forwarding=0
+net.ipv6.conf.default.forwarding=0
+net.ipv6.conf.all.accept_redirects=0
+net.ipv6.conf.default.accept_redirects=0
+net.ipv6.conf.all.accept_source_route=0
+net.ipv6.conf.default.accept_source_route=0
+EOF
+  chmod 644 "${SECURITY_SYSCTL_FILE}"
+  sysctl --system >/dev/null || error_exit "Failed to apply Solutionz kernel/network hardening sysctl policy."
+
+  install -d -m 755 /etc/ssh/sshd_config.d
+  cat > "${SSH_HARDENING_FILE}" <<'EOF'
+# Solutionz RMM SSH hardening. Domotz-sensitive global tunneling/authentication
+# controls are intentionally not changed until V1210/Domotz regression testing.
+PermitRootLogin no
+MaxAuthTries 3
+LoginGraceTime 30
+X11Forwarding no
+
+# Dedicated field technicians may use the controlled configuration menu but do
+# not receive an unrestricted SSH shell. Engineering accounts are not matched.
+Match Group solutionz-rmm-tech
+    ForceCommand sudo -n /usr/local/sbin/solutionz-rmm-local-config
+    X11Forwarding no
+    AllowTcpForwarding no
+    PermitTunnel no
+Match all
+EOF
+  chmod 644 "${SSH_HARDENING_FILE}"
+  sshd -t || error_exit "SSH hardening configuration failed sshd syntax validation."
+  systemctl reload ssh || error_exit "Unable to reload SSH after hardening."
+
+  cat > "${SECURITY_APT_POLICY_FILE}" <<'EOF'
+// Solutionz RMM controlled security-update policy.
+// Security packages are installed only during an approved maintenance action.
+APT::Periodic::Unattended-Upgrade "0";
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::Allowed-Origins {
+        "${distro_id}:${distro_codename}-security";
+};
+EOF
+  chmod 644 "${SECURITY_APT_POLICY_FILE}"
+
+  install -d -m 750 /etc/audit/rules.d
+  cat > "${AUDIT_RULES_FILE}" <<'EOF'
+-w /etc/netplan/ -p wa -k solutionz_netplan
+-w /etc/solutionz-rmm/ -p wa -k solutionz_rmm_config
+-w /etc/ssh/ -p wa -k solutionz_ssh
+-w /etc/ufw/ -p wa -k solutionz_ufw
+-w /etc/sysctl.d/ -p wa -k solutionz_sysctl
+-w /etc/systemd/system/ -p wa -k solutionz_systemd
+-w /usr/local/sbin/ -p wa -k solutionz_sbin
+-w /var/lib/rswsolutionz-rmm/ -p wa -k solutionz_state
+EOF
+  chmod 640 "${AUDIT_RULES_FILE}"
+  systemctl enable --now auditd >/dev/null 2>&1 || error_exit "Unable to enable/start auditd."
+  augenrules --load >/dev/null 2>&1 || warning_message "auditd rules could not be reloaded immediately; they will be loaded at reboot."
+
+  systemctl enable --now apparmor >/dev/null 2>&1 || error_exit "Unable to enable/start AppArmor."
+  install_security_integrity_tool
+  install_security_validator
+
+  progress_message "Security hardening installed: forwarding/redirect/source-route protections, SSH hardening, auditd, AppArmor, integrity tooling, and security validation."
+}
+
+write_default_network_profile() {
+  install -d -m 750 "${NETWORK_PROFILE_DIR}"
+  cat > "${NETWORK_PROFILE_FILE}" <<'JSON'
+{
+  "revision": "V06.100626N",
+  "wan": {"interface": "eth0", "mode": "dhcp", "dns": []},
+  "lan": {"interface": "eth1", "mode": "dhcp"},
+  "vlans": []
+}
+JSON
+  chmod 600 "${NETWORK_PROFILE_FILE}"
+}
+
+install_network_profile_tool() {
+  install -d -m 755 /usr/local/sbin
+  cat > "${NETWORK_PROFILE_TOOL}" <<'PYNETPROFILE'
+#!/usr/bin/env python3
+import argparse, ipaddress, json, os, sys
+from pathlib import Path
+REVISION="V06.100626N"; WAN_IFACE="eth0"; LAN_IFACE="eth1"; MAX_VLANS=32
+class ProfileError(ValueError): pass
+def fail(msg): raise ProfileError(msg)
+def normalize_dns(values,label):
+    if values is None:return []
+    if not isinstance(values,list):fail(f"{label} dns must be a JSON array.")
+    out=[]
+    for value in values:
+        try: ip=ipaddress.ip_address(str(value).strip())
+        except ValueError: fail(f"{label} contains invalid DNS address: {value}")
+        if ip.version!=4:fail(f"{label} DNS must be IPv4: {value}")
+        out.append(str(ip))
+    return out
+def parse_static(entry,label):
+    address=str(entry.get("address","")).strip()
+    if not address:fail(f"{label} static mode requires address in CIDR notation.")
+    try:iface=ipaddress.ip_interface(address)
+    except ValueError:fail(f"{label} has invalid address/CIDR: {address}")
+    if iface.version!=4:fail(f"{label} must use IPv4.")
+    if iface.ip in (iface.network.network_address,iface.network.broadcast_address):fail(f"{label} host address cannot be network/broadcast.")
+    return iface
+def validate_profile(raw):
+    if not isinstance(raw,dict):fail("Profile root must be a JSON object.")
+    rev=raw.get("revision")
+    if rev not in (None,"",REVISION):fail(f"Profile revision {rev!r} does not match {REVISION}.")
+    wan=raw.get("wan");lan=raw.get("lan")
+    if not isinstance(wan,dict):fail("wan must be a JSON object.")
+    if not isinstance(lan,dict):fail("lan must be a JSON object.")
+    if str(wan.get("interface",WAN_IFACE)).strip()!=WAN_IFACE:fail("wan.interface must be eth0.")
+    if str(lan.get("interface",LAN_IFACE)).strip()!=LAN_IFACE:fail("lan.interface must be eth1.")
+    wm=str(wan.get("mode","dhcp")).strip().lower(); wd=normalize_dns(wan.get("dns",[]),"wan"); wi=None; wg=str(wan.get("gateway","")).strip()
+    if wm not in {"dhcp","static"}:fail("wan.mode must be dhcp or static.")
+    if wm=="static":
+        wi=parse_static(wan,"wan")
+        if not wg:fail("wan static mode requires gateway.")
+        try:g=ipaddress.ip_address(wg)
+        except ValueError:fail(f"wan has invalid gateway: {wg}")
+        if g.version!=4 or g not in wi.network:fail("wan gateway must be inside WAN subnet.")
+        if not wd:fail("wan static mode requires at least one DNS server.")
+    elif wan.get("address") or wg:fail("wan DHCP mode cannot define address or gateway.")
+    lm=str(lan.get("mode","dhcp")).strip().lower(); li=None
+    if lm not in {"dhcp","static","none"}:fail("lan.mode must be dhcp, static, or none.")
+    if lan.get("gateway") or lan.get("default_route"):fail("LAN eth1 may not define gateway/default route.")
+    if lan.get("dns"):fail("LAN eth1 may not define system DNS.")
+    if lm=="static":li=parse_static(lan,"lan")
+    elif lan.get("address"):fail(f"lan address invalid when mode={lm}.")
+    vlans=raw.get("vlans",[])
+    if not isinstance(vlans,list):fail("vlans must be a JSON array.")
+    if len(vlans)>MAX_VLANS:fail(f"Maximum {MAX_VLANS} VLANs supported.")
+    if lm=="none" and not vlans:fail("lan.mode=none requires at least one VLAN.")
+    nets=[]
+    if wi:nets.append(("wan/eth0",wi.network))
+    if li:nets.append(("lan/eth1",li.network))
+    if wi and li and wi.network.overlaps(li.network):fail(f"WAN subnet {wi.network} overlaps LAN subnet {li.network}.")
+    seen=set();nv=[]
+    for idx,item in enumerate(vlans,1):
+        if not isinstance(item,dict):fail(f"vlan entry {idx} must be object.")
+        try:vid=int(item.get("id"))
+        except Exception:fail(f"vlan entry {idx} id must be integer.")
+        if not 1<=vid<=4094:fail(f"VLAN {vid} id must be 1-4094.")
+        if vid in seen:fail(f"Duplicate VLAN ID {vid}.")
+        seen.add(vid);mode=str(item.get("mode","static")).strip().lower()
+        if mode not in {"dhcp","static"}:fail(f"VLAN {vid} mode must be dhcp or static.")
+        if item.get("gateway") or item.get("default_route"):fail(f"VLAN {vid} may not define gateway/default route.")
+        if item.get("dns"):fail(f"VLAN {vid} may not define system DNS.")
+        vi=None
+        if mode=="static":
+            vi=parse_static(item,f"VLAN {vid}")
+            for label,net in nets:
+                if vi.network.overlaps(net):fail(f"VLAN {vid} subnet {vi.network} overlaps {label} subnet {net}.")
+            nets.append((f"vlan{vid}",vi.network))
+        elif item.get("address"):fail(f"VLAN {vid} address invalid for DHCP mode.")
+        nv.append({"id":vid,"mode":mode,"address":str(vi) if vi else ""})
+    return {"revision":REVISION,"wan":{"interface":"eth0","mode":wm,"address":str(wi) if wi else "","gateway":wg,"dns":wd},"lan":{"interface":"eth1","mode":lm,"address":str(li) if li else ""},"vlans":nv,"default_interface":"eth0"}
+def load_profile(path):
+    try:raw=json.loads(Path(path).read_text())
+    except FileNotFoundError:fail(f"Profile not found: {path}")
+    except json.JSONDecodeError as e:fail(f"Invalid JSON line {e.lineno}: {e.msg}")
+    return validate_profile(raw)
+def common(lines,p):lines += [f"{p}dhcp6: false",f"{p}accept-ra: false",f"{p}optional: true"]
+def render(pf):
+    L=["network:","  version: 2","  renderer: networkd","  ethernets:"]
+    w=pf["wan"];L.append("    eth0:");p="      "
+    if w["mode"]=="dhcp":L += [p+"dhcp4: true",p+"dhcp-identifier: mac",p+"dhcp4-overrides:",p+"  route-metric: 100"];common(L,p)
+    else:L.append(p+"dhcp4: false");common(L,p);L += [p+"addresses:",p+f"  - {w['address']}",p+"routes:",p+"  - to: default",p+f"    via: {w['gateway']}",p+"nameservers:",p+f"  addresses: [{', '.join(w['dns'])}]" ]
+    l=pf["lan"];L.append("    eth1:");p="      "
+    if l["mode"]=="dhcp":L += [p+"dhcp4: true",p+"dhcp-identifier: mac",p+"dhcp4-overrides:",p+"  use-routes: false",p+"  use-dns: false"];common(L,p)
+    elif l["mode"]=="static":L.append(p+"dhcp4: false");common(L,p);L += [p+"addresses:",p+f"  - {l['address']}" ]
+    else:L += [p+"dhcp4: false",p+"link-local: []"];common(L,p)
+    if pf["vlans"]:
+        L.append("  vlans:")
+        for v in pf["vlans"]:
+            p="      ";L += [f"    vlan{v['id']}:",p+f"id: {v['id']}",p+"link: eth1"]
+            if v["mode"]=="dhcp":L += [p+"dhcp4: true",p+"dhcp-identifier: mac",p+"dhcp4-overrides:",p+"  use-routes: false",p+"  use-dns: false"];common(L,p)
+            else:L.append(p+"dhcp4: false");common(L,p);L += [p+"addresses:",p+f"  - {v['address']}" ]
+    return "\n".join(L)+"\n"
+def atomic(path,content,mode=0o600):
+    p=Path(path);p.parent.mkdir(parents=True,exist_ok=True);t=p.with_name(p.name+".tmp");t.write_text(content);os.chmod(t,mode);os.replace(t,p)
+def result(path,res,reason,pfpath=None,pf=None,np=None):
+    L=[f"result={res}",f"revision={REVISION}",f"reason={reason}"]
+    if pfpath:L.append(f"profile={pfpath}")
+    if pf:L += [f"wan_mode={pf['wan']['mode']}",f"lan_mode={pf['lan']['mode']}","default_interface=eth0","vlans="+",".join(str(v["id"]) for v in pf["vlans"])]
+    if np:L.append(f"netplan={np}")
+    atomic(path,"\n".join(L)+"\n",0o640)
+def choice(prompt,opts,default):
+    while True:
+        v=input(f"{prompt} [{'/' .join(opts)}] (default {default}): ").strip().lower() or default
+        if v in opts:return v
+        print("Invalid choice.")
+def cidr(prompt):
+    while True:
+        v=input(prompt+": ").strip()
+        try:i=ipaddress.ip_interface(v);assert i.version==4 and i.ip not in (i.network.network_address,i.network.broadcast_address);return str(i)
+        except Exception:print("Enter valid IPv4/CIDR.")
+def ipv4(prompt):
+    while True:
+        v=input(prompt+": ").strip()
+        try:i=ipaddress.ip_address(v);assert i.version==4;return str(i)
+        except Exception:print("Enter valid IPv4 address.")
+def wizard(path):
+    print("Solutionz dual-homed profile builder - eth0 WAN / eth1 AV LAN")
+    wm=choice("WAN eth0 mode",["dhcp","static"],"dhcp");wan={"interface":"eth0","mode":wm,"dns":[]}
+    if wm=="static":wan.update(address=cidr("WAN IPv4/CIDR"),gateway=ipv4("WAN gateway"),dns=[x.strip() for x in input("WAN DNS comma separated: ").split(',') if x.strip()])
+    lm=choice("LAN eth1 native mode",["dhcp","static","none"],"dhcp");lan={"interface":"eth1","mode":lm}
+    if lm=="static":lan["address"]=cidr("LAN eth1 IPv4/CIDR")
+    while True:
+        try:n=int(input(f"Tagged VLAN count 0-{MAX_VLANS}: ").strip() or 0);assert 0<=n<=MAX_VLANS;break
+        except Exception:print("Invalid count.")
+    vs=[];seen=set()
+    for x in range(n):
+        while True:
+            try:vid=int(input(f"VLAN #{x+1} ID: "));assert 1<=vid<=4094 and vid not in seen;seen.add(vid);break
+            except Exception:print("Invalid/duplicate VLAN ID.")
+        m=choice(f"VLAN {vid} mode",["dhcp","static"],"static");v={"id":vid,"mode":m}
+        if m=="static":v["address"]=cidr(f"VLAN {vid} IPv4/CIDR")
+        vs.append(v)
+    pf=validate_profile({"revision":REVISION,"wan":wan,"lan":lan,"vlans":vs});atomic(path,json.dumps({"revision":REVISION,"wan":pf["wan"],"lan":pf["lan"],"vlans":pf["vlans"]},indent=2)+"\n");print("Profile written; WAN eth0 owns the only default route.")
+def main():
+    a=argparse.ArgumentParser();sub=a.add_subparsers(dest="cmd",required=True)
+    for c in ("validate","default-interface","summary"):q=sub.add_parser(c);q.add_argument("profile")
+    q=sub.add_parser("render");q.add_argument("profile");q.add_argument("netplan");q.add_argument("result")
+    q=sub.add_parser("wizard");q.add_argument("profile");args=a.parse_args()
+    try:
+        if args.cmd=="wizard":wizard(args.profile);return 0
+        pf=load_profile(args.profile)
+        if args.cmd=="validate":print("PASS");return 0
+        if args.cmd=="default-interface":print("eth0");return 0
+        if args.cmd=="summary":print(json.dumps(pf,indent=2));return 0
+        atomic(args.netplan,render(pf));result(args.result,"PASS","PROFILE_RENDERED",args.profile,pf,args.netplan);print("eth0");return 0
+    except ProfileError as e:
+        if getattr(args,"cmd",None)=="render":
+            try:result(args.result,"FAIL",str(e),getattr(args,"profile",None))
+            except Exception:pass
+        print("ERROR:",e,file=sys.stderr);return 1
+if __name__=="__main__":raise SystemExit(main())
+PYNETPROFILE
+  chmod 750 "${NETWORK_PROFILE_TOOL}"; chown root:root "${NETWORK_PROFILE_TOOL}"
+}
+
+install_live_network_discovery_tool() {
+  install -d -m 755 /usr/local/sbin
+  cat > "${LIVE_DISCOVERY_TOOL}" <<'LIVEDISCOVERY'
+#!/usr/bin/env bash
+set -uo pipefail
+
+REVISION="V06.100626N"
+WAN="eth0"
+LAN="eth1"
+RESULT="/var/lib/rswsolutionz-rmm/network-live-discovery-V06.100626N.result"
+
+mkdir -p "$(dirname "$RESULT")"
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+record(){ printf '%s=%s\n' "$1" "$2" >> "$tmp"; }
+upper(){ tr '[:lower:]' '[:upper:]'; }
+
+iface_exists(){ ip link show dev "$1" >/dev/null 2>&1; }
+iface_mac(){ cat "/sys/class/net/$1/address" 2>/dev/null || echo "UNKNOWN"; }
+iface_operstate(){ cat "/sys/class/net/$1/operstate" 2>/dev/null | upper || echo "UNKNOWN"; }
+iface_carrier(){
+  local c
+  c="$(cat "/sys/class/net/$1/carrier" 2>/dev/null || true)"
+  case "$c" in 1) echo "YES";; 0) echo "NO";; *) echo "UNKNOWN";; esac
+}
+iface_speed(){
+  local sp
+  sp="$(cat "/sys/class/net/$1/speed" 2>/dev/null || true)"
+  if [[ "$sp" =~ ^[0-9]+$ ]] && (( sp > 0 )); then echo "${sp} Mb/s"; else echo "UNKNOWN"; fi
+}
+iface_ipv4_all(){
+  ip -o -4 addr show dev "$1" scope global 2>/dev/null | awk '{print $4}' | paste -sd, - || true
+}
+iface_assignment(){
+  local iface="$1" lines idx lease
+  lines="$(ip -o -4 addr show dev "$iface" scope global 2>/dev/null || true)"
+  if [[ -z "$lines" ]]; then
+    echo "NONE"
+    return
+  fi
+  if grep -qw dynamic <<<"$lines"; then
+    echo "DHCP"
+    return
+  fi
+  idx="$(cat "/sys/class/net/$iface/ifindex" 2>/dev/null || true)"
+  lease="/run/systemd/netif/leases/${idx}"
+  if [[ -n "$idx" && -s "$lease" ]] && grep -q '^ADDRESS=' "$lease" 2>/dev/null; then
+    echo "DHCP"
+    return
+  fi
+  echo "STATIC_OR_MANUAL"
+}
+iface_default(){
+  if ip -4 route show default 2>/dev/null | grep -Eq " dev $1( |$)"; then echo "YES"; else echo "NO"; fi
+}
+iface_gateway(){
+  ip -4 route show default 2>/dev/null | awk -v i="$1" '$0 ~ (" dev " i "( |$)") {print $3; exit}'
+}
+iface_dns(){
+  if command -v resolvectl >/dev/null 2>&1; then
+    local d
+    d="$(resolvectl dns "$1" 2>/dev/null | sed -n 's/^[^:]*:[[:space:]]*//p' | head -n1)"
+    [[ -n "$d" ]] && echo "$d" || echo "NONE"
+  else
+    echo "UNKNOWN"
+  fi
+}
+
+show_iface(){
+  local iface="$1" role="$2"
+  echo
+  echo "${role} / ${iface}"
+  echo "------------------------------------------------"
+  if ! iface_exists "$iface"; then
+    echo "Interface:            NOT FOUND"
+    record "${iface}_present" "NO"
+    return
+  fi
+  local mac link carrier speed ipv4 source gateway def dns
+  mac="$(iface_mac "$iface")"
+  link="$(iface_operstate "$iface")"
+  carrier="$(iface_carrier "$iface")"
+  speed="$(iface_speed "$iface")"
+  ipv4="$(iface_ipv4_all "$iface")"
+  source="$(iface_assignment "$iface")"
+  gateway="$(iface_gateway "$iface")"
+  def="$(iface_default "$iface")"
+  dns="$(iface_dns "$iface")"
+  [[ -n "$ipv4" ]] || ipv4="NONE"
+  [[ -n "$gateway" ]] || gateway="NONE"
+
+  printf '%-22s %s\n' "MAC Address:" "$mac"
+  printf '%-22s %s\n' "Link:" "$link"
+  printf '%-22s %s\n' "Carrier:" "$carrier"
+  printf '%-22s %s\n' "Negotiated Speed:" "$speed"
+  printf '%-22s %s\n' "Detected IPv4:" "$ipv4"
+  printf '%-22s %s\n' "Assignment:" "$source"
+  printf '%-22s %s\n' "Gateway:" "$gateway"
+  printf '%-22s %s\n' "Default Route:" "$def"
+  printf '%-22s %s\n' "DNS:" "$dns"
+  case "$source" in
+    DHCP) printf '%-22s %s\n' "Status:" "ADDRESS DETECTED AUTOMATICALLY" ;;
+    STATIC_OR_MANUAL) printf '%-22s %s\n' "Status:" "ACTIVE ADDRESS DETECTED" ;;
+    NONE)
+      if [[ "$carrier" == "YES" ]]; then
+        printf '%-22s %s\n' "Status:" "NO ACTIVE IPv4 - DHCP OR STATIC CONFIGURATION REQUIRED"
+      else
+        printf '%-22s %s\n' "Status:" "NO PHYSICAL LINK / NO ACTIVE IPv4"
+      fi
+      ;;
+  esac
+
+  record "${iface}_present" "YES"
+  record "${iface}_mac" "$mac"
+  record "${iface}_link" "$link"
+  record "${iface}_carrier" "$carrier"
+  record "${iface}_speed" "$speed"
+  record "${iface}_ipv4" "$ipv4"
+  record "${iface}_assignment" "$source"
+  record "${iface}_gateway" "$gateway"
+  record "${iface}_default_route" "$def"
+  record "${iface}_dns" "$dns"
+}
+
+show_vlans(){
+  local count=0 line raw name parent vid addr source
+  echo
+  echo "LIVE DETECTED VLANs"
+  echo "------------------------------------------------"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    raw="$(awk -F': ' '{print $2}' <<<"$line" | awk '{print $1}')"
+    name="${raw%%@*}"
+    if [[ "$raw" == *"@"* ]]; then parent="${raw#*@}"; else parent="UNKNOWN"; fi
+    vid="$(sed -n 's/.* vlan protocol [^ ]* id \([0-9]\+\).*/\1/p' <<<"$line")"
+    [[ -n "$vid" ]] || vid="UNKNOWN"
+    addr="$(iface_ipv4_all "$name")"; [[ -n "$addr" ]] || addr="NONE"
+    source="$(iface_assignment "$name")"
+    printf 'VLAN %-5s %-16s parent=%-8s IPv4=%-20s source=%s\n' "$vid" "$name" "$parent" "$addr" "$source"
+    count=$((count+1))
+    record "vlan_${count}_id" "$vid"
+    record "vlan_${count}_name" "$name"
+    record "vlan_${count}_parent" "$parent"
+    record "vlan_${count}_ipv4" "$addr"
+    record "vlan_${count}_assignment" "$source"
+  done < <(ip -d -o link show type vlan 2>/dev/null || true)
+  if (( count == 0 )); then echo "None detected."; fi
+  record "vlan_count" "$count"
+}
+
+echo "============================================================"
+echo "Solutionz RMM Live Network Discovery"
+echo "Revision: $REVISION"
+echo "Time: $(date -u +%FT%TZ)"
+echo "============================================================"
+echo "Observed state is read from the running Linux network stack."
+echo "Netplan is not used to determine the live addresses shown below."
+
+record "revision" "$REVISION"
+record "timestamp_utc" "$(date -u +%FT%TZ)"
+show_iface "$WAN" "WAN"
+show_iface "$LAN" "LAN"
+show_vlans
+
+echo
+echo "LIVE IPv4 ROUTE TABLE"
+echo "------------------------------------------------"
+ip -4 route 2>/dev/null || true
+
+echo
+echo "SYSTEM DNS"
+echo "------------------------------------------------"
+if command -v resolvectl >/dev/null 2>&1; then
+  resolvectl dns 2>/dev/null || true
+else
+  cat /etc/resolv.conf 2>/dev/null || true
+fi
+
+if [[ $EUID -eq 0 ]]; then
+  install -o root -g root -m 640 "$tmp" "$RESULT"
+  echo
+  echo "Live discovery result: $RESULT"
+else
+  echo
+  echo "Live state displayed read-only. Run with sudo to persist the discovery result."
+fi
+LIVEDISCOVERY
+  chmod 750 "${LIVE_DISCOVERY_TOOL}"
+  chown root:root "${LIVE_DISCOVERY_TOOL}"
+}
+
+install_network_validator() {
+  install -d -m 755 /usr/local/sbin
+  cat > "${NETWORK_VALIDATOR}" <<'NETVALIDATOR'
+#!/usr/bin/env bash
+set -uo pipefail
+
+REVISION="V06.100626N"
+PROFILE="/etc/solutionz-rmm/network-profile.json"
+PROFILE_TOOL="/usr/local/sbin/solutionz-rmm-network-profile"
+RESULT="/var/lib/rswsolutionz-rmm/network-validation-V06.100626N.result"
+WAN="eth0"
+LAN="eth1"
+WAIT_SECONDS="${SOLUTIONZ_NETWORK_VALIDATION_WAIT_SECONDS:-30}"
+
+CONFIG_FAILS=()
+CONNECT_FAILS=()
+
+cf() { CONFIG_FAILS+=("$*"); echo "FAIL - $*"; }
+xf() { CONNECT_FAILS+=("$*"); echo "FAIL - $*"; }
+ok() { echo "PASS - $*"; }
+
+ip4() {
+  ip -o -4 addr show dev "$1" scope global 2>/dev/null | awk 'NR==1 {print $4}'
+}
+
+default_iface() {
+  ip -4 route show default 2>/dev/null | awk 'NR==1 {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
+}
+
+default_gateway() {
+  ip -4 route show default 2>/dev/null | awk -v iface="$1" '$0 ~ (" dev " iface "( |$)") {print $3; exit}'
+}
+
+carrier() {
+  [[ "$(cat "/sys/class/net/$1/carrier" 2>/dev/null || echo 0)" == "1" ]]
+}
+
+tcp_open() {
+  timeout 8 bash -c "</dev/tcp/$1/$2" >/dev/null 2>&1
+}
+
+profile_meta() {
+  python3 - "$PROFILE" <<'PROFILEPY'
+import json, sys
+p=json.load(open(sys.argv[1]))
+w=p.get('wan',{})
+l=p.get('lan',{})
+print(w.get('mode',''))
+print(w.get('address',''))
+print(w.get('gateway',''))
+print(l.get('mode',''))
+print(l.get('address',''))
+PROFILEPY
+}
+
+profile_vlans() {
+  python3 - "$PROFILE" <<'VLANPY'
+import json, sys
+for v in json.load(open(sys.argv[1])).get('vlans',[]):
+    print(f"{v['id']}|{v.get('mode','')}|{v.get('address','')}")
+VLANPY
+}
+
+PROFILE_VALID=0
+WAN_MODE=""
+WAN_EXPECTED=""
+WAN_GATEWAY_EXPECTED=""
+LAN_MODE=""
+LAN_EXPECTED=""
+
+mkdir -p "$(dirname "$RESULT")"
+
+if [[ -x "$PROFILE_TOOL" ]]; then
+  ok "Network profile helper installed."
+else
+  cf "Network profile helper missing."
+fi
+
+if [[ -s "$PROFILE" ]]; then
+  ok "Network profile present."
+else
+  cf "Network profile missing."
+fi
+
+if [[ -x "$PROFILE_TOOL" && -s "$PROFILE" ]] && "$PROFILE_TOOL" validate "$PROFILE" >/dev/null 2>&1; then
+  PROFILE_VALID=1
+  ok "Network profile validates."
+  mapfile -t META < <(profile_meta)
+  WAN_MODE="${META[0]:-}"
+  WAN_EXPECTED="${META[1]:-}"
+  WAN_GATEWAY_EXPECTED="${META[2]:-}"
+  LAN_MODE="${META[3]:-}"
+  LAN_EXPECTED="${META[4]:-}"
+else
+  cf "Network profile validation failed."
+fi
+
+if netplan generate >/dev/null 2>&1; then
+  ok "Netplan generates successfully."
+else
+  cf "Netplan generation failed."
+fi
+
+# Give systemd-networkd a bounded opportunity to obtain DHCP leases and create VLANs.
+if command -v networkctl >/dev/null 2>&1; then
+  networkctl reconfigure "$WAN" >/dev/null 2>&1 || true
+  networkctl reconfigure "$LAN" >/dev/null 2>&1 || true
+  [[ "$WAN_MODE" == "dhcp" ]] && networkctl renew "$WAN" >/dev/null 2>&1 || true
+  [[ "$LAN_MODE" == "dhcp" ]] && networkctl renew "$LAN" >/dev/null 2>&1 || true
+  if (( PROFILE_VALID )); then
+    while IFS='|' read -r vid vmode vaddr; do
+      [[ -n "$vid" ]] || continue
+      [[ "$vmode" == "dhcp" ]] && networkctl renew "vlan${vid}" >/dev/null 2>&1 || true
+    done < <(profile_vlans)
+  fi
+fi
+
+ready_now() {
+  carrier "$WAN" || return 1
+  carrier "$LAN" || return 1
+  [[ -n "$(ip4 "$WAN")" ]] || return 1
+  mapfile -t defaults < <(ip -4 route show default 2>/dev/null)
+  [[ ${#defaults[@]} -eq 1 && "$(default_iface)" == "$WAN" ]] || return 1
+
+  if (( PROFILE_VALID )); then
+    if [[ "$LAN_MODE" == "dhcp" || "$LAN_MODE" == "static" ]]; then
+      [[ -n "$(ip4 "$LAN")" ]] || return 1
+      [[ "$LAN_MODE" != "static" || "$(ip4 "$LAN")" == "$LAN_EXPECTED" ]] || return 1
+    fi
+    while IFS='|' read -r vid vmode vaddr; do
+      [[ -n "$vid" ]] || continue
+      local vname="vlan${vid}"
+      ip link show "$vname" >/dev/null 2>&1 || return 1
+      [[ -n "$(ip4 "$vname")" ]] || return 1
+      [[ "$vmode" != "static" || "$(ip4 "$vname")" == "$vaddr" ]] || return 1
+    done < <(profile_vlans)
+  fi
+  return 0
+}
+
+attempts=$(( (WAIT_SECONDS + 1) / 2 ))
+(( attempts < 1 )) && attempts=1
+for ((i=1; i<=attempts; i++)); do
+  ready_now && break
+  (( i < attempts )) && sleep 2
+done
+
+ip link show "$WAN" >/dev/null 2>&1 && ok "WAN eth0 exists." || cf "WAN eth0 missing."
+ip link show "$LAN" >/dev/null 2>&1 && ok "LAN eth1 exists." || cf "LAN eth1 missing."
+carrier "$WAN" && ok "WAN eth0 carrier UP." || cf "WAN eth0 carrier DOWN."
+carrier "$LAN" && ok "LAN eth1 carrier UP." || cf "LAN eth1 carrier DOWN."
+
+wan_addr="$(ip4 "$WAN")"
+if [[ -n "$wan_addr" ]]; then
+  ok "WAN eth0 IPv4 ${wan_addr}."
+else
+  cf "WAN eth0 has no IPv4 address."
+fi
+if [[ "$WAN_MODE" == "static" && -n "$WAN_EXPECTED" && "$wan_addr" != "$WAN_EXPECTED" ]]; then
+  cf "WAN eth0 IPv4 ${wan_addr:-none}; expected ${WAN_EXPECTED}."
+fi
+
+mapfile -t DEFAULTS < <(ip -4 route show default 2>/dev/null)
+if [[ ${#DEFAULTS[@]} -eq 1 ]]; then
+  ok "Exactly one IPv4 default route is installed."
+else
+  cf "Expected exactly one IPv4 default route; found ${#DEFAULTS[@]}."
+fi
+
+if [[ "$(default_iface)" == "$WAN" ]]; then
+  ok "Default route uses WAN eth0."
+else
+  cf "Default route does not use WAN eth0."
+fi
+
+if ip -4 route show default 2>/dev/null | grep -Eq ' dev (eth1|vlan[0-9]+)( |$)'; then
+  cf "LAN eth1 or an eth1 VLAN has a prohibited default route."
+else
+  ok "LAN eth1 and LAN VLANs have no default route."
+fi
+
+if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 1)" == "0" ]]; then
+  ok "IPv4 forwarding disabled; collector is not routing WAN to LAN."
+else
+  cf "IPv4 forwarding enabled."
+fi
+
+if (( PROFILE_VALID )); then
+  if [[ "$WAN_MODE" == "static" && -n "$WAN_GATEWAY_EXPECTED" ]]; then
+    actual_gateway="$(default_gateway "$WAN")"
+    [[ "$actual_gateway" == "$WAN_GATEWAY_EXPECTED" ]] && \
+      ok "WAN gateway ${actual_gateway} matches profile." || \
+      cf "WAN gateway ${actual_gateway:-none}; expected ${WAN_GATEWAY_EXPECTED}."
+  fi
+
+  if [[ "$LAN_MODE" == "none" ]]; then
+    ok "LAN eth1 is configured as an unnumbered VLAN trunk parent."
+  elif [[ "$LAN_MODE" == "dhcp" || "$LAN_MODE" == "static" ]]; then
+    lan_addr="$(ip4 "$LAN")"
+    [[ -n "$lan_addr" ]] && ok "LAN eth1 IPv4 ${lan_addr}." || cf "LAN eth1 has no IPv4 address."
+    if [[ "$LAN_MODE" == "static" && -n "$LAN_EXPECTED" && "$lan_addr" != "$LAN_EXPECTED" ]]; then
+      cf "LAN eth1 IPv4 ${lan_addr:-none}; expected ${LAN_EXPECTED}."
+    fi
+  fi
+
+  while IFS='|' read -r vid vmode vexpected; do
+    [[ -n "$vid" ]] || continue
+    vname="vlan${vid}"
+    if ip -d link show "$vname" 2>/dev/null | grep -Eq "vlan protocol 802\\.1Q id ${vid}( |$)"; then
+      ok "${vname} VLAN ID ${vid} active on LAN eth1."
+    else
+      cf "${vname} missing or has the wrong 802.1Q VLAN ID."
+    fi
+    vaddr="$(ip4 "$vname")"
+    [[ -n "$vaddr" ]] && ok "${vname} IPv4 ${vaddr}." || cf "${vname} has no IPv4 address."
+    if [[ "$vmode" == "static" && -n "$vexpected" && "$vaddr" != "$vexpected" ]]; then
+      cf "${vname} IPv4 ${vaddr:-none}; expected ${vexpected}."
+    fi
+  done < <(profile_vlans)
+fi
+
+# WAN/cloud checks. These do not cause rollback of a locally valid Netplan.
+getent ahostsv4 api.snapcraft.io >/dev/null 2>&1 && ok "WAN DNS resolves api.snapcraft.io." || xf "WAN DNS cannot resolve api.snapcraft.io."
+getent ahostsv4 portal.domotz.com >/dev/null 2>&1 && ok "WAN DNS resolves portal.domotz.com." || xf "WAN DNS cannot resolve portal.domotz.com."
+tcp_open portal.domotz.com 443 && ok "Domotz TCP 443 reachable through WAN." || xf "Domotz TCP 443 unreachable through WAN."
+tcp_open messaging-us-east-1-cell-1.domotz.com 5671 && ok "Domotz TCP 5671 reachable through WAN." || xf "Domotz TCP 5671 unreachable through WAN."
+if systemctl is-active --quiet systemd-timesyncd.service; then
+  ok "systemd-timesyncd active."
+else
+  xf "systemd-timesyncd is not active."
+fi
+if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" == "yes" || -e /run/systemd/timesync/synchronized ]]; then
+  ok "NTP synchronization evidence present."
+else
+  xf "NTP synchronization evidence not present."
+fi
+
+configuration_result="PASS"
+connectivity_result="PASS"
+result="PASS"
+failure_category="NONE"
+if (( ${#CONFIG_FAILS[@]} > 0 )); then
+  configuration_result="FAIL"
+  result="FAIL"
+  failure_category="CONFIGURATION"
+fi
+if (( ${#CONNECT_FAILS[@]} > 0 )); then
+  connectivity_result="FAIL"
+  result="FAIL"
+  if [[ "$failure_category" == "CONFIGURATION" ]]; then
+    failure_category="BOTH"
+  else
+    failure_category="CONNECTIVITY"
+  fi
+fi
+
+{
+  echo "result=${result}"
+  echo "revision=${REVISION}"
+  echo "timestamp_utc=$(date -u +%FT%TZ)"
+  echo "configuration_result=${configuration_result}"
+  echo "connectivity_result=${connectivity_result}"
+  echo "failure_category=${failure_category}"
+echo "wan_interface=${WAN}"
+  echo "wan_carrier=$(carrier "$WAN" && echo UP || echo DOWN)"
+  echo "wan_ipv4=$(ip4 "$WAN")"
+  echo "wan_gateway=$(default_gateway "$WAN")"
+  echo "default_route_interface=$(default_iface)"
+  echo "lan_interface=${LAN}"
+  echo "lan_carrier=$(carrier "$LAN" && echo UP || echo DOWN)"
+  echo "lan_ipv4=$(ip4 "$LAN")"
+  echo "ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
+  echo
+  echo "CONFIGURATION_FAILURES:"
+  if (( ${#CONFIG_FAILS[@]} > 0 )); then printf -- '- %s\n' "${CONFIG_FAILS[@]}"; else echo '- none'; fi
+  echo
+  echo "CONNECTIVITY_FAILURES:"
+  if (( ${#CONNECT_FAILS[@]} > 0 )); then printf -- '- %s\n' "${CONNECT_FAILS[@]}"; else echo '- none'; fi
+} > "$RESULT"
+chmod 640 "$RESULT"
+
+[[ "$configuration_result" == "FAIL" ]] && exit 10
+[[ "$connectivity_result" == "FAIL" ]] && exit 20
+exit 0
+NETVALIDATOR
+  chmod 750 "${NETWORK_VALIDATOR}"
+  chown root:root "${NETWORK_VALIDATOR}"
+}
+
+stage_production_network_profile() {
+  install_network_profile_tool
+  install_live_network_discovery_tool
+  install_network_validator
+  install -d -m 750 "${NETWORK_PROFILE_DIR}"
+  if [[ -n "${NETWORK_PROFILE_SOURCE}" ]]; then
+    [[ -r "${NETWORK_PROFILE_SOURCE}" ]] || error_exit "Network profile is not readable: ${NETWORK_PROFILE_SOURCE}"
+    cp -f "${NETWORK_PROFILE_SOURCE}" "${NETWORK_PROFILE_FILE}"; chmod 600 "${NETWORK_PROFILE_FILE}"
+    progress_message "Using supplied dual-homed WAN/LAN network profile: ${NETWORK_PROFILE_SOURCE}"
+  else
+    write_default_network_profile
+    progress_message "No network profile supplied; using default WAN eth0 DHCP + LAN eth1 DHCP profile."
+  fi
+  "${NETWORK_PROFILE_TOOL}" render "${NETWORK_PROFILE_FILE}" "${NETPLAN_FILE}" "${NETWORK_PROFILE_RESULT_FILE}" || error_exit "WAN/LAN/VLAN profile rendering failed. Review ${NETWORK_PROFILE_RESULT_FILE}."
   chmod 600 "${NETPLAN_FILE}"
 }
 
@@ -926,22 +2085,22 @@ remove_stale_cloud_init_netplans() {
 }
 
 stage_network_config() {
-  step_message 10 "Stage Solutionz Netplan configuration"
-
-  if [[ -f "${NETPLAN_FILE}" ]]; then
-    cp -a "${NETPLAN_FILE}" "${NETPLAN_FILE}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
-  fi
-
-  write_netplan_config
+  step_message 10 "Stage dual-homed WAN eth0 / LAN eth1 networking"
+  [[ -f "${NETPLAN_FILE}" ]] && cp -a "${NETPLAN_FILE}" "${NETPLAN_FILE}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  [[ -f "${NETWORK_PROFILE_FILE}" ]] && cp -a "${NETWORK_PROFILE_FILE}" "${NETWORK_PROFILE_FILE}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  stage_production_network_profile
   remove_stale_cloud_init_netplans
-
   mkdir -p /etc/cloud/cloud.cfg.d
   cat > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg <<'EOF'
 network: {config: disabled}
 EOF
-
+  cat > "${IP_FORWARD_SYSCTL_FILE}" <<'EOF'
+# Solutionz RMM V06.100626N - dual-homed collector, not a router.
+net.ipv4.ip_forward=0
+EOF
+  chmod 644 "${IP_FORWARD_SYSCTL_FILE}"; sysctl -w net.ipv4.ip_forward=0 >/dev/null
   netplan generate
-  progress_message "Netplan syntax validated. Configuration is staged but not applied during this remote session."
+  progress_message "Netplan validated: eth0 WAN owns the only default route; eth1/VLANs are AV LAN paths with no default route; IPv4 forwarding is disabled."
 }
 
 repair_resolv_conf() {
@@ -1071,234 +2230,477 @@ EOF
 }
 
 install_local_serial_config_tool() {
-  step_message 14 "Install USB-C COM direct configuration utility"
-
+  step_message 14 "Install field WAN/LAN/VLAN configuration utility"
   cat > "${LOCAL_CONFIG_TOOL}" <<'LOCALCFG'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-NETPLAN_FILE="/etc/netplan/00-installer-config.yaml"
+REVISION="V06.100626N"
+NETPLAN="/etc/netplan/00-installer-config.yaml"
+PROFILE="/etc/solutionz-rmm/network-profile.json"
+TOOL="/usr/local/sbin/solutionz-rmm-network-profile"
+VALIDATOR="/usr/local/sbin/solutionz-rmm-network-validate"
+LIVE="/usr/local/sbin/solutionz-rmm-live-network-discovery"
+LIVE_RESULT="/var/lib/rswsolutionz-rmm/network-live-discovery-V06.100626N.result"
+POSTVALIDATOR="/usr/local/sbin/rswsolutionz-rmm-postreboot-validate"
+RESULT="/var/lib/rswsolutionz-rmm/network-validation-V06.100626N.result"
+CHANGE="/var/lib/rswsolutionz-rmm/network-change-V06.100626N.result"
+PROFILE_RESULT="/var/lib/rswsolutionz-rmm/network-profile-V06.100626N.result"
+POST_RESULT="/var/lib/rswsolutionz-rmm/postreboot-validation-V06.100626N.result"
+SECURITY_RESULT="/var/lib/rswsolutionz-rmm/security-validation-V06.100626N.result"
+INTEGRITY="/usr/local/sbin/solutionz-rmm-integrity-baseline"
+SECURITY_BASELINE="/var/lib/rswsolutionz-rmm/security-baseline-V06.100626N.sha256"
+AUTO=0
+PRODUCTION_VALIDATION_RESULT="NOT_RUN"
+PRE_NETPLAN_SHA256=""
+PRE_PROFILE_SHA256=""
 
-require_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    echo "Run this utility with sudo." >&2
-    exit 1
+if [[ "${1:-}" == "--serial-auto" ]]; then
+  AUTO=1
+elif [[ $# -ne 0 ]]; then
+  echo "Usage: $(basename "$0") [--serial-auto]"
+  exit 2
+fi
+[[ $EUID -eq 0 ]] || { echo "Run with sudo."; exit 1; }
+
+sha_file() { [[ -f "$1" ]] && sha256sum "$1" | awk '{print $1}' || true; }
+bak() { [[ -f "$1" ]] && cp -a "$1" "$1.networkcfg.bak.$(date -u +%Y%m%dT%H%M%SZ)"; }
+latest() { ls -1t "$1".networkcfg.bak.* 2>/dev/null | head -n1 || true; }
+backup() {
+  PRE_NETPLAN_SHA256="$(sha_file "$NETPLAN")"
+  PRE_PROFILE_SHA256="$(sha_file "$PROFILE")"
+  bak "$NETPLAN"; bak "$PROFILE"
+}
+prechange_integrity_verify() {
+  if [[ ! -x "$INTEGRITY" || ! -s "$SECURITY_BASELINE" ]]; then
+    echo "SECURITY CHECK FAILED: integrity tool/baseline is missing. Network changes are blocked."
+    return 1
   fi
-}
-
-backup_netplan() {
-  if [[ -f "${NETPLAN_FILE}" ]]; then
-    cp -a "${NETPLAN_FILE}" "${NETPLAN_FILE}.serialcfg.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  if ! "$INTEGRITY" --verify >/dev/null 2>&1; then
+    echo "SECURITY CHECK FAILED: current appliance integrity does not match the approved baseline."
+    echo "Network changes are blocked until RMM Engineering reviews the integrity failure."
+    return 1
   fi
+  return 0
+}
+ip4() { ip -o -4 addr show dev "$1" scope global 2>/dev/null | awk 'NR==1 {print $4}'; }
+def() { ip -4 route show default 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'; }
+gw() { ip -4 route show default 2>/dev/null | awk -v i="$1" '$0 ~ (" dev " i "( |$)") {print $3; exit}'; }
+
+active_ssh_iface() {
+  local client=""
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then client="${SSH_CONNECTION%% *}"; fi
+  if [[ -z "$client" && -n "${SSH_CLIENT:-}" ]]; then client="${SSH_CLIENT%% *}"; fi
+  [[ -n "$client" ]] || return 0
+  ip route get "$client" 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'
 }
 
-validate_ipv4_cidr() {
-  python3 - "$1" <<'PY'
-import ipaddress, sys
-ipaddress.ip_interface(sys.argv[1])
-PY
+guard_change() {
+  local scope="$1" sif
+  sif="$(active_ssh_iface)"
+  [[ -n "$sif" ]] || return 0
+  case "$scope" in
+    wan) [[ "$sif" == "eth0" ]] || return 0 ;;
+    lan) [[ "$sif" == "eth1" || "$sif" == vlan* ]] || return 0 ;;
+    all) ;;
+  esac
+  echo
+  echo "NETWORK CHANGE BLOCKED FOR SESSION SAFETY"
+  echo "This SSH session is using ${sif}. Changing that network could terminate the session before rollback can complete."
+  echo "Use the V1210 USB-C COM console (115200 8N1), or connect through the opposite network when changing only one side."
+  return 1
 }
 
-validate_ipv4_address() {
-  python3 - "$1" <<'PY'
-import ipaddress, sys
-ipaddress.ip_address(sys.argv[1])
-PY
+change() {
+  mkdir -p /var/lib/rswsolutionz-rmm
+  {
+    echo "result=$1"
+    echo "revision=$REVISION"
+    echo "timestamp_utc=$(date -u +%FT%TZ)"
+    echo "user=${SUDO_USER:-${USER:-unknown}}"
+    echo "tty=$(tty 2>/dev/null || echo none)"
+    echo "ssh_connection=${SSH_CONNECTION:-none}"
+    echo "active_session_interface=$(active_ssh_iface)"
+    echo "change_type=$2"
+    echo "reason=$3"
+    echo "wan_ipv4=$(ip4 eth0)"
+    echo "wan_gateway=$(gw eth0)"
+    echo "default_route_interface=$(def)"
+    echo "lan_ipv4=$(ip4 eth1)"
+    echo "previous_netplan_sha256=$PRE_NETPLAN_SHA256"
+    echo "current_netplan_sha256=$(sha_file "$NETPLAN")"
+    echo "previous_profile_sha256=$PRE_PROFILE_SHA256"
+    echo "current_profile_sha256=$(sha_file "$PROFILE")"
+    echo "network_validation_result=$RESULT"
+    echo "production_validation_result=$PRODUCTION_VALIDATION_RESULT"
+    echo "production_validation_file=$POST_RESULT"
+    echo "security_validation_file=$SECURITY_RESULT"
+    echo "security_baseline=$SECURITY_BASELINE"
+    [[ -s "$SECURITY_BASELINE" ]] && echo "security_baseline_sha256=$(sha256sum "$SECURITY_BASELINE" | awk '{print $1}')"
+  } > "$CHANGE"
+  chmod 640 "$CHANGE"
 }
 
-write_dhcp() {
-  backup_netplan
-  cat > "${NETPLAN_FILE}" <<'YAML'
-network:
-  version: 2
-  renderer: networkd
-  ethernets:
-    eth0:
-      dhcp4: true
-      dhcp6: false
-      accept-ra: false
-    eth1:
-      dhcp4: false
-      dhcp6: false
-      accept-ra: false
-      optional: true
-YAML
-  chmod 600 "${NETPLAN_FILE}"
+restore_prev() {
+  local n p
+  n="$(latest "$NETPLAN")"
+  p="$(latest "$PROFILE")"
+  [[ -n "$n" ]] && cp -a "$n" "$NETPLAN"
+  [[ -n "$p" ]] && cp -a "$p" "$PROFILE"
+  netplan generate >/dev/null 2>&1 && netplan apply >/dev/null 2>&1
 }
 
-write_static() {
-  local address gateway dns_input
-  local -a dns_servers
+rollback_and_validate() {
+  restore_prev || return 1
+  set +e
+  "$VALIDATOR" >/dev/null 2>&1
+  local rc=$?
+  set -e
+  [[ $rc -ne 10 ]]
+}
 
-  read -r -p "eth0 IPv4 address with CIDR (example 192.168.10.20/24): " address
-  validate_ipv4_cidr "${address}" || { echo "Invalid IPv4/CIDR."; return 1; }
+stage() {
+  local src="$1" t r
+  [[ -r "$src" ]] || { echo "Profile not readable."; return 1; }
+  prechange_integrity_verify || return 1
+  backup
+  t="$(mktemp)"
+  r="$(mktemp)"
+  "$TOOL" render "$src" "$t" "$r" || { cat "$r" 2>/dev/null || true; rm -f "$t" "$r"; return 1; }
+  mkdir -p /etc/solutionz-rmm
+  cp -f "$src" "$PROFILE"
+  cp -f "$t" "$NETPLAN"
+  cp -f "$r" "$PROFILE_RESULT"
+  chmod 600 "$PROFILE" "$NETPLAN"
+  chmod 640 "$PROFILE_RESULT"
+  rm -f "$t" "$r"
+}
 
-  read -r -p "Default gateway IPv4 address: " gateway
-  validate_ipv4_address "${gateway}" || { echo "Invalid gateway."; return 1; }
+refresh_integrity_baseline() {
+  [[ -x "$INTEGRITY" ]] || { echo "ERROR - Security integrity tool is not installed: $INTEGRITY"; return 1; }
+  "$INTEGRITY" --refresh
+}
 
-  read -r -p "DNS servers, comma separated (example 192.168.10.1,8.8.8.8): " dns_input
-  IFS=',' read -r -a dns_servers <<< "${dns_input}"
-
-  local dns_yaml=""
-  local dns
-  for dns in "${dns_servers[@]}"; do
-    dns="$(echo "${dns}" | xargs)"
-    [[ -z "${dns}" ]] && continue
-    validate_ipv4_address "${dns}" || { echo "Invalid DNS address: ${dns}"; return 1; }
-    if [[ -n "${dns_yaml}" ]]; then
-      dns_yaml+=", "
-    fi
-    dns_yaml+="${dns}"
-  done
-
-  backup_netplan
-
-  cat > "${NETPLAN_FILE}" <<YAML
-network:
-  version: 2
-  renderer: networkd
-  ethernets:
-    eth0:
-      dhcp4: false
-      dhcp6: false
-      accept-ra: false
-      addresses:
-        - ${address}
-      routes:
-        - to: default
-          via: ${gateway}
-YAML
-
-  if [[ -n "${dns_yaml}" ]]; then
-    cat >> "${NETPLAN_FILE}" <<YAML
-      nameservers:
-        addresses: [${dns_yaml}]
-YAML
+run_production_validation() {
+  PRODUCTION_VALIDATION_RESULT="NOT_AVAILABLE"
+  [[ -x "$POSTVALIDATOR" ]] || { echo "WARN - Production validator is not installed."; return 0; }
+  echo
+  echo "Running automatic full production validation..."
+  set +e
+  "$POSTVALIDATOR" --force
+  local rc=$?
+  set -e
+  if [[ $rc -eq 0 ]]; then
+    PRODUCTION_VALIDATION_RESULT="PASS"
+    echo "FULL PRODUCTION VALIDATION: PASS"
+  else
+    PRODUCTION_VALIDATION_RESULT="FAIL"
+    echo "FULL PRODUCTION VALIDATION: FAIL"
+    echo "Network configuration remains committed because local network validation passed."
+    echo "Review: $POST_RESULT"
   fi
-
-  cat >> "${NETPLAN_FILE}" <<'YAML'
-    eth1:
-      dhcp4: false
-      dhcp6: false
-      accept-ra: false
-      optional: true
-YAML
-
-  chmod 600 "${NETPLAN_FILE}"
-}
-
-show_status() {
-  echo
-  echo "===== Current Interface State ====="
-  ip -br addr || true
-  echo
-  echo "===== Current Routes ====="
-  ip route || true
-  echo
-  echo "===== Current Netplan ====="
-  cat "${NETPLAN_FILE}" 2>/dev/null || true
-  echo
-  echo "===== DNS ====="
-  resolvectl status 2>/dev/null | sed -n '1,80p' || true
-  echo
-}
-
-sync_ufw_to_eth0_subnet() {
-  # Revision 5091126 production policy keeps TCP 22 and TCP 3000 globally
-  # permitted in UFW. Network changes therefore do not require source-subnet
-  # firewall rewrites.
   return 0
 }
 
-apply_config() {
-  netplan generate
+apply() {
+  local type="$1" rc
   echo
-  echo "Proposed Netplan:"
-  cat "${NETPLAN_FILE}"
+  echo "Proposed Solutionz network profile:"
+  cat "$PROFILE"
   echo
-  read -r -p "Apply this network configuration now? Type 'yes': " answer
-  if [[ "${answer}" != "yes" ]]; then
-    echo "Configuration saved but not applied."
+  echo "Generated Netplan:"
+  cat "$NETPLAN"
+  echo
+  read -r -p "Apply now? Type 'yes': " a
+  if [[ "$a" != "yes" ]]; then
+    echo "Change cancelled; restoring the previously committed Netplan/profile."
+    restore_prev || true
     return 0
   fi
 
-  netplan apply
-  sleep 2
-  sync_ufw_to_eth0_subnet
-  show_status
-}
-
-restore_backup() {
-  local latest
-  latest="$(ls -1t "${NETPLAN_FILE}".serialcfg.bak.* 2>/dev/null | head -n1 || true)"
-  if [[ -z "${latest}" ]]; then
-    echo "No serial configuration backup found."
+  if ! netplan generate; then
+    echo "Netplan generation failed; rolling back."
+    rollback_and_validate || true
+    change FAIL "$type" NETPLAN_GENERATE_FAILED
     return 1
   fi
-  cp -a "${latest}" "${NETPLAN_FILE}"
-  chmod 600 "${NETPLAN_FILE}"
-  echo "Restored ${latest}"
-  apply_config
+
+  if ! netplan apply; then
+    echo "Netplan apply failed; rolling back."
+    rollback_and_validate || true
+    change FAIL "$type" NETPLAN_APPLY_FAILED
+    return 1
+  fi
+
+  echo
+  echo "Refreshing detected live NIC state after network apply..."
+  [[ -x "$LIVE" ]] && "$LIVE" || true
+
+  echo
+  echo "Running automatic post-change WAN/LAN/VLAN validation..."
+  set +e
+  "$VALIDATOR"
+  rc=$?
+  set -e
+
+  if [[ $rc -eq 10 ]]; then
+    echo
+    echo "LOCAL NETWORK CONFIGURATION VALIDATION: FAIL"
+    echo "Restoring the previous working Netplan/profile automatically..."
+    if rollback_and_validate; then
+      change FAIL "$type" CONFIGURATION_FAILED_ROLLBACK_COMPLETED
+      echo "ROLLBACK COMPLETED AND LOCAL CONFIGURATION REVALIDATED."
+    else
+      change FAIL "$type" CONFIGURATION_FAILED_ROLLBACK_FAILED
+      echo "ROLLBACK FAILED OR COULD NOT BE REVALIDATED. Use USB-C COM recovery."
+    fi
+    return 1
+  fi
+
+  if [[ $rc -eq 20 ]]; then
+    echo
+    echo "LOCAL NETWORK CONFIGURATION: PASS"
+    echo "WAN CONNECTIVITY VALIDATION: FAIL"
+    echo "Addressing is retained because the local Netplan is valid. Review upstream DNS/firewall/WAN access."
+    if ! refresh_integrity_baseline; then
+      change FAIL "$type" SECURITY_BASELINE_REFRESH_FAILED
+      echo "SECURITY BASELINE REFRESH: FAIL. Network configuration remains applied for recovery."
+      return 1
+    fi
+    run_production_validation
+    if [[ "$PRODUCTION_VALIDATION_RESULT" == "PASS" ]]; then
+      change PASS "$type" LOCAL_CONFIGURATION_VALID_CONNECTIVITY_FAILED_BUT_PRODUCTION_VALIDATION_PASSED
+    else
+      change FAIL "$type" PRODUCTION_VALIDATION_FAILED_CONFIGURATION_RETAINED
+    fi
+    return 0
+  fi
+
+  echo
+  echo "AUTOMATIC NETWORK VALIDATION: PASS"
+  if ! refresh_integrity_baseline; then
+    change FAIL "$type" SECURITY_BASELINE_REFRESH_FAILED
+    echo "SECURITY BASELINE REFRESH: FAIL. Network configuration remains applied for recovery."
+    return 1
+  fi
+  run_production_validation
+  if [[ "$PRODUCTION_VALIDATION_RESULT" == "PASS" ]]; then
+    change PASS "$type" AUTOMATIC_NETWORK_AND_SECURITY_VALIDATION_PASSED
+  else
+    change FAIL "$type" PRODUCTION_VALIDATION_FAILED_CONFIGURATION_RETAINED
+  fi
+  return 0
 }
 
-require_root
+modify() {
+  local section="$1" mode="$2" addr="${3:-}" g="${4:-}" dns="${5:-}" tmp
+  tmp="$(mktemp)"
+  python3 - "$PROFILE" "$tmp" "$section" "$mode" "$addr" "$g" "$dns" <<'MODIFYPY'
+import json,sys
+src,out,sec,mode,addr,gw,dns=sys.argv[1:]
+try:
+    p=json.load(open(src))
+except Exception:
+    p={"revision":"V06.100626N","wan":{"interface":"eth0","mode":"dhcp","dns":[]},"lan":{"interface":"eth1","mode":"dhcp"},"vlans":[]}
+if sec=='wan':
+    p['wan']={'interface':'eth0','mode':mode,'dns':[]}
+    if mode=='static':
+        p['wan'].update(address=addr,gateway=gw,dns=[x.strip() for x in dns.split(',') if x.strip()])
+else:
+    p['lan']={'interface':'eth1','mode':mode}
+    if mode=='static': p['lan']['address']=addr
+json.dump(p,open(out,'w'),indent=2)
+open(out,'a').write('\n')
+MODIFYPY
+  stage "$tmp"
+  rm -f "$tmp"
+}
+
+wan() {
+  guard_change wan || return 1
+  local m a g d
+  read -r -p "WAN mode [dhcp/static]: " m
+  m="${m:-dhcp}"
+  if [[ "$m" == "static" ]]; then
+    read -r -p "WAN IPv4/CIDR: " a
+    read -r -p "Gateway: " g
+    read -r -p "DNS comma separated: " d
+    modify wan "$m" "$a" "$g" "$d"
+  elif [[ "$m" == "dhcp" ]]; then
+    modify wan dhcp
+  else
+    echo "Invalid WAN mode."
+    return 1
+  fi
+  apply wan
+}
+
+lan() {
+  guard_change lan || return 1
+  local m a
+  read -r -p "LAN native mode [dhcp/static/none]: " m
+  m="${m:-dhcp}"
+  if [[ "$m" == "static" ]]; then
+    read -r -p "LAN IPv4/CIDR (no gateway): " a
+    modify lan "$m" "$a"
+  elif [[ "$m" == "dhcp" || "$m" == "none" ]]; then
+    modify lan "$m"
+  else
+    echo "Invalid LAN mode."
+    return 1
+  fi
+  apply lan
+}
+
+wizard() {
+  guard_change all || return 1
+  local t
+  t="$(mktemp)"
+  "$TOOL" wizard "$t" && stage "$t" && apply wan_lan_vlan
+  rm -f "$t"
+}
+
+saved() {
+  guard_change all || return 1
+  local p
+  read -r -p "JSON profile path: " p
+  stage "$p" && apply saved_profile
+}
+
+show_live() {
+  echo
+  echo "Scanning live network interfaces..."
+  if [[ -x "$LIVE" ]]; then
+    "$LIVE" || true
+  else
+    echo "WARN - Live network discovery utility is not installed: $LIVE"
+  fi
+}
+
+show() {
+  show_live
+  echo
+  echo "PERSISTENT SOLUTIONZ NETWORK CONFIGURATION"
+  echo "------------------------------------------------"
+  if [[ -s "$PROFILE" ]]; then
+    cat "$PROFILE"
+  else
+    echo "No Solutionz network profile found."
+  fi
+  echo
+  echo "SECURITY / ROUTING STATE"
+  echo "------------------------------------------------"
+  echo "IPv4 forwarding: $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unknown)"
+  [[ -s "$RESULT" ]] && { echo; echo "LAST NETWORK VALIDATION"; echo "------------------------------------------------"; cat "$RESULT"; }
+}
+
+validate() {
+  set +e
+  "$VALIDATOR"
+  local rc=$?
+  set -e
+  cat "$RESULT" 2>/dev/null || true
+  return $rc
+}
+
+validate_full() {
+  validate || true
+  run_production_validation
+  [[ -s "$SECURITY_RESULT" ]] && { echo; cat "$SECURITY_RESULT"; }
+}
+
+restore() {
+  guard_change all || return 1
+  prechange_integrity_verify || return 1
+  local n p a
+  n="$(latest "$NETPLAN")"
+  p="$(latest "$PROFILE")"
+  echo "Netplan: ${n:-none}"
+  echo "Profile: ${p:-none}"
+  read -r -p "Restore? Type yes: " a
+  [[ "$a" == "yes" ]] || return 0
+  [[ -n "$n" ]] && cp -a "$n" "$NETPLAN"
+  [[ -n "$p" ]] && cp -a "$p" "$PROFILE"
+  netplan generate && netplan apply
+  [[ -x "$LIVE" ]] && "$LIVE" || true
+  validate || true
+  refresh_integrity_baseline || true
+  run_production_validation
+}
+
+echo
+echo "AUTO-DETECT CURRENT NETWORK"
+echo "------------------------------------------------"
+show_live
 
 while true; do
   cat <<'MENU'
 
-Solutionz RMM V1210 USB-C COM Local Configuration
--------------------------------------------------
-1) Configure eth0 for DHCP
-2) Configure eth0 with a static IPv4 address
-3) Show current network status
-4) Restore most recent serial-console Netplan backup
-5) Exit
-MENU
+Solutionz RMM Dual-Homed Network Configuration - Revision V06.100626N
+1) Configure WAN / eth0 (DHCP or static; default route/DNS)
+2) Configure LAN / eth1 native network (DHCP, static, or unnumbered trunk)
+3) Guided WAN + LAN + 802.1Q VLAN configuration (VLANs on eth1)
+4) Apply saved WAN/LAN/VLAN JSON profile
+5) Show live + persistent network status
+6) Refresh detected live network information
+7) Run automatic network + security validation
+8) Restore previous network configuration
+9) Log out
 
-  read -r -p "Selection: " choice
-  case "${choice}" in
-    1)
-      write_dhcp
-      apply_config
-      ;;
-    2)
-      write_static
-      apply_config
-      ;;
-    3)
-      show_status
-      ;;
-    4)
-      restore_backup
-      ;;
-    5)
-      exit 0
-      ;;
-    *)
-      echo "Invalid selection."
-      ;;
+eth0 = WAN/cloud | eth1 = AV/control LAN | VLANs on eth1 | forwarding disabled
+Live detected state comes from the running Linux network stack, not Netplan.
+Netplan remains the persistent configuration mechanism across reboot.
+USB-C COM = independent recovery/configuration path
+Every applied network change is automatically rediscovered and validated; local configuration failures roll back.
+MENU
+  read -r -p "Selection: " c
+  case "$c" in
+    1) wan ;;
+    2) lan ;;
+    3) wizard ;;
+    4) saved ;;
+    5) show ;;
+    6) show_live ;;
+    7) validate_full || true ;;
+    8) restore ;;
+    9) if (( AUTO )); then exit 90; else exit 0; fi ;;
+    *) echo "Invalid selection." ;;
   esac
 done
 LOCALCFG
-
   chmod 750 "${LOCAL_CONFIG_TOOL}"
   chown root:root "${LOCAL_CONFIG_TOOL}"
 
+  cat > "${LOCAL_CONFIG_SUDOERS_FILE}" <<EOF
+%${FIELD_TECH_GROUP} ALL=(root) NOPASSWD: ${LOCAL_CONFIG_TOOL}
+%${ENGINEERING_GROUP} ALL=(root) NOPASSWD: ${LOCAL_CONFIG_TOOL}
+%sudo ALL=(root) NOPASSWD: ${LOCAL_CONFIG_TOOL}
+EOF
+  chmod 440 "${LOCAL_CONFIG_SUDOERS_FILE}"
+  visudo -cf "${LOCAL_CONFIG_SUDOERS_FILE}" >/dev/null || error_exit "Local config sudoers validation failed."
+
   cat > "${SERIAL_PROFILE_FILE}" <<EOF
 #!/usr/bin/env bash
-case "\$(tty 2>/dev/null || true)" in
-  /dev/ttyS0)
-    echo
-    echo "Solutionz RMM V1210 USB-C COM console detected."
-    echo "For direct network configuration run:"
-    echo "  sudo ${LOCAL_CONFIG_TOOL}"
-    echo
-    ;;
-esac
+if [[ "\${SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE:-0}" != 1 && "\$(tty 2>/dev/null || true)" == /dev/ttyS0 ]]; then
+  export SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE=1
+  _rc=0
+  echo
+  echo "Solutionz USB-C COM session detected; launching WAN/LAN/VLAN menu."
+  if [[ \${EUID} -eq 0 ]]; then
+    "${LOCAL_CONFIG_TOOL}" --serial-auto || _rc=\$?
+  else
+    sudo "${LOCAL_CONFIG_TOOL}" --serial-auto || _rc=\$?
+  fi
+  unset SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE
+  if [[ \${EUID} -ne 0 ]] && ! id -nG "\${USER:-}" 2>/dev/null | tr ' ' '\n' | grep -qx '${ENGINEERING_GROUP}'; then
+    exit
+  fi
+  [[ \$_rc -eq 90 ]] && exit
+  unset _rc
+fi
 EOF
   chmod 644 "${SERIAL_PROFILE_FILE}"
-
-  progress_message "Direct laptop configuration is available through the V1210 USB-C COM console."
+  progress_message "Field WAN/LAN/VLAN utility installed; live NIC discovery runs automatically before configuration, unrestricted field-menu shell access is removed, and USB-C COM/session-safety/automatic validation/rollback remain enabled."
 }
 
 update_banner() {
@@ -1332,296 +2734,198 @@ EOF
 
 install_postreboot_validation() {
   step_message 16 "Install post-reboot production validation"
-
   cat > "${POSTREBOOT_VALIDATOR}" <<'POSTVALIDATOR'
 #!/usr/bin/env bash
 set -uo pipefail
 
-REVISION="5091126"
-SUPPORTED_OS_ID="ubuntu"
-SUPPORTED_UBUNTU_VERSION_ID="24.04"
-SUPPORTED_UBUNTU_CODENAME="noble"
-SUPPORTED_VENDOR="Protectli"
-SUPPORTED_MODEL="V1210"
+REVISION="V06.100626N"
+STATE="/var/lib/rswsolutionz-rmm/install.state"
+RESULT="/var/lib/rswsolutionz-rmm/postreboot-validation-V06.100626N.result"
+LOG="/var/log/solutionz-rmm/setup/postreboot-validation.log"
+NV="/usr/local/sbin/solutionz-rmm-network-validate"
+NVR="/var/lib/rswsolutionz-rmm/network-validation-V06.100626N.result"
+LD="/usr/local/sbin/solutionz-rmm-live-network-discovery"
+LDR="/var/lib/rswsolutionz-rmm/network-live-discovery-V06.100626N.result"
+PF="/etc/solutionz-rmm/network-profile.json"
+PT="/usr/local/sbin/solutionz-rmm-network-profile"
+PR="/var/lib/rswsolutionz-rmm/network-profile-V06.100626N.result"
+DOM="domotzpro-agent-publicstore"
+SER="serial-getty@ttyS0.service"
+CFG="/usr/local/sbin/solutionz-rmm-local-config"
+SP="/etc/profile.d/solutionz-rmm-serial.sh"
+SD="/etc/sudoers.d/solutionz-rmm-local-config"
+GRUB="/etc/default/grub"
+IPF="/etc/sysctl.d/90-solutionz-rmm-no-forwarding.conf"
+SV="/usr/local/sbin/solutionz-rmm-security-validate"
+SVR="/var/lib/rswsolutionz-rmm/security-validation-V06.100626N.result"
+IB="/var/lib/rswsolutionz-rmm/security-baseline-V06.100626N.sha256"
+FORCE=0
 
-STATE_FILE="/var/lib/rswsolutionz-rmm/install.state"
-PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/package-baseline-5091126.tsv"
-OS_BASELINE_FILE="/var/lib/rswsolutionz-rmm/os-baseline-5091126.txt"
-MANUFACTURER_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126.txt"
-MANUFACTURER_PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-packages-5091126.tsv"
-MANUFACTURER_PACKAGE_VALIDATION_FILE="/var/lib/rswsolutionz-rmm/manufacturer-package-validation-5091126.txt"
-MANUFACTURER_BASELINE_SHA256_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126.sha256"
-SNAP_BASELINE_FILE="/var/lib/rswsolutionz-rmm/snap-baseline-5091126.txt"
-NETWORK_REQUIREMENTS_FILE="/var/lib/rswsolutionz-rmm/network-requirements-5091126.txt"
-LOG_DIR="/var/log/solutionz-rmm/setup"
-LOG_FILE="${LOG_DIR}/postreboot-validation.log"
-DOMOTZ_SNAP_NAME="domotzpro-agent-publicstore"
-SERIAL_SERVICE="serial-getty@ttyS0.service"
-SERIAL_DEVICE="/dev/ttyS0"
-LOCAL_CONFIG_TOOL="/usr/local/sbin/solutionz-rmm-local-config"
-NETPLAN_FILE="/etc/netplan/00-installer-config.yaml"
-GRUB_FILE="/etc/default/grub"
+if [[ "${1:-}" == "--force" ]]; then
+  FORCE=1
+elif [[ $# -ne 0 ]]; then
+  echo "Usage: $(basename "$0") [--force]"
+  exit 2
+fi
 
-REQUIRED_PACKAGES=(
-  net-tools
-  openvswitch-switch
-  traceroute
-  dnsutils
-  curl
-  openssl
-  netcat-openbsd
-  nano
-  iputils-ping
-  ufw
-  snapd
-  openssh-server
-  systemd-timesyncd
-  sudo
-  python3
-)
+mkdir -p "$(dirname "$LOG")"
+exec >>"$LOG" 2>&1
 
-mkdir -p "${LOG_DIR}"
-exec >> "${LOG_FILE}" 2>&1
+if (( ! FORCE )); then
+  st="$(head -n1 "$STATE" 2>/dev/null || true)"
+  case "$st" in
+    phase1_complete|phase2_validation_failed) ;;
+    *) exit 0 ;;
+  esac
+fi
 
-status="$(head -n1 "${STATE_FILE}" 2>/dev/null || true)"
-case "${status}" in
-  phase1_complete|phase2_validation_failed)
-    ;;
-  *)
-    exit 0
-    ;;
-esac
+F=()
+W=()
+pass() { echo "PASS - $*"; }
+fail() { echo "FAIL - $*"; F+=("$*"); }
+warn() { echo "WARN - $*"; W+=("$*"); }
+check() { local d="$1"; shift; "$@" && pass "$d" || fail "$d"; }
+ntp() { [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" == "yes" || -e /run/systemd/timesync/synchronized ]]; }
+waitntp() { local i; for i in {1..36}; do ntp && return 0; [[ $i -lt 36 ]] && sleep 5; done; return 1; }
 
 echo "============================================================"
-echo "Solutionz RMM production post-reboot validation"
-echo "Revision: ${REVISION}"
+echo "Solutionz RMM Post-Reboot Production Validation"
+echo "Revision: $REVISION"
+echo "Forced validation: $FORCE"
 echo "Time: $(date -u +%FT%TZ)"
 echo "============================================================"
 
-failures=0
-warnings=0
+. /etc/os-release 2>/dev/null || true
+[[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == "24.04" ]] && pass "Ubuntu 24.04 LTS." || fail "Unsupported OS."
+v="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)"
+m="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+[[ "${v,,}" == *protectli* && "$m" == "V1210" ]] && pass "Protectli V1210." || fail "Unsupported hardware."
 
-pass() { echo "PASS - $*"; }
-warn() { echo "WARN - $*"; warnings=$((warnings + 1)); }
-fail() { echo "FAIL - $*"; failures=$((failures + 1)); }
+if [[ -x "$PT" && -s "$PF" ]] && "$PT" validate "$PF" >/dev/null 2>&1; then
+  pass "WAN/LAN/VLAN profile valid."
+else
+  fail "Network profile invalid or missing."
+fi
+[[ -s "$PR" ]] && grep -q '^result=PASS$' "$PR" && pass "Profile render result PASS." || fail "Profile render result missing/not PASS."
+netplan generate >/dev/null 2>&1 && pass "Netplan generates." || fail "Netplan generation failed."
+[[ -s "$IPF" ]] && grep -Eq '^net\.ipv4\.ip_forward=0$' "$IPF" && pass "Persistent IPv4 forwarding disable policy installed." || fail "Persistent IPv4 forwarding disable policy missing."
+[[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 1)" == "0" ]] && pass "IPv4 forwarding disabled." || fail "IPv4 forwarding enabled."
 
-check() {
-  local description="$1"
-  shift
-  if "$@" >/dev/null 2>&1; then
-    pass "${description}"
+if [[ -x "$LD" ]]; then
+  "$LD" || warn "Live network discovery utility returned a non-zero status."
+  [[ -s "$LDR" ]] && pass "Live network discovery state captured." || warn "Live network discovery result file was not created."
+else
+  fail "Live network discovery utility missing."
+fi
+
+if [[ -x "$NV" ]]; then
+  set +e
+  "$NV"
+  rc=$?
+  set -e
+  if [[ $rc -eq 0 ]]; then
+    pass "Automatic WAN/LAN/VLAN network validation passed."
+  elif [[ $rc -eq 10 ]]; then
+    fail "Local WAN/LAN/VLAN configuration validation failed; see $NVR."
   else
-    fail "${description}"
-  fi
-}
-
-dns_resolves_ipv4() {
-  local host="$1"
-  getent ahostsv4 "${host}" 2>/dev/null | awk '{print $1}' | grep -Eq '^[0-9]+(\.[0-9]+){3}$'
-}
-
-ntp_is_synchronized() {
-  local synced=""
-  synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
-  [[ "${synced}" == "yes" || -e /run/systemd/timesync/synchronized ]]
-}
-
-wait_for_ntp_sync() {
-  local attempts="${1:-36}"
-  local delay_seconds="${2:-5}"
-  local attempt
-
-  for ((attempt=1; attempt<=attempts; attempt++)); do
-    if ntp_is_synchronized; then
-      return 0
-    fi
-    if (( attempt < attempts )); then
-      sleep "${delay_seconds}"
-    fi
-  done
-
-  return 1
-}
-
-report_ntp_diagnostics() {
-  echo "INFO - NTP diagnostics:"
-  timedatectl status 2>/dev/null | sed -n '1,20p' || true
-  timedatectl timesync-status --no-pager 2>/dev/null | sed -n '1,40p' || true
-  systemctl status systemd-timesyncd.service --no-pager -l 2>/dev/null | sed -n '1,40p' || true
-  journalctl -u systemd-timesyncd.service -n 30 --no-pager 2>/dev/null || true
-}
-
-state_value() {
-  local key="$1"
-  awk -F= -v key="${key}" '$1 == key {print substr($0, index($0,"=")+1); exit}' "${STATE_FILE}" 2>/dev/null || true
-}
-
-# Platform baseline. Any Ubuntu 24.04.x Noble point release is supported,
-# including Ubuntu 24.04.4 LTS.
-if [[ -r /etc/os-release ]]; then
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  [[ "${ID:-}" == "${SUPPORTED_OS_ID}" ]] && pass "Operating system is Ubuntu." || fail "Operating system ID is ${ID:-unknown}; expected Ubuntu."
-  [[ "${VERSION_ID:-}" == "${SUPPORTED_UBUNTU_VERSION_ID}" ]] && pass "Ubuntu LTS family is ${SUPPORTED_UBUNTU_VERSION_ID}." || fail "Ubuntu VERSION_ID is ${VERSION_ID:-unknown}; expected ${SUPPORTED_UBUNTU_VERSION_ID}."
-  if [[ -n "${VERSION_CODENAME:-}" && "${VERSION_CODENAME}" != "${SUPPORTED_UBUNTU_CODENAME}" ]]; then
-    fail "Ubuntu codename is ${VERSION_CODENAME}; expected ${SUPPORTED_UBUNTU_CODENAME}."
-  else
-    pass "Ubuntu runtime release is supported: ${PRETTY_NAME:-${VERSION:-unknown}}"
+    fail "WAN connectivity validation failed; see $NVR."
   fi
 else
-  fail "/etc/os-release is unavailable."
+  fail "Network validator missing."
 fi
 
-vendor="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null | xargs || true)"
-model="$(cat /sys/class/dmi/id/product_name 2>/dev/null | xargs || true)"
-[[ "${vendor,,}" == *"${SUPPORTED_VENDOR,,}"* ]] && pass "Hardware vendor is Protectli." || fail "Hardware vendor is ${vendor:-unknown}; expected Protectli."
-[[ "${model}" == "${SUPPORTED_MODEL}" ]] && pass "Hardware model is V1210." || fail "Hardware model is ${model:-unknown}; expected V1210."
-
-[[ "$(state_value revision)" == "${REVISION}" ]] && pass "State-file revision matches ${REVISION}." || fail "State-file revision does not match ${REVISION}."
-[[ -s "${PACKAGE_BASELINE_FILE}" ]] && pass "Final required-package baseline record exists." || fail "Final required-package baseline record is missing."
-[[ -s "${OS_BASELINE_FILE}" ]] && pass "Initial OS runtime baseline record exists." || fail "Initial OS runtime baseline record is missing."
-[[ -s "${MANUFACTURER_BASELINE_FILE}" ]] && pass "Manufacturer system baseline record exists." || fail "Manufacturer system baseline record is missing."
-[[ -s "${MANUFACTURER_PACKAGE_BASELINE_FILE}" ]] && pass "Manufacturer package inventory exists." || fail "Manufacturer package inventory is missing."
-[[ -s "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" ]] && pass "Manufacturer required-package validation exists." || fail "Manufacturer required-package validation is missing."
-[[ -s "${MANUFACTURER_BASELINE_SHA256_FILE}" ]] && pass "Manufacturer baseline checksum record exists." || fail "Manufacturer baseline checksum record is missing."
-[[ -s "${NETWORK_REQUIREMENTS_FILE}" ]] && pass "Network requirements record exists." || fail "Network requirements record is missing."
-if [[ -s "${MANUFACTURER_BASELINE_SHA256_FILE}" ]]; then
-  if sha256sum -c "${MANUFACTURER_BASELINE_SHA256_FILE}" >/dev/null 2>&1; then
-    pass "Manufacturer baseline integrity validation passed."
-  else
-    fail "Manufacturer baseline integrity validation failed."
-  fi
-fi
-if [[ -s "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" ]]; then
-  if grep -q '^manufacturer_package_validation=PASS$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}"; then
-    pass "Manufacturer-delivered required-package set was complete at baseline capture."
-  elif grep -q '^manufacturer_package_validation=DEVIATION$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}"; then
-    warn "Manufacturer-delivered package baseline had one or more missing required packages; the original deviation is preserved in the baseline report."
-  else
-    fail "Manufacturer required-package validation record does not contain a recognized PASS/DEVIATION result."
-  fi
-fi
-[[ -s "${SNAP_BASELINE_FILE}" ]] && pass "Domotz Snap audit record exists." || fail "Domotz Snap audit record is missing."
-
-for pkg in "${REQUIRED_PACKAGES[@]}"; do
-  if dpkg-query -W -f='${db:Status-Abbrev}' "${pkg}" 2>/dev/null | grep -q '^ii'; then
-    pass "Final required package installed: ${pkg}"
-  else
-    fail "Final required package missing: ${pkg}"
-  fi
-done
-
-# Network baseline
-check "eth0 exists" ip link show eth0
-if ip -4 addr show dev eth0 2>/dev/null | grep -q 'inet '; then pass "eth0 has an IPv4 address."; else fail "eth0 has no IPv4 address."; fi
-if ip -4 route show default | grep -q ' dev eth0 '; then pass "Default IPv4 route uses eth0."; else fail "Default IPv4 route does not use eth0."; fi
-if ip -4 route show default | grep -q ' dev eth1 '; then fail "eth1 has an IPv4 default route."; else pass "eth1 has no IPv4 default route."; fi
-check "Netplan configuration generates successfully" netplan generate
-[[ -s "${NETPLAN_FILE}" ]] && pass "Solutionz Netplan file exists." || fail "Solutionz Netplan file is missing."
-
-# DNS and time
-if dns_resolves_ipv4 api.snapcraft.io; then pass "DNS resolves api.snapcraft.io to IPv4."; else fail "DNS does not resolve api.snapcraft.io to IPv4."; fi
-if dns_resolves_ipv4 archive.ubuntu.com; then pass "DNS resolves archive.ubuntu.com to IPv4."; else fail "DNS does not resolve archive.ubuntu.com to IPv4."; fi
-if dns_resolves_ipv4 security.ubuntu.com; then pass "DNS resolves security.ubuntu.com to IPv4."; else fail "DNS does not resolve security.ubuntu.com to IPv4."; fi
-
-if command -v timedatectl >/dev/null 2>&1; then
-  if systemctl is-enabled --quiet systemd-timesyncd.service 2>/dev/null; then
-    pass "systemd-timesyncd.service is enabled."
-  else
-    fail "systemd-timesyncd.service is not enabled."
-  fi
-
-  if systemctl is-active --quiet systemd-timesyncd.service; then
-    pass "systemd-timesyncd.service is active."
-  else
-    fail "systemd-timesyncd.service is not active."
-  fi
-
-  echo "INFO - Phase 2 does not depend on time-sync.target or systemd-time-wait-sync.service; NTP synchronization is validated with a bounded 180-second runtime check."
-
-  echo "INFO - Waiting up to 180 seconds for current-boot NTP synchronization evidence."
-  if wait_for_ntp_sync 36 5; then
-    pass "System clock is synchronized to a network time source."
-  else
-    fail "System clock did not synchronize within 180 seconds."
-    report_ntp_diagnostics
-  fi
+if [[ -x "$SV" ]]; then
+  set +e
+  "$SV"
+  src=$?
+  set -e
+  [[ $src -eq 0 ]] && pass "Solutionz security validation passed." || fail "Solutionz security validation failed; see $SVR."
 else
-  fail "timedatectl is unavailable; NTP synchronization cannot be validated."
+  fail "Security validator missing."
 fi
 
-# SSH and firewall
-check "SSH service is active" systemctl is-active --quiet ssh
-check "SSH service is enabled" systemctl is-enabled --quiet ssh
-if ss -lnt 2>/dev/null | awk '$4 ~ /:22$/ {found=1} END {exit found?0:1}'; then pass "TCP 22 is listening locally."; else fail "TCP 22 is not listening locally."; fi
-if ufw status | grep -q 'Status: active'; then pass "UFW is active."; else fail "UFW is not active."; fi
-if ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW'; then pass "UFW globally permits inbound TCP 22."; else fail "UFW global TCP 22 rule is missing."; fi
-if ufw status | grep -Eq '^3000/tcp[[:space:]]+ALLOW'; then pass "UFW globally permits inbound TCP 3000."; else fail "UFW global TCP 3000 rule is missing."; fi
-if ufw status verbose | grep -Eq '^Default: deny \(incoming\), allow \(outgoing\)'; then pass "UFW default outbound policy is allow."; else fail "UFW default outbound policy is not allow."; fi
-if ss -lnt 2>/dev/null | awk '$4 ~ /:3000$/ {found=1} END {exit found?0:1}'; then pass "TCP 3000 is listening locally."; else warn "TCP 3000 is not currently listening; Domotz local service may require activation/startup state review."; fi
-
-# TUN and Domotz local state
-[[ -c /dev/net/tun ]] && pass "TUN device is available." || fail "TUN device is unavailable."
-if snap list "${DOMOTZ_SNAP_NAME}" >/dev/null 2>&1; then pass "Domotz Snap is installed."; else fail "Domotz Snap is not installed."; fi
-for permission in firewall-control network-observe raw-usb shutdown system-observe; do
-  if snap connections "${DOMOTZ_SNAP_NAME}" 2>/dev/null | awk -v p="${permission}" '$1 == p && $3 != "-" {found=1} END {exit found ? 0 : 1}'; then
-    pass "Domotz permission ${permission} is connected."
-  else
-    fail "Domotz permission ${permission} is not connected."
-  fi
+check "SSH active" systemctl is-active --quiet ssh
+ufw status | grep -q 'Status: active' && pass "UFW active." || fail "UFW inactive."
+[[ -c /dev/net/tun ]] && pass "TUN available." || fail "TUN unavailable."
+snap list "$DOM" >/dev/null 2>&1 && pass "Domotz installed." || fail "Domotz missing."
+for p in firewall-control network-observe raw-usb shutdown system-observe; do
+  snap connections "$DOM" 2>/dev/null | awk -v p="$p" '$1==p && $3!="-" {f=1} END {exit f?0:1}' && \
+    pass "Domotz ${p} connected." || fail "Domotz ${p} missing."
 done
+systemctl is-active --quiet systemd-timesyncd.service && pass "systemd-timesyncd active." || fail "systemd-timesyncd inactive."
+waitntp && pass "NTP synchronized." || fail "NTP synchronization failed."
+[[ -c /dev/ttyS0 ]] && pass "ttyS0 present." || fail "ttyS0 missing."
+check "Serial service active" systemctl is-active --quiet "$SER"
+[[ -x "$CFG" && -s "$SP" ]] && grep -q '/dev/ttyS0' "$SP" && pass "USB-C COM network menu installed." || fail "USB-C COM menu missing."
+[[ -s "$SD" ]] && visudo -cf "$SD" >/dev/null 2>&1 && pass "sudoers policy valid." || fail "sudoers policy invalid."
+grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=.*console=ttyS0,115200n8' "$GRUB" && pass "GRUB serial console configured." || fail "GRUB serial console missing."
 
-# Serial/COM recovery path
-[[ -c "${SERIAL_DEVICE}" ]] && pass "V1210 ttyS0 serial device is present." || fail "V1210 ttyS0 serial device is missing."
-check "Serial console service is active" systemctl is-active --quiet "${SERIAL_SERVICE}"
-check "Serial console service is enabled" systemctl is-enabled --quiet "${SERIAL_SERVICE}"
-# Do not require a persistent pgrep match for agetty. The systemd serial-getty
-# unit may respawn around login/session changes; enabled+active unit state,
-# ttyS0 presence, and GRUB console configuration are the production criteria.
-[[ -x "${LOCAL_CONFIG_TOOL}" ]] && pass "USB-C COM local configuration utility is installed." || fail "USB-C COM local configuration utility is missing."
-if grep -Eq '^GRUB_CMDLINE_LINUX=.*net\.ifnames=0' "${GRUB_FILE}" && grep -Eq '^GRUB_CMDLINE_LINUX=.*biosdevname=0' "${GRUB_FILE}"; then pass "GRUB interface-naming parameters are present."; else fail "Required GRUB interface-naming parameters are missing."; fi
-if grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=.*console=ttyS0,115200n8' "${GRUB_FILE}"; then pass "GRUB serial-console parameter is present."; else fail "GRUB serial-console parameter is missing."; fi
+f=${#F[@]}
+w=${#W[@]}
+res="PASS"
+(( f > 0 )) && res="FAIL"
+{
+  echo "result=$res"
+  echo "revision=$REVISION"
+  echo "timestamp_utc=$(date -u +%FT%TZ)"
+  echo "forced_validation=$FORCE"
+  echo "failures=$f"
+  echo "warnings=$w"
+  echo "network_validation_result=$NVR"
+  echo "network_live_discovery_result=$LDR"
+  echo "security_validation_result=$SVR"
+  echo "security_baseline=$IB"
+  echo
+  echo "FAILED_CHECKS:"
+  if (( f > 0 )); then printf -- '- %s\n' "${F[@]}"; else echo '- none'; fi
+  echo
+  echo "WARNING_CHECKS:"
+  if (( w > 0 )); then printf -- '- %s\n' "${W[@]}"; else echo '- none'; fi
+} > "$RESULT"
+chmod 640 "$RESULT"
 
-echo "------------------------------------------------------------"
-echo "Production validation failures: ${failures}"
-echo "Production validation warnings: ${warnings}"
-echo "Log: ${LOG_FILE}"
-echo "============================================================"
-
-if (( failures == 0 )); then
+if (( f == 0 )); then
   {
     echo "phase2_system_validated"
-    echo "revision=${REVISION}"
+    echo "revision=$REVISION"
     echo "timestamp_utc=$(date -u +%FT%TZ)"
     echo "failures=0"
-    echo "warnings=${warnings}"
-  } > "${STATE_FILE}"
-  chmod 640 "${STATE_FILE}"
+    echo "warnings=$w"
+    echo "result_file=$RESULT"
+    echo "network_validation_result=$NVR"
+    echo "network_live_discovery_result=$LDR"
+    echo "security_validation_result=$SVR"
+    echo "security_baseline=$IB"
+    echo "log=$LOG"
+  } > "$STATE"
+  chmod 640 "$STATE"
   echo "POST-REBOOT PRODUCTION VALIDATION PASSED"
   exit 0
 fi
 
 {
   echo "phase2_validation_failed"
-  echo "revision=${REVISION}"
+  echo "revision=$REVISION"
   echo "timestamp_utc=$(date -u +%FT%TZ)"
-  echo "failures=${failures}"
-  echo "warnings=${warnings}"
-} > "${STATE_FILE}"
-chmod 640 "${STATE_FILE}"
-echo "POST-REBOOT PRODUCTION VALIDATION FAILED: ${failures} check(s)"
+  echo "failures=$f"
+  echo "warnings=$w"
+  echo "result_file=$RESULT"
+  echo "network_validation_result=$NVR"
+  echo "network_live_discovery_result=$LDR"
+  echo "security_validation_result=$SVR"
+  echo "security_baseline=$IB"
+  echo "log=$LOG"
+} > "$STATE"
+chmod 640 "$STATE"
+echo "POST-REBOOT PRODUCTION VALIDATION FAILED: $f"
 exit 1
 POSTVALIDATOR
-
   chmod 750 "${POSTREBOOT_VALIDATOR}"
   chown root:root "${POSTREBOOT_VALIDATOR}"
 
   cat > "${POSTREBOOT_SERVICE}" <<EOF
 [Unit]
 Description=Solutionz RMM Post-Reboot Production Validation
-# Do not order this service after time-sync.target. If NTP cannot synchronize,
-# time-sync.target may be delayed and Phase 2 would never run, leaving the build
-# stuck at phase1_complete. The validator itself performs a bounded NTP wait.
 After=network-online.target systemd-timesyncd.service ssh.service snapd.service
 Wants=network-online.target systemd-timesyncd.service
 
@@ -1634,9 +2938,468 @@ TimeoutStartSec=5min
 [Install]
 WantedBy=multi-user.target
 EOF
-
   systemctl daemon-reload
   systemctl enable rswsolutionz-rmm-postreboot-validation.service
+}
+
+install_domotz_activation() {
+  step_message 17 "Install integrated Domotz activation workflow"
+
+  install -d -m 750 /etc/solutionz-rmm "${DOMOTZ_ACTIVATION_STATE_DIR}"
+
+  cat > "${DOMOTZ_ACTIVATION_HELPER}" <<'PYACTIVATION'
+#!/usr/bin/env python3
+import argparse
+import getpass
+import json
+import os
+import re
+import socket
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+CONFIG = Path('/etc/solutionz-rmm/domotz-activation.json')
+STATE_DIR = Path('/var/lib/solutionz-domotz-activation')
+RESULT = STATE_DIR / 'result.json'
+LOCAL_STATUS = 'http://127.0.0.1:3000/api/v1/status'
+LOCAL_AGENT = 'http://127.0.0.1:3000/api/v1/agent'
+TERMINAL_STATUSES = {
+    'activation_request_accepted',
+    'existing_configuration_review',
+    'submission_started',
+    'review_required',
+}
+
+
+def atomic_json(path: Path, data: dict, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + '.', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def load_json(path: Path):
+    with path.open('r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def version_tuple(value: str):
+    nums = [int(x) for x in re.findall(r'\d+', value or '')[:3]]
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums)
+
+
+def validate_endpoint(endpoint: str):
+    u = urllib.parse.urlparse(endpoint)
+    if u.scheme != 'https' or not u.hostname:
+        raise ValueError('Domotz API endpoint must be an https:// URL.')
+    if '/public-api/' not in (u.path or ''):
+        raise ValueError('Domotz API endpoint must be the Public API endpoint supplied with the activation key.')
+    return u
+
+
+def validate_config(c: dict):
+    if not isinstance(c, dict):
+        raise ValueError('Activation configuration must be a JSON object.')
+    for key in ('enabled', 'name', 'endpoint', 'activation_key', 'deny_all_interfaces'):
+        if key not in c:
+            raise ValueError(f'Missing activation configuration field: {key}')
+    if not isinstance(c['enabled'], bool) or not isinstance(c['deny_all_interfaces'], bool):
+        raise ValueError('enabled and deny_all_interfaces must be JSON booleans.')
+    if not isinstance(c['name'], str) or not c['name'].strip():
+        raise ValueError('Collector name is required.')
+    if not isinstance(c['activation_key'], str) or not c['activation_key'].strip():
+        raise ValueError('Collector Activation Key is required.')
+    validate_endpoint(c['endpoint'])
+    return c
+
+
+def read_config():
+    if not CONFIG.exists():
+        return None
+    c = load_json(CONFIG)
+    validate_config(c)
+    return c
+
+
+def read_result():
+    if not RESULT.exists():
+        return None
+    try:
+        return load_json(RESULT)
+    except Exception:
+        return {'status': 'review_required', 'reason': 'result_file_unreadable'}
+
+
+def local_status(timeout=12):
+    req = urllib.request.Request(LOCAL_STATUS, method='GET')
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read(65536)
+    data = json.loads(raw.decode('utf-8'))
+    if not isinstance(data, dict):
+        raise ValueError('Local Domotz status did not return a JSON object.')
+    return data
+
+
+def cloud_preflight(endpoint: str, timeout=7):
+    u = validate_endpoint(endpoint)
+    port = u.port or 443
+    infos = socket.getaddrinfo(u.hostname, port, type=socket.SOCK_STREAM)
+    last = None
+    for family, socktype, proto, _, addr in infos:
+        s = socket.socket(family, socktype, proto)
+        s.settimeout(timeout)
+        try:
+            s.connect(addr)
+            return
+        except OSError as e:
+            last = e
+        finally:
+            s.close()
+    raise OSError(f'Unable to connect to {u.hostname}:{port}: {last}')
+
+
+def configure():
+    print('Solutionz Domotz activation configuration')
+    print('The activation key is hidden and is never written to the setup log.')
+    name = input('Collector name: ').strip()
+    endpoint = input('Domotz API endpoint (include https:// and /public-api/v1/): ').strip()
+    key = getpass.getpass('Collector Activation Key: ').strip()
+    deny = input('Keep network scanning disabled after activation? [y/N]: ').strip().lower() in {'y', 'yes'}
+    c = {
+        'enabled': False,
+        'name': name,
+        'endpoint': endpoint,
+        'activation_key': key,
+        'deny_all_interfaces': deny,
+    }
+    validate_config(c)
+    atomic_json(CONFIG, c)
+    print(f'Configuration saved securely to {CONFIG}. Activation remains DISARMED.')
+
+
+def arm(enabled: bool):
+    c = read_config()
+    if c is None:
+        raise RuntimeError('Activation configuration does not exist. Run --configure first.')
+    existing = read_result()
+    if enabled and existing and existing.get('status') in TERMINAL_STATUSES:
+        raise RuntimeError(f"Activation result already requires review: {existing.get('status')}. Refusing to arm automatically.")
+    c['enabled'] = enabled
+    atomic_json(CONFIG, c)
+    print('Domotz activation ARMED for a future boot.' if enabled else 'Domotz activation DISARMED.')
+
+
+def check():
+    print('Solutionz Domotz activation status')
+    print(f'Configuration: {CONFIG}')
+    try:
+        c = read_config()
+    except Exception as e:
+        print(f'Configuration: INVALID ({e})')
+        return 1
+    if c is None:
+        print('Configuration: NOT CREATED')
+    else:
+        mode = oct(CONFIG.stat().st_mode & 0o777)
+        print(f"Collector name: {c['name']}")
+        print(f"Endpoint: {c['endpoint']}")
+        print(f"Armed: {c['enabled']}")
+        print(f"Scanning disabled after activation: {c['deny_all_interfaces']}")
+        print(f'Config permissions: {mode}')
+    r = read_result()
+    print(f"Result: {r.get('status') if r else 'none'}")
+    try:
+        s = local_status(timeout=5)
+        print(f"Local collector mode: {s.get('mode', 'unknown')}")
+        print(f"Local collector version: {s.get('agent_version', 'unknown')}")
+    except Exception as e:
+        print(f'Local collector status: unavailable ({type(e).__name__})')
+    return 0
+
+
+def attempt():
+    try:
+        c = read_config()
+    except Exception as e:
+        atomic_json(RESULT, {'status': 'review_required', 'reason': 'invalid_configuration', 'detail': str(e)})
+        print(f'Activation configuration invalid: {e}', file=sys.stderr)
+        return 2
+    if c is None:
+        print('Domotz activation not configured; nothing to do.')
+        return 0
+    if not c['enabled']:
+        print('Domotz activation is configured but disarmed; nothing to do.')
+        return 0
+
+    existing = read_result()
+    if existing and existing.get('status') in TERMINAL_STATUSES:
+        print(f"Existing activation result '{existing.get('status')}' prevents another POST.")
+        return 0
+
+    try:
+        status = local_status()
+    except Exception as e:
+        print(f'Local Domotz API not ready; retry later: {type(e).__name__}: {e}', file=sys.stderr)
+        return 75
+
+    mode = str(status.get('mode', ''))
+    agent_version = str(status.get('agent_version', ''))
+    if mode != 'RESTRICTED':
+        atomic_json(RESULT, {
+            'status': 'existing_configuration_review',
+            'reason': 'collector_not_restricted',
+            'collector_mode': mode or 'unknown',
+            'agent_version': agent_version or 'unknown',
+        })
+        print('Collector is not in RESTRICTED mode. No activation POST was sent.')
+        return 0
+
+    vt = version_tuple(agent_version)
+    if vt < (3, 3, 0):
+        atomic_json(RESULT, {
+            'status': 'review_required',
+            'reason': 'unsupported_collector_version',
+            'agent_version': agent_version or 'unknown',
+        })
+        print('Collector version is older than the supported command-line activation minimum.', file=sys.stderr)
+        return 2
+    if c['deny_all_interfaces'] and vt < (3, 9, 3):
+        atomic_json(RESULT, {
+            'status': 'review_required',
+            'reason': 'scanning_flag_requires_newer_collector',
+            'agent_version': agent_version or 'unknown',
+        })
+        print('Scanning-disabled activation requires Collector 3.9.3 or newer.', file=sys.stderr)
+        return 2
+
+    try:
+        cloud_preflight(c['endpoint'])
+    except Exception as e:
+        print(f'Domotz cloud endpoint not reachable yet; retry later: {type(e).__name__}: {e}', file=sys.stderr)
+        return 75
+
+    payload = {'name': c['name'], 'endpoint': c['endpoint']}
+    if vt >= (3, 9, 3):
+        payload['deny_all_interfaces'] = c['deny_all_interfaces']
+
+    atomic_json(RESULT, {
+        'status': 'submission_started',
+        'collector_name': c['name'],
+        'agent_version': agent_version or 'unknown',
+    })
+
+    body = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(
+        LOCAL_AGENT,
+        data=body,
+        headers={
+            'x-api-key': c['activation_key'],
+        },
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            response_body = resp.read(8192).decode('utf-8', 'replace')
+            code = int(resp.getcode())
+        if not 200 <= code < 300:
+            raise RuntimeError(f'Unexpected local API HTTP status {code}')
+        atomic_json(RESULT, {
+            'status': 'activation_request_accepted',
+            'collector_name': c['name'],
+            'agent_version': agent_version or 'unknown',
+            'http_status': code,
+            'response': response_body[:4096],
+        })
+        print('Domotz local activation API accepted the request. Verify the collector in the Domotz portal.')
+        return 0
+    except Exception as e:
+        detail = f'{type(e).__name__}: {e}'
+        if isinstance(e, urllib.error.HTTPError):
+            try:
+                detail += ' | ' + e.read(2048).decode('utf-8', 'replace')
+            except Exception:
+                pass
+        atomic_json(RESULT, {
+            'status': 'review_required',
+            'reason': 'post_submission_error_or_uncertain_response',
+            'collector_name': c['name'],
+            'agent_version': agent_version or 'unknown',
+            'detail': detail[:4096],
+        })
+        print('Activation POST was attempted but the result is uncertain or failed. Automatic POST retries are paused.', file=sys.stderr)
+        return 2
+
+
+def main():
+    p = argparse.ArgumentParser(description='Solutionz Domotz collector activation helper')
+    g = p.add_mutually_exclusive_group()
+    g.add_argument('--configure', action='store_true')
+    g.add_argument('--arm', action='store_true')
+    g.add_argument('--disarm', action='store_true')
+    g.add_argument('--check', action='store_true')
+    g.add_argument('--attempt', action='store_true')
+    a = p.parse_args()
+    try:
+        if a.configure:
+            configure(); return 0
+        if a.arm:
+            arm(True); return 0
+        if a.disarm:
+            arm(False); return 0
+        if a.check:
+            return check()
+        return attempt()
+    except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as e:
+        print(f'ERROR: {e}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+PYACTIVATION
+  chmod 750 "${DOMOTZ_ACTIVATION_HELPER}"
+  chown root:root "${DOMOTZ_ACTIVATION_HELPER}"
+
+  cat > "${DOMOTZ_ACTIVATION_SERVICE}" <<'EOF'
+[Unit]
+Description=Solutionz Domotz Collector Activation
+After=network-online.target snapd.service
+Wants=network-online.target
+ConditionPathExists=/usr/local/sbin/solutionz-domotz-activate
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/solutionz-domotz-activate --attempt
+SuccessExitStatus=0 75
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/solutionz-domotz-activation
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+EOF
+
+  cat > "${DOMOTZ_ACTIVATION_TIMER}" <<'EOF'
+[Unit]
+Description=Retry Solutionz Domotz Collector Activation Until Ready
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=2min
+AccuracySec=10s
+Persistent=true
+Unit=solutionz-domotz-activate.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  chmod 644 "${DOMOTZ_ACTIVATION_SERVICE}" "${DOMOTZ_ACTIVATION_TIMER}"
+  chown root:root "${DOMOTZ_ACTIVATION_SERVICE}" "${DOMOTZ_ACTIVATION_TIMER}"
+  python3 -m py_compile "${DOMOTZ_ACTIVATION_HELPER}" || error_exit "Integrated Domotz activation helper failed Python syntax validation."
+  systemd-analyze verify "${DOMOTZ_ACTIVATION_SERVICE}" "${DOMOTZ_ACTIVATION_TIMER}" >/dev/null || error_exit "Integrated Domotz activation systemd units failed validation."
+  systemctl daemon-reload
+
+  # Installation is deliberately dormant. The deployment-preparation mode only
+  # arms activation after the mandatory post-reboot validation has passed.
+  systemctl disable --now solutionz-domotz-activate.timer >/dev/null 2>&1 || true
+  systemctl stop solutionz-domotz-activate.service >/dev/null 2>&1 || true
+
+  cat > "${SETUP_COMMAND}" <<EOF
+#!/usr/bin/env bash
+exec bash "${INSTALLED_SCRIPT_COPY}" "\$@"
+EOF
+  chmod 750 "${SETUP_COMMAND}"
+  chown root:root "${SETUP_COMMAND}"
+
+  progress_message "Integrated Domotz activation workflow installed but left disarmed until Phase 2 passes."
+}
+
+activation_status() {
+  echo "============================================================"
+  echo "Solutionz RMM build and activation status"
+  echo "============================================================"
+  if [[ -s "${STATE_FILE}" ]]; then
+    cat "${STATE_FILE}"
+  else
+    echo "install.state: missing"
+  fi
+  echo "------------------------------------------------------------"
+  if [[ -x "${DOMOTZ_ACTIVATION_HELPER}" ]]; then
+    "${DOMOTZ_ACTIVATION_HELPER}" --check || true
+  else
+    echo "Domotz activation helper: not installed"
+  fi
+  echo "------------------------------------------------------------"
+  echo "Activation timer enabled: $(systemctl is-enabled solutionz-domotz-activate.timer 2>/dev/null || echo no)"
+  echo "Activation timer active:  $(systemctl is-active solutionz-domotz-activate.timer 2>/dev/null || echo no)"
+}
+
+prepare_deployment() {
+  local phase answer
+  phase="$(head -n1 "${STATE_FILE}" 2>/dev/null || true)"
+  [[ "${phase}" == "phase2_system_validated" ]] || error_exit "Deployment preparation requires phase2_system_validated. Current state: ${phase:-missing}."
+  [[ -x "${DOMOTZ_ACTIVATION_HELPER}" ]] || error_exit "Integrated Domotz activation helper is not installed."
+
+  systemctl stop solutionz-domotz-activate.timer solutionz-domotz-activate.service >/dev/null 2>&1 || true
+
+  if [[ ! -s "${DOMOTZ_ACTIVATION_CONFIG}" ]]; then
+    (( NON_INTERACTIVE == 0 )) || error_exit "No Domotz activation configuration exists. Run --prepare-deployment interactively once."
+    "${DOMOTZ_ACTIVATION_HELPER}" --configure || error_exit "Domotz activation configuration failed."
+  else
+    "${DOMOTZ_ACTIVATION_HELPER}" --check || error_exit "Existing Domotz activation configuration is invalid."
+    if (( NON_INTERACTIVE == 0 )); then
+      read -r -p "Use the existing protected Domotz activation configuration? Type yes to continue: " answer
+      if [[ "${answer}" != "yes" ]]; then
+        "${DOMOTZ_ACTIVATION_HELPER}" --configure || error_exit "Domotz activation reconfiguration failed."
+      fi
+    fi
+  fi
+
+  "${DOMOTZ_ACTIVATION_HELPER}" --check || error_exit "Domotz activation pre-arm check failed."
+
+  if (( NON_INTERACTIVE == 0 )); then
+    echo
+    warning_message "This will arm this appliance to activate as a NEW Domotz collector on its next boot."
+    warning_message "Do not use this mode for an RMA/migration that must retain an existing collector identity."
+    read -r -p "Type DEPLOY to arm this appliance for its next boot: " answer
+    [[ "${answer}" == "DEPLOY" ]] || error_exit "Deployment preparation cancelled before arming."
+  fi
+
+  "${DOMOTZ_ACTIVATION_HELPER}" --arm || error_exit "Unable to arm Domotz activation."
+  systemctl enable solutionz-domotz-activate.timer >/dev/null || error_exit "Unable to enable Domotz activation timer for the next boot."
+  systemctl stop solutionz-domotz-activate.timer solutionz-domotz-activate.service >/dev/null 2>&1 || true
+
+  progress_message "Domotz activation is armed for the next boot. The timer is enabled but intentionally stopped now."
+  info_message "At the customer site, connect the approved WAN to eth0 and power on. The first activation attempt starts after approximately 90 seconds."
+
+  if (( NO_POWEROFF == 1 )); then
+    warning_message "Appliance remains powered on. Do not manually start the activation timer in the lab."
+    return 0
+  fi
+
+  sync
+  progress_message "Deployment preparation complete. Powering off to prevent lab activation."
+  systemctl poweroff
 }
 
 check_final_requirement() {
@@ -1647,18 +3410,52 @@ check_final_requirement() {
     return 0
   fi
   printf '%sFAIL - %s%s\n' "${COLOR_RED}" "${description}" "${COLOR_RESET}"
+  PRE_REBOOT_FAILED_CHECKS+=("${description}")
   return 1
 }
 
+write_prereboot_result() {
+  local failures="$1"
+  local result="PASS"
+  local message
+  (( failures > 0 )) && result="FAIL"
+
+  {
+    echo "result=${result}"
+    echo "phase=phase1_prereboot_validation"
+    echo "revision=${REVISION}"
+    echo "script=${SCRIPT_NAME}"
+    echo "timestamp_utc=$(date -u +%FT%TZ)"
+    echo "failures=${failures}"
+    echo "log=${LOG_FILE}"
+    echo
+    echo "FAILED_CHECKS:"
+    if (( ${#PRE_REBOOT_FAILED_CHECKS[@]} == 0 )); then
+      echo "- none"
+    else
+      for message in "${PRE_REBOOT_FAILED_CHECKS[@]}"; do
+        printf -- '- %s\n' "${message}"
+      done
+    fi
+  } > "${PREREBOOT_RESULT_FILE}"
+  chmod 640 "${PREREBOOT_RESULT_FILE}"
+}
+
 final_summary_check() {
-  step_message 17 "Run mandatory pre-reboot validation"
+  step_message 18 "Run mandatory pre-reboot validation"
 
   local failures=0
+  PRE_REBOOT_FAILED_CHECKS=()
 
   echo
   echo "============================================================"
   echo "FINAL PRE-REBOOT VALIDATION - REVISION ${REVISION}"
   echo "============================================================"
+
+  if ! "${INTEGRITY_TOOL}" --refresh; then
+    PRE_REBOOT_FAILED_CHECKS+=("Security integrity baseline refresh failed")
+    failures=$((failures + 1))
+  fi
 
   check_final_requirement "Ubuntu ${SUPPORTED_UBUNTU_VERSION_ID} LTS OS family" \
     bash -c ". /etc/os-release; [[ \"\$ID\" == ubuntu && \"\$VERSION_ID\" == ${SUPPORTED_UBUNTU_VERSION_ID} && ( -z \"\${VERSION_CODENAME:-}\" || \"\$VERSION_CODENAME\" == ${SUPPORTED_UBUNTU_CODENAME} ) ]]" || failures=$((failures + 1))
@@ -1667,12 +3464,35 @@ final_summary_check() {
   check_final_requirement "serial getty active" systemctl is-active --quiet "${SERIAL_SERVICE}" || failures=$((failures + 1))
   check_final_requirement "serial getty enabled" systemctl is-enabled --quiet "${SERIAL_SERVICE}" || failures=$((failures + 1))
   check_final_requirement "GRUB serial console configured for ttyS0 at 115200 8N1"     grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=.*console=ttyS0,115200n8' "${GRUB_FILE}" || failures=$((failures + 1))
-  check_final_requirement "USB-C COM local config utility installed" test -x "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Local network configuration utility installed" test -x "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Live network discovery utility installed" test -x "${LIVE_DISCOVERY_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "USB-C COM automatic-menu profile installed" test -s "${SERIAL_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "USB-C COM automatic-menu profile targets ttyS0" grep -q '/dev/ttyS0' "${SERIAL_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "USB-C COM automatic-menu profile launches serial-auto mode" grep -q -- '--serial-auto' "${SERIAL_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Local config sudoers policy installed" test -s "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Local config sudoers policy valid" visudo -cf "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
   check_final_requirement "Protectli V1210 hardware" bash -c 'vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null); model=$(cat /sys/class/dmi/id/product_name 2>/dev/null); [[ "${vendor,,}" == *protectli* && "$model" == "V1210" ]]' || failures=$((failures + 1))
   check_final_requirement "SSH active" systemctl is-active --quiet ssh || failures=$((failures + 1))
   check_final_requirement "UFW active" bash -c "ufw status | grep -q 'Status: active'" || failures=$((failures + 1))
   check_final_requirement "UFW globally permits TCP 22" bash -c "ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW'" || failures=$((failures + 1))
   check_final_requirement "UFW globally permits TCP 3000" bash -c "ufw status | grep -Eq '^3000/tcp[[:space:]]+ALLOW'" || failures=$((failures + 1))
+  check_final_requirement "UFW denies routed/forwarded traffic by default" grep -Eq '^DEFAULT_FORWARD_POLICY="?DROP"?$' /etc/default/ufw || failures=$((failures + 1))
+  check_final_requirement "SSH hardening policy installed" test -s "${SSH_HARDENING_FILE}" || failures=$((failures + 1))
+  check_final_requirement "SSH configuration valid" sshd -t || failures=$((failures + 1))
+  check_final_requirement "SSH root login disabled" bash -c "sshd -T | grep -q '^permitrootlogin no$'" || failures=$((failures + 1))
+  check_final_requirement "Restricted field-tech group exists" getent group "${FIELD_TECH_GROUP}" || failures=$((failures + 1))
+  check_final_requirement "Engineering group exists" getent group "${ENGINEERING_GROUP}" || failures=$((failures + 1))
+  check_final_requirement "Field network menu has no unrestricted Linux shell option" bash -c "! grep -q 'Open Linux shell' '${LOCAL_CONFIG_TOOL}'" || failures=$((failures + 1))
+  check_final_requirement "auditd active" systemctl is-active --quiet auditd || failures=$((failures + 1))
+  check_final_requirement "Solutionz audit rules installed" test -s "${AUDIT_RULES_FILE}" || failures=$((failures + 1))
+  check_final_requirement "AppArmor active" systemctl is-active --quiet apparmor || failures=$((failures + 1))
+  check_final_requirement "Controlled security-update policy installed" test -s "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Automatic security reboot disabled" grep -q 'Automatic-Reboot "false"' "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Unattended package installation disabled" grep -q 'APT::Periodic::Unattended-Upgrade "0"' "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Security integrity baseline exists" test -s "${SECURITY_BASELINE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Security integrity baseline validates" "${INTEGRITY_TOOL}" --verify || failures=$((failures + 1))
+check_final_requirement "Solutionz security validator installed" test -x "${SECURITY_VALIDATOR}" || failures=$((failures + 1))
+  check_final_requirement "Solutionz security validation passes" "${SECURITY_VALIDATOR}" || failures=$((failures + 1))
   check_final_requirement "DNS resolves api.snapcraft.io to IPv4" dns_resolves_ipv4 api.snapcraft.io || failures=$((failures + 1))
   check_final_requirement "DNS resolves archive.ubuntu.com to IPv4" dns_resolves_ipv4 archive.ubuntu.com || failures=$((failures + 1))
   check_final_requirement "systemd-timesyncd enabled" systemctl is-enabled --quiet systemd-timesyncd.service || failures=$((failures + 1))
@@ -1698,6 +3518,20 @@ final_summary_check() {
   check_final_requirement "Final required-package baseline record exists" test -s "${BASELINE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Network requirements record exists" test -s "${NETWORK_REQUIREMENTS_FILE}" || failures=$((failures + 1))
   check_final_requirement "Netplan generates successfully" netplan generate || failures=$((failures + 1))
+  check_final_requirement "Automatic Netplan/VLAN profile helper installed" test -x "${NETWORK_PROFILE_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Production network profile installed" test -s "${NETWORK_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Production network profile validates" "${NETWORK_PROFILE_TOOL}" validate "${NETWORK_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Production network profile render result exists" test -s "${NETWORK_PROFILE_RESULT_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Production network profile render result is PASS" grep -q '^result=PASS$' "${NETWORK_PROFILE_RESULT_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Automatic dual-homed network validator installed" test -x "${NETWORK_VALIDATOR}" || failures=$((failures + 1))
+  check_final_requirement "Persistent IPv4 forwarding disable policy installed" grep -Eq '^net\.ipv4\.ip_forward=0$' "${IP_FORWARD_SYSCTL_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Current IPv4 forwarding is disabled" bash -c '[[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "0" ]]' || failures=$((failures + 1))
+  check_final_requirement "Integrated Domotz activation helper installed" test -x "${DOMOTZ_ACTIVATION_HELPER}" || failures=$((failures + 1))
+  check_final_requirement "Domotz activation service unit installed" test -s "${DOMOTZ_ACTIVATION_SERVICE}" || failures=$((failures + 1))
+  check_final_requirement "Domotz activation timer unit installed" test -s "${DOMOTZ_ACTIVATION_TIMER}" || failures=$((failures + 1))
+  check_final_requirement "Domotz activation helper syntax valid" python3 -m py_compile "${DOMOTZ_ACTIVATION_HELPER}" || failures=$((failures + 1))
+  check_final_requirement "Domotz activation systemd units valid" systemd-analyze verify "${DOMOTZ_ACTIVATION_SERVICE}" "${DOMOTZ_ACTIVATION_TIMER}" || failures=$((failures + 1))
+  check_final_requirement "Unified setup command installed" test -x "${SETUP_COMMAND}" || failures=$((failures + 1))
   check_final_requirement "Domotz installed" snap list "${DOMOTZ_SNAP_NAME}" || failures=$((failures + 1))
   check_final_requirement "Post-reboot production validator installed" test -x "${POSTREBOOT_VALIDATOR}" || failures=$((failures + 1))
 
@@ -1710,6 +3544,7 @@ final_summary_check() {
       printf '%sPASS - Domotz permission %s connected%s\n' "${COLOR_GREEN}" "${permission}" "${COLOR_RESET}"
     else
       printf '%sFAIL - Domotz permission %s not connected%s\n' "${COLOR_RED}" "${permission}" "${COLOR_RESET}"
+      PRE_REBOOT_FAILED_CHECKS+=("Domotz permission ${permission} not connected")
       failures=$((failures + 1))
     fi
   done
@@ -1718,8 +3553,10 @@ final_summary_check() {
 
   echo "------------------------------------------------------------"
   echo "Pre-reboot mandatory failures: ${failures}"
+  echo "Validation result: ${PREREBOOT_RESULT_FILE}"
   echo "============================================================"
 
+  write_prereboot_result "${failures}"
   (( failures == 0 ))
 }
 
@@ -1728,11 +3565,20 @@ main() {
   require_root
   init_logging
 
-  echo "Solutionz RMM Agent build starting."
-  echo "Script: ${SCRIPT_NAME}"
-  echo "Revision: ${REVISION}"
-  echo "Release date: ${RELEASE_DATE}"
-  echo "Log: ${LOG_FILE}"
+  case "${RUN_MODE}" in
+    activation_status)
+      activation_status
+      return 0
+      ;;
+    prepare_deployment)
+      prepare_deployment
+      return 0
+      ;;
+  esac
+
+  printf '\n%sSolutionz RMM Agent Installation%s\n' "${COLOR_CYAN}" "${COLOR_RESET}" >&${UI_FD}
+  info_message "Revision ${REVISION} | Release ${RELEASE_DATE}"
+  info_message "Command output is displayed on the console and recorded in ${LOG_FILE}."
 
   backup_previous_state
   write_state "phase1_in_progress"
@@ -1750,6 +3596,7 @@ main() {
   install_domotz
   configure_domotz_permissions
   configure_ufw
+  configure_security_hardening
   stage_network_config
   repair_resolv_conf
   normalize_host_entries
@@ -1757,34 +3604,48 @@ main() {
   install_local_serial_config_tool
   update_banner
   install_postreboot_validation
+  install_domotz_activation
 
   if ! final_summary_check; then
-    error_exit "Mandatory pre-reboot validation failed."
+    error_exit "Mandatory pre-reboot validation failed. Review ${PREREBOOT_RESULT_FILE} for failed check names."
   fi
 
   write_state "phase1_complete" \
     "reboot_required=1" \
+    "prereboot_result=${PREREBOOT_RESULT_FILE}" \
     "postreboot_validator=${POSTREBOOT_VALIDATOR}" \
+    "postreboot_result=${POSTREBOOT_RESULT_FILE}" \
+    "network_profile=${NETWORK_PROFILE_FILE}" \
+    "network_profile_result=${NETWORK_PROFILE_RESULT_FILE}" \
+    "network_validation_result=${NETWORK_VALIDATION_RESULT_FILE}" \
+    "network_live_discovery_result=${LIVE_DISCOVERY_RESULT_FILE}" \
+    "security_validation_result=${SECURITY_VALIDATION_RESULT_FILE}" \
+    "security_baseline=${SECURITY_BASELINE_FILE}" \
+    "domotz_activation_helper=${DOMOTZ_ACTIVATION_HELPER}" \
+    "domotz_activation_config=${DOMOTZ_ACTIVATION_CONFIG}" \
+    "setup_command=${SETUP_COMMAND}" \
     "log=${LOG_FILE}"
 
-  echo
-  echo "------------------------------------------------------------"
+  completion_message
   progress_message "Phase 1 completed successfully."
   progress_message "Completion Time: $(date -u +%FT%TZ)"
   progress_message "Hostname: $(hostname)"
   progress_message "Script Revision: ${REVISION}"
+  progress_message "Network mode after reboot is generated from ${NETWORK_PROFILE_FILE}. Default profile: eth0 WAN DHCP + eth1 LAN DHCP with LAN routes/DNS suppressed."
+  progress_message "eth0 is WAN/cloud and owns the only default route. eth1 is AV/control LAN; 802.1Q VLANs, when used, are linked to eth1."
+  progress_message "Automatic network validation tool: ${NETWORK_VALIDATOR}"
+  progress_message "Automatic security validation tool: ${SECURITY_VALIDATOR}"
+  progress_message "Security integrity baseline: ${SECURITY_BASELINE_FILE}"
   progress_message "State File: ${STATE_FILE}"
   progress_message "Log File: ${LOG_FILE}"
-  echo "------------------------------------------------------------"
-  echo "Manual reboot is required."
-  echo "After reboot, systemd will run the post-reboot validation automatically."
-  echo
-  echo "V1210 direct laptop configuration:"
-  echo "  1. Connect the laptop to the V1210 USB-C port labeled COM."
-  echo "  2. Open a serial terminal at 115200 baud, 8 data bits, no parity, 1 stop bit."
-  echo "  3. Log in with an authorized local account."
-  echo "  4. Run: sudo ${LOCAL_CONFIG_TOOL}"
-  echo "Domotz update policy: not revision-pinned; installed revision recorded in ${SNAP_BASELINE_FILE}."
+  warning_message "Manual reboot is required. Post-reboot validation will run automatically after restart."
+  info_message "After Phase 2 reaches phase2_system_validated, run: sudo solutionz-rmm-setup --prepare-deployment"
+  info_message "That same Setup source configures and arms Domotz activation for the next boot, then powers the appliance off by default."
+  info_message "USB-C COM recovery/configuration: connect at 115200 8N1 and log in; the WAN/LAN/VLAN menu launches automatically."
+  info_message "After every network change the script validates WAN eth0, LAN eth1/VLANs, default-route ownership, DNS/Domotz reachability, IPv4 forwarding, firewall/SSH hardening, audit state, and file integrity."
+  info_message "Automated VLAN deployment: use --network-profile <json> or network-menu option 3/4 onsite; VLANs are created on eth1."
+  info_message "Domotz is not revision-pinned; the installed revision is recorded in ${SNAP_BASELINE_FILE}."
 }
 
 main "$@"
+

@@ -10,6 +10,7 @@ set -Eeuo pipefail
 # Security Hardening Update: 2026-11-03
 # Live Network Discovery Update: 2026-11-03
 # Integrated Domotz Activation Update: 2026-11-04
+# Optional LAN / UFW sysctl persistence / network-validator NTP update: 2026-11-04
 #
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
@@ -126,6 +127,7 @@ LIVE_DISCOVERY_TOOL="/usr/local/sbin/solutionz-rmm-live-network-discovery"
 LIVE_DISCOVERY_RESULT_FILE="${STATE_DIR}/network-live-discovery-${REVISION}.result"
 IP_FORWARD_SYSCTL_FILE="/etc/sysctl.d/90-solutionz-rmm-no-forwarding.conf"
 SECURITY_SYSCTL_FILE="/etc/sysctl.d/91-solutionz-rmm-security.conf"
+UFW_SYSCTL_FILE="/etc/ufw/sysctl.conf"
 SSH_HARDENING_FILE="/etc/ssh/sshd_config.d/99-solutionz-rmm-hardening.conf"
 AUDIT_RULES_FILE="/etc/audit/rules.d/99-solutionz-rmm.rules"
 SECURITY_VALIDATOR="/usr/local/sbin/solutionz-rmm-security-validate"
@@ -456,6 +458,10 @@ Automatic WAN/LAN/VLAN behavior
 - Default profile: WAN eth0 DHCP; LAN eth1 DHCP with DHCP routes and DNS ignored.
 - WAN eth0 supports DHCP or true static IPv4. Static WAN requires gateway and DNS.
 - LAN eth1 supports DHCP, static IPv4, or unnumbered trunk-parent mode.
+- eth1 is optional when the profile uses the default DHCP LAN mode with no VLANs.
+  If no cable is connected, validation reports OPTIONAL_NOT_CONNECTED instead of failing.
+  If carrier is present, the configured LAN is validated normally. Static LAN addressing
+  or configured VLANs make eth1 an explicitly required deployment interface.
 - Tagged VLANs are IEEE 802.1Q subinterfaces linked to eth1, not eth0.
 - VLANs support DHCP or static IPv4, but may not own a default route or DNS.
 - VLAN IDs are never guessed; customer/engineering values must be supplied.
@@ -1122,6 +1128,7 @@ FILES=(
   "/etc/audit/rules.d/99-solutionz-rmm.rules"
   "/etc/apt/apt.conf.d/52solutionz-rmm-security-updates"
   "/etc/default/ufw"
+  "/etc/ufw/sysctl.conf"
   "/etc/ufw/user.rules"
   "/etc/profile.d/solutionz-rmm-serial.sh"
   "/etc/sudoers.d/solutionz-rmm-local-config"
@@ -1338,7 +1345,31 @@ net.ipv6.conf.all.accept_source_route=0
 net.ipv6.conf.default.accept_source_route=0
 EOF
   chmod 644 "${SECURITY_SYSCTL_FILE}"
+
+  # UFW loads /etc/ufw/sysctl.conf when the firewall starts and can therefore
+  # override values loaded earlier from /etc/sysctl.d. Keep the Solutionz
+  # martian-packet logging requirement in both locations so it persists after
+  # reboot and after a future UFW reload/restart.
+  install -d -m 755 /etc/ufw
+  if [[ -f "${UFW_SYSCTL_FILE}" && ! -f "${UFW_SYSCTL_FILE}.pre-solutionz" ]]; then
+    cp -a "${UFW_SYSCTL_FILE}" "${UFW_SYSCTL_FILE}.pre-solutionz"
+  fi
+  touch "${UFW_SYSCTL_FILE}"
+  sed -i -E \
+    -e '/^[[:space:]]*net[.\/]ipv4[.\/]conf[.\/]all[.\/]log_martians[[:space:]]*=/d' \
+    -e '/^[[:space:]]*net[.\/]ipv4[.\/]conf[.\/]default[.\/]log_martians[[:space:]]*=/d' \
+    "${UFW_SYSCTL_FILE}"
+  cat >> "${UFW_SYSCTL_FILE}" <<'EOF'
+
+# Solutionz RMM persistent UFW sysctl overrides.
+net/ipv4/conf/all/log_martians=1
+net/ipv4/conf/default/log_martians=1
+EOF
+  chmod 644 "${UFW_SYSCTL_FILE}"
+
   sysctl --system >/dev/null || error_exit "Failed to apply Solutionz kernel/network hardening sysctl policy."
+  sysctl -w net.ipv4.conf.all.log_martians=1 >/dev/null || error_exit "Failed to enable runtime martian logging for all interfaces."
+  sysctl -w net.ipv4.conf.default.log_martians=1 >/dev/null || error_exit "Failed to enable runtime default martian logging."
 
   install -d -m 755 /etc/ssh/sshd_config.d
   cat > "${SSH_HARDENING_FILE}" <<'EOF'
@@ -1786,6 +1817,7 @@ CONNECT_FAILS=()
 cf() { CONFIG_FAILS+=("$*"); echo "FAIL - $*"; }
 xf() { CONNECT_FAILS+=("$*"); echo "FAIL - $*"; }
 ok() { echo "PASS - $*"; }
+info() { echo "INFO - $*"; }
 
 ip4() {
   ip -o -4 addr show dev "$1" scope global 2>/dev/null | awk 'NR==1 {print $4}'
@@ -1835,6 +1867,9 @@ WAN_EXPECTED=""
 WAN_GATEWAY_EXPECTED=""
 LAN_MODE=""
 LAN_EXPECTED=""
+LAN_VLAN_COUNT=0
+LAN_REQUIRED=0
+LAN_STATUS="UNKNOWN"
 
 mkdir -p "$(dirname "$RESULT")"
 
@@ -1859,6 +1894,12 @@ if [[ -x "$PROFILE_TOOL" && -s "$PROFILE" ]] && "$PROFILE_TOOL" validate "$PROFI
   WAN_GATEWAY_EXPECTED="${META[2]:-}"
   LAN_MODE="${META[3]:-}"
   LAN_EXPECTED="${META[4]:-}"
+  LAN_VLAN_COUNT="$(profile_vlans | awk 'NF {c++} END {print c+0}')"
+  # Default DHCP LAN with no VLANs is optional. An explicitly static LAN or any
+  # configured VLAN means the deployment expects eth1 to be available.
+  if [[ "$LAN_MODE" == "static" || "$LAN_VLAN_COUNT" -gt 0 ]]; then
+    LAN_REQUIRED=1
+  fi
 else
   cf "Network profile validation failed."
 fi
@@ -1885,23 +1926,28 @@ fi
 
 ready_now() {
   carrier "$WAN" || return 1
-  carrier "$LAN" || return 1
   [[ -n "$(ip4 "$WAN")" ]] || return 1
   mapfile -t defaults < <(ip -4 route show default 2>/dev/null)
   [[ ${#defaults[@]} -eq 1 && "$(default_iface)" == "$WAN" ]] || return 1
 
   if (( PROFILE_VALID )); then
-    if [[ "$LAN_MODE" == "dhcp" || "$LAN_MODE" == "static" ]]; then
-      [[ -n "$(ip4 "$LAN")" ]] || return 1
-      [[ "$LAN_MODE" != "static" || "$(ip4 "$LAN")" == "$LAN_EXPECTED" ]] || return 1
+    # An unused default DHCP eth1 is allowed to remain physically disconnected.
+    # Once carrier is present, or the profile explicitly requires LAN/VLAN use,
+    # normal LAN validation becomes mandatory.
+    if (( LAN_REQUIRED )) || carrier "$LAN"; then
+      carrier "$LAN" || return 1
+      if [[ "$LAN_MODE" == "dhcp" || "$LAN_MODE" == "static" ]]; then
+        [[ -n "$(ip4 "$LAN")" ]] || return 1
+        [[ "$LAN_MODE" != "static" || "$(ip4 "$LAN")" == "$LAN_EXPECTED" ]] || return 1
+      fi
+      while IFS='|' read -r vid vmode vaddr; do
+        [[ -n "$vid" ]] || continue
+        local vname="vlan${vid}"
+        ip link show "$vname" >/dev/null 2>&1 || return 1
+        [[ -n "$(ip4 "$vname")" ]] || return 1
+        [[ "$vmode" != "static" || "$(ip4 "$vname")" == "$vaddr" ]] || return 1
+      done < <(profile_vlans)
     fi
-    while IFS='|' read -r vid vmode vaddr; do
-      [[ -n "$vid" ]] || continue
-      local vname="vlan${vid}"
-      ip link show "$vname" >/dev/null 2>&1 || return 1
-      [[ -n "$(ip4 "$vname")" ]] || return 1
-      [[ "$vmode" != "static" || "$(ip4 "$vname")" == "$vaddr" ]] || return 1
-    done < <(profile_vlans)
   fi
   return 0
 }
@@ -1916,7 +1962,16 @@ done
 ip link show "$WAN" >/dev/null 2>&1 && ok "WAN eth0 exists." || cf "WAN eth0 missing."
 ip link show "$LAN" >/dev/null 2>&1 && ok "LAN eth1 exists." || cf "LAN eth1 missing."
 carrier "$WAN" && ok "WAN eth0 carrier UP." || cf "WAN eth0 carrier DOWN."
-carrier "$LAN" && ok "LAN eth1 carrier UP." || cf "LAN eth1 carrier DOWN."
+if carrier "$LAN"; then
+  LAN_STATUS="CONNECTED"
+  ok "LAN eth1 carrier UP."
+elif (( LAN_REQUIRED )); then
+  LAN_STATUS="REQUIRED_NOT_CONNECTED"
+  cf "LAN eth1 is required by the configured static LAN/VLAN profile but has no carrier."
+else
+  LAN_STATUS="OPTIONAL_NOT_CONNECTED"
+  info "LAN eth1 is not connected. eth1 is optional for this profile; LAN validation is skipped until a cable is connected."
+fi
 
 wan_addr="$(ip4 "$WAN")"
 if [[ -n "$wan_addr" ]]; then
@@ -1962,12 +2017,22 @@ if (( PROFILE_VALID )); then
   fi
 
   if [[ "$LAN_MODE" == "none" ]]; then
-    ok "LAN eth1 is configured as an unnumbered VLAN trunk parent."
+    if carrier "$LAN" || (( LAN_REQUIRED )); then
+      ok "LAN eth1 is configured as an unnumbered VLAN trunk parent."
+    else
+      info "LAN eth1 unnumbered trunk parent is not connected and is not required by the current profile."
+    fi
   elif [[ "$LAN_MODE" == "dhcp" || "$LAN_MODE" == "static" ]]; then
     lan_addr="$(ip4 "$LAN")"
-    [[ -n "$lan_addr" ]] && ok "LAN eth1 IPv4 ${lan_addr}." || cf "LAN eth1 has no IPv4 address."
-    if [[ "$LAN_MODE" == "static" && -n "$LAN_EXPECTED" && "$lan_addr" != "$LAN_EXPECTED" ]]; then
-      cf "LAN eth1 IPv4 ${lan_addr:-none}; expected ${LAN_EXPECTED}."
+    if carrier "$LAN"; then
+      [[ -n "$lan_addr" ]] && ok "LAN eth1 IPv4 ${lan_addr}." || cf "LAN eth1 has carrier but no IPv4 address."
+      if [[ "$LAN_MODE" == "static" && -n "$LAN_EXPECTED" && "$lan_addr" != "$LAN_EXPECTED" ]]; then
+        cf "LAN eth1 IPv4 ${lan_addr:-none}; expected ${LAN_EXPECTED}."
+      fi
+    elif (( LAN_REQUIRED )); then
+      cf "LAN eth1 has no IPv4 address because the required LAN interface is not connected."
+    else
+      info "LAN eth1 has no IPv4 address because the optional LAN interface is not connected."
     fi
   fi
 
@@ -1988,21 +2053,12 @@ if (( PROFILE_VALID )); then
 fi
 
 # WAN/cloud checks. These do not cause rollback of a locally valid Netplan.
+# NTP is intentionally excluded from the network validator. Time synchronization
+# is validated by the dedicated Phase 1 and Phase 2 NTP checks with bounded retry.
 getent ahostsv4 api.snapcraft.io >/dev/null 2>&1 && ok "WAN DNS resolves api.snapcraft.io." || xf "WAN DNS cannot resolve api.snapcraft.io."
 getent ahostsv4 portal.domotz.com >/dev/null 2>&1 && ok "WAN DNS resolves portal.domotz.com." || xf "WAN DNS cannot resolve portal.domotz.com."
 tcp_open portal.domotz.com 443 && ok "Domotz TCP 443 reachable through WAN." || xf "Domotz TCP 443 unreachable through WAN."
 tcp_open messaging-us-east-1-cell-1.domotz.com 5671 && ok "Domotz TCP 5671 reachable through WAN." || xf "Domotz TCP 5671 unreachable through WAN."
-if systemctl is-active --quiet systemd-timesyncd.service; then
-  ok "systemd-timesyncd active."
-else
-  xf "systemd-timesyncd is not active."
-fi
-if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" == "yes" || -e /run/systemd/timesync/synchronized ]]; then
-  ok "NTP synchronization evidence present."
-else
-  xf "NTP synchronization evidence not present."
-fi
-
 configuration_result="PASS"
 connectivity_result="PASS"
 result="PASS"
@@ -2035,6 +2091,8 @@ echo "wan_interface=${WAN}"
   echo "wan_gateway=$(default_gateway "$WAN")"
   echo "default_route_interface=$(default_iface)"
   echo "lan_interface=${LAN}"
+  echo "lan_required=${LAN_REQUIRED}"
+  echo "lan_status=${LAN_STATUS}"
   echo "lan_carrier=$(carrier "$LAN" && echo UP || echo DOWN)"
   echo "lan_ipv4=$(ip4 "$LAN")"
   echo "ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
@@ -3475,6 +3533,8 @@ final_summary_check() {
   check_final_requirement "UFW globally permits TCP 22" bash -c "ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW'" || failures=$((failures + 1))
   check_final_requirement "UFW globally permits TCP 3000" bash -c "ufw status | grep -Eq '^3000/tcp[[:space:]]+ALLOW'" || failures=$((failures + 1))
   check_final_requirement "UFW denies routed/forwarded traffic by default" grep -Eq '^DEFAULT_FORWARD_POLICY="?DROP"?$' /etc/default/ufw || failures=$((failures + 1))
+  check_final_requirement "UFW persists martian logging for all interfaces" grep -Eq '^[[:space:]]*net[./]ipv4[./]conf[./]all[./]log_martians[[:space:]]*=[[:space:]]*1[[:space:]]*$' "${UFW_SYSCTL_FILE}" || failures=$((failures + 1))
+  check_final_requirement "UFW persists default martian logging" grep -Eq '^[[:space:]]*net[./]ipv4[./]conf[./]default[./]log_martians[[:space:]]*=[[:space:]]*1[[:space:]]*$' "${UFW_SYSCTL_FILE}" || failures=$((failures + 1))
   check_final_requirement "SSH hardening policy installed" test -s "${SSH_HARDENING_FILE}" || failures=$((failures + 1))
   check_final_requirement "SSH configuration valid" sshd -t || failures=$((failures + 1))
   check_final_requirement "SSH root login disabled" bash -c "sshd -T | grep -q '^permitrootlogin no$'" || failures=$((failures + 1))
@@ -3629,8 +3689,8 @@ main() {
   progress_message "Completion Time: $(date -u +%FT%TZ)"
   progress_message "Hostname: $(hostname)"
   progress_message "Script Revision: ${REVISION}"
-  progress_message "Network mode after reboot is generated from ${NETWORK_PROFILE_FILE}. Default profile: eth0 WAN DHCP + eth1 LAN DHCP with LAN routes/DNS suppressed."
-  progress_message "eth0 is WAN/cloud and owns the only default route. eth1 is AV/control LAN; 802.1Q VLANs, when used, are linked to eth1."
+  progress_message "Network mode after reboot is generated from ${NETWORK_PROFILE_FILE}. Default profile: eth0 WAN DHCP + optional eth1 LAN DHCP with LAN routes/DNS suppressed."
+  progress_message "eth0 is WAN/cloud and owns the only default route. eth1 is optional AV/control LAN unless a static LAN or VLAN profile requires it; 802.1Q VLANs, when used, are linked to eth1."
   progress_message "Automatic network validation tool: ${NETWORK_VALIDATOR}"
   progress_message "Automatic security validation tool: ${SECURITY_VALIDATOR}"
   progress_message "Security integrity baseline: ${SECURITY_BASELINE_FILE}"

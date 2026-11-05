@@ -4025,8 +4025,8 @@ final_summary_check() {
     check_final_requirement "Default engineering account is in engineering group" bash -c "id -nG '${ENGINEERING_USER}' | tr ' ' '\\n' | grep -qx '${ENGINEERING_GROUP}'" || failures=$((failures + 1))
     check_final_requirement "Default engineering account has sudo membership" bash -c "id -nG '${ENGINEERING_USER}' | tr ' ' '\\n' | grep -qx sudo" || failures=$((failures + 1))
     check_final_requirement "Default engineering account is not in field-tech group" bash -c "! id -nG '${ENGINEERING_USER}' | tr ' ' '\\n' | grep -qx '${FIELD_TECH_GROUP}'" || failures=$((failures + 1))
-    check_final_requirement "Default engineering account uses Bash shell" bash -c "[[ "$(getent passwd '${ENGINEERING_USER}' | awk -F: '{print $7}')" == /bin/bash ]]" || failures=$((failures + 1))
-    check_final_requirement "Default engineering account has authorized SSH key" bash -c "test -s \"$(getent passwd '${ENGINEERING_USER}' | awk -F: '{print $6}')/.ssh/authorized_keys\"" || failures=$((failures + 1))
+    check_final_requirement "Default engineering account uses Bash shell" bash -c '[[ "$(getent passwd "$1" | cut -d: -f7)" == /bin/bash ]]' _ "${ENGINEERING_USER}" || failures=$((failures + 1))
+    check_final_requirement "Default engineering account has authorized SSH key" bash -c 'home="$(getent passwd "$1" | cut -d: -f6)"; [[ -n "$home" && -s "$home/.ssh/authorized_keys" ]]' _ "${ENGINEERING_USER}" || failures=$((failures + 1))
     check_final_requirement "Engineering SSH key fingerprint record present" test -s "${ENGINEERING_SSH_FINGERPRINT_FILE}" || failures=$((failures + 1))
     check_final_requirement "Engineering SSH public-key authentication enabled" bash -c "sshd -T | grep -q '^pubkeyauthentication yes$'" || failures=$((failures + 1))
   fi
@@ -4218,3 +4218,4 @@ main() {
 }
 
 main "$@"
+

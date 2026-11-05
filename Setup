@@ -13,7 +13,8 @@ set -Eeuo pipefail
 # Optional LAN / UFW sysctl persistence / network-validator NTP update: 2026-11-04
 # Default engineering account / login-policy update: 2026-11-04
 # Post-reboot unified menu + engineering credential provisioning update: 2026-11-05
-# Engineering-key protected credential provisioning update: 2026-11-04
+# Engineering-key protected credential provisioning update: 2026-11-05
+# Production engineering-key preflight/fingerprint validation update: 2026-11-05
 #
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
@@ -32,13 +33,18 @@ set -Eeuo pipefail
 #   - The V1210 USB-C port labeled COM is a serial console, not USB Ethernet.
 #     This script exposes an authenticated login on ttyS0 and automatically
 #     launches the Solutionz local configuration menu for restricted technician
-#     accounts on interactive SSH, local console, or USB-C COM login. Engineering
-#     group members retain unrestricted administrative shell access.
+#     accounts on interactive SSH, local console, or USB-C COM login. Authenticated
+#     engineering logins also land on the same menu in ENGINEERING mode, where an
+#     engineering shell is available only after engineering authentication.
 #   - The default engineering login is solz_eng. Setup creates/configures the
 #     account but never embeds a password. A Solutionz engineering SSH public key
-#     is installed for first access. After Phase 2 validates successfully, the
-#     first authenticated solz_eng interactive SSH login is forced through a
-#     one-time password-creation step before the engineering shell opens.
+#     is installed for first access. After Phase 2 validates successfully, an
+#     engineer authenticates as solz_eng with the matching private key, enters the
+#     same Solutionz menu in ENGINEERING mode, and selects option 9 to create the
+#     local solz_eng password. Technicians cannot perform this first-time setup.
+#   - Only the public SSH key is stored in Setup/on the appliance. The matching
+#     private key remains with Solutionz Engineering and is never copied to GitHub
+#     or to a V1210 appliance.
 #   - Technicians cannot create, change, or provision the solz_eng password.
 #   - Ubuntu 24.04 LTS is the controlled OS family. Supported Noble point
 #     releases include Ubuntu 24.04.4 LTS.
@@ -150,11 +156,19 @@ FIELD_TECH_GROUP="solutionz-rmm-tech"
 ENGINEERING_GROUP="solutionz-rmm-engineering"
 TECHNICIAN_USER="${SOLUTIONZ_RMM_TECHNICIAN_USER:-solz_rmm}"
 ENGINEERING_USER="${SOLUTIONZ_RMM_ENGINEERING_USER:-solz_eng}"
-# Public keys are safe to store in source control. Set this once to the Solutionz
-# engineering public key before production use, or pass
-# SOLUTIONZ_RMM_ENGINEERING_SSH_PUBLIC_KEY when invoking Setup.
+# MASS-PRODUCTION ENGINEERING ACCESS
+# -----------------------------------------------------------------------------
+# Generate ONE dedicated Solutionz RMM engineering ED25519 key pair on an
+# engineering-controlled workstation. Paste ONLY the complete .pub line below.
+# Example format:
+#   ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... Solutionz RMM Engineering
+#
+# The private key MUST remain with Solutionz Engineering and MUST NOT be placed
+# in GitHub, this script, an appliance image, a ticket, or technician materials.
+# An environment override is retained for controlled testing/recovery builds.
 ENGINEERING_SSH_PUBLIC_KEY_DEFAULT=""
 ENGINEERING_SSH_PUBLIC_KEY="${SOLUTIONZ_RMM_ENGINEERING_SSH_PUBLIC_KEY:-${ENGINEERING_SSH_PUBLIC_KEY_DEFAULT}}"
+ENGINEERING_SSH_FINGERPRINT_FILE="${STATE_DIR}/engineering-ssh-key-${REVISION}.fingerprint"
 ENGINEERING_PASSWORD_MARKER="${STATE_DIR}/engineering-password-provisioned"
 ENGINEERING_PASSWORD_TOOL="/usr/local/sbin/solutionz-rmm-engineering-password-setup"
 ENGINEERING_PASSWORD_SUDOERS_FILE="/etc/sudoers.d/solutionz-rmm-engineering-password-setup"
@@ -698,6 +712,26 @@ report_ntp_diagnostics() {
   systemctl status systemd-timesyncd.service --no-pager -l 2>/dev/null | sed -n '1,40p' || true
 }
 
+validate_engineering_ssh_key_preflight() {
+  local key="${ENGINEERING_SSH_PUBLIC_KEY}"
+
+  [[ -n "${key}" ]] || error_exit "Solutionz engineering SSH public key is not configured. Before production use, paste the complete Solutionz RMM Engineering .pub line into ENGINEERING_SSH_PUBLIC_KEY_DEFAULT near the top of Setup, or provide SOLUTIONZ_RMM_ENGINEERING_SSH_PUBLIC_KEY for a controlled test build."
+  [[ "${key}" == ssh-ed25519\ * ]] || \
+    error_exit "Engineering SSH key must be a single OpenSSH ED25519 public-key line beginning with 'ssh-ed25519 '."
+  [[ "${key}" != *$'\n'* && "${key}" != *$'\r'* ]] || \
+    error_exit "Engineering SSH public key must be a single line."
+  [[ "${key}" != *"PRIVATE KEY"* ]] || \
+    error_exit "A private SSH key was supplied where a public key is required. Never place the engineering private key in Setup."
+
+  local key_blob
+  key_blob="$(awk '{print $2}' <<<"${key}")"
+  [[ -n "${key_blob}" ]] || error_exit "Engineering SSH public key is missing its key data."
+  printf '%s' "${key_blob}" | base64 -d >/dev/null 2>&1 || \
+    error_exit "Engineering SSH public key data is not valid base64/OpenSSH key material."
+
+  progress_message "Engineering SSH public-key configuration is present and structurally valid."
+}
+
 preflight_checks() {
   step_message 1 "Preflight validation"
 
@@ -746,6 +780,8 @@ preflight_checks() {
     error_exit "Required V1210 serial device ${SERIAL_DEVICE} was not detected."
   fi
   progress_message "Detected V1210 serial device ${SERIAL_DEVICE}."
+
+  validate_engineering_ssh_key_preflight
 
   local free_kb
   free_kb="$(df -Pk / | awk 'NR==2 {print $4}')"
@@ -1164,6 +1200,8 @@ FILES=(
   "/etc/profile.d/solutionz-rmm-access.sh"
   "/etc/sudoers.d/solutionz-rmm-local-config"
   "/etc/sudoers.d/solutionz-rmm-engineering-password-setup"
+  "/home/solz_eng/.ssh/authorized_keys"
+  "/var/lib/rswsolutionz-rmm/engineering-ssh-key-V06.100626N.fingerprint"
 )
 usage(){ echo "Usage: $(basename "$0") --refresh|--verify"; }
 case "${1:-}" in
@@ -1208,6 +1246,7 @@ ENG_USER="solz_eng"
 LOCALCFG="/usr/local/sbin/solutionz-rmm-local-config"
 ENGPASS="/usr/local/sbin/solutionz-rmm-engineering-password-setup"
 ENGPASS_SUDOERS="/etc/sudoers.d/solutionz-rmm-engineering-password-setup"
+ENGKEY_FP="/var/lib/rswsolutionz-rmm/engineering-ssh-key-V06.100626N.fingerprint"
 LIVE="/usr/local/sbin/solutionz-rmm-live-network-discovery"
 LIVE_RESULT="/var/lib/rswsolutionz-rmm/network-live-discovery-V06.100626N.result"
 F=(); W=()
@@ -1262,6 +1301,7 @@ if command -v sshd >/dev/null 2>&1 && sshd -t >/dev/null 2>&1; then
   pass "sshd configuration parses successfully."
   SSH_EFFECTIVE="$(sshd -T 2>/dev/null || true)"
   grep -q '^permitrootlogin no$' <<<"$SSH_EFFECTIVE" && pass "SSH root login disabled." || fail "SSH PermitRootLogin is not 'no'."
+  grep -q '^pubkeyauthentication yes$' <<<"$SSH_EFFECTIVE" && pass "SSH public-key authentication enabled." || fail "SSH PubkeyAuthentication is not enabled."
   grep -q '^maxauthtries 3$' <<<"$SSH_EFFECTIVE" && pass "SSH MaxAuthTries=3." || fail "SSH MaxAuthTries is not 3."
   grep -q '^logingracetime 30$' <<<"$SSH_EFFECTIVE" && pass "SSH LoginGraceTime=30." || fail "SSH LoginGraceTime is not 30 seconds."
   grep -q '^x11forwarding no$' <<<"$SSH_EFFECTIVE" && pass "SSH X11 forwarding disabled." || fail "SSH X11Forwarding is not disabled."
@@ -1301,7 +1341,18 @@ if id "$ENG_USER" >/dev/null 2>&1; then
   fi
   [[ "$(getent passwd "$ENG_USER" | awk -F: '{print $7}')" == "/bin/bash" ]] && pass "$ENG_USER uses /bin/bash." || fail "$ENG_USER does not use /bin/bash."
   ENG_HOME="$(getent passwd "$ENG_USER" | awk -F: '{print $6}')"
-  [[ -s "$ENG_HOME/.ssh/authorized_keys" ]] && pass "$ENG_USER authorized_keys installed." || fail "$ENG_USER authorized_keys missing."
+  if [[ -s "$ENG_HOME/.ssh/authorized_keys" ]]; then
+    pass "$ENG_USER authorized_keys installed."
+    if [[ -s "$ENGKEY_FP" ]]; then
+      EXPECTED_FP="$(awk -F= '$1=="fingerprint" {print $2}' "$ENGKEY_FP" | head -n1)"
+      ACTUAL_FP="$(ssh-keygen -lf "$ENG_HOME/.ssh/authorized_keys" -E sha256 2>/dev/null | awk 'NR==1 {print $2}')"
+      [[ -n "$EXPECTED_FP" && "$ACTUAL_FP" == "$EXPECTED_FP" ]] && pass "$ENG_USER engineering SSH key fingerprint matches production record." || fail "$ENG_USER engineering SSH key fingerprint does not match production record."
+    else
+      fail "Engineering SSH key fingerprint record missing."
+    fi
+  else
+    fail "$ENG_USER authorized_keys missing."
+  fi
 else
   fail "Default engineering account $ENG_USER does not exist."
 fi
@@ -1446,16 +1497,23 @@ configure_security_hardening() {
   install -d -o "${ENGINEERING_USER}" -g "${ENGINEERING_USER}" -m 700 "${engineering_home}/.ssh"
 
   engineering_key_to_install="${ENGINEERING_SSH_PUBLIC_KEY}"
-  if [[ -n "${engineering_key_to_install}" ]]; then
-    printf '%s\n' "${engineering_key_to_install}" > "${engineering_home}/.ssh/authorized_keys"
-  elif [[ ! -s "${engineering_home}/.ssh/authorized_keys" ]]; then
-    error_exit "No Solutionz engineering SSH public key is configured. Set ENGINEERING_SSH_PUBLIC_KEY_DEFAULT in Setup or provide SOLUTIONZ_RMM_ENGINEERING_SSH_PUBLIC_KEY before production installation."
-  fi
+  printf '%s\n' "${engineering_key_to_install}" > "${engineering_home}/.ssh/authorized_keys"
   chown "${ENGINEERING_USER}:${ENGINEERING_USER}" "${engineering_home}/.ssh/authorized_keys"
   chmod 600 "${engineering_home}/.ssh/authorized_keys"
-  ssh-keygen -l -f "${engineering_home}/.ssh/authorized_keys" >/dev/null 2>&1 || \
-    error_exit "Configured engineering authorized_keys file is not a valid SSH public key file."
-  progress_message "Engineering SSH public-key access configured for ${ENGINEERING_USER}."
+
+  local engineering_key_fingerprint
+  engineering_key_fingerprint="$(ssh-keygen -lf "${engineering_home}/.ssh/authorized_keys" -E sha256 2>/dev/null | awk 'NR==1 {print $2}')"
+  [[ -n "${engineering_key_fingerprint}" ]] || \
+    error_exit "Configured engineering authorized_keys file is not a valid ED25519 SSH public key file."
+  {
+    echo "engineering_login=${ENGINEERING_USER}"
+    echo "key_type=ssh-ed25519"
+    echo "fingerprint=${engineering_key_fingerprint}"
+    echo "installed_utc=$(date -u +%FT%TZ)"
+  } > "${ENGINEERING_SSH_FINGERPRINT_FILE}"
+  chmod 640 "${ENGINEERING_SSH_FINGERPRINT_FILE}"
+  chown root:root "${ENGINEERING_SSH_FINGERPRINT_FILE}"
+  progress_message "Engineering SSH public-key access configured for ${ENGINEERING_USER}; fingerprint ${engineering_key_fingerprint}."
 
   # Existing explicitly provisioned passwords are preserved. A new/unprovisioned
   # engineering account receives a high-entropy discarded password hash so the
@@ -1531,6 +1589,7 @@ EOF
 # Solutionz RMM SSH hardening. Domotz-sensitive global tunneling/authentication
 # controls are intentionally not changed until V1210/Domotz regression testing.
 PermitRootLogin no
+PubkeyAuthentication yes
 MaxAuthTries 3
 LoginGraceTime 30
 X11Forwarding no
@@ -3178,6 +3237,7 @@ AP="/etc/profile.d/solutionz-rmm-access.sh"
 SD="/etc/sudoers.d/solutionz-rmm-local-config"
 ENGPASS="/usr/local/sbin/solutionz-rmm-engineering-password-setup"
 ENGPASS_SD="/etc/sudoers.d/solutionz-rmm-engineering-password-setup"
+ENGKEY_FP="/var/lib/rswsolutionz-rmm/engineering-ssh-key-V06.100626N.fingerprint"
 SSHCFG="/etc/ssh/sshd_config.d/99-solutionz-rmm-hardening.conf"
 TECH_USER="solz_rmm"
 ENG_USER="solz_eng"
@@ -3301,7 +3361,18 @@ if id "$ENG_USER" >/dev/null 2>&1; then
   if id -nG "$ENG_USER" | tr ' ' '\n' | grep -qx "$TECH_GROUP"; then fail "$ENG_USER incorrectly has field-tech classification."; else pass "$ENG_USER field-tech classification absent."; fi
   [[ "$(getent passwd "$ENG_USER" | awk -F: '{print $7}')" == "/bin/bash" ]] && pass "$ENG_USER Bash shell present." || fail "$ENG_USER Bash shell missing."
   ENG_HOME="$(getent passwd "$ENG_USER" | awk -F: '{print $6}')"
-  [[ -s "$ENG_HOME/.ssh/authorized_keys" ]] && pass "$ENG_USER engineering SSH public key installed." || fail "$ENG_USER engineering SSH public key missing."
+  if [[ -s "$ENG_HOME/.ssh/authorized_keys" ]]; then
+    pass "$ENG_USER engineering SSH public key installed."
+    if [[ -s "$ENGKEY_FP" ]]; then
+      EXPECTED_FP="$(awk -F= '$1=="fingerprint" {print $2}' "$ENGKEY_FP" | head -n1)"
+      ACTUAL_FP="$(ssh-keygen -lf "$ENG_HOME/.ssh/authorized_keys" -E sha256 2>/dev/null | awk 'NR==1 {print $2}')"
+      [[ -n "$EXPECTED_FP" && "$ACTUAL_FP" == "$EXPECTED_FP" ]] && pass "$ENG_USER engineering SSH key fingerprint verified." || fail "$ENG_USER engineering SSH key fingerprint mismatch."
+    else
+      fail "Engineering SSH key fingerprint record missing."
+    fi
+  else
+    fail "$ENG_USER engineering SSH public key missing."
+  fi
 else
   fail "Default engineering account $ENG_USER does not exist."
 fi
@@ -3347,6 +3418,7 @@ if (( f == 0 )); then
     echo "security_validation_result=$SVR"
     echo "security_baseline=$IB"
     echo "engineering_login=$ENG_USER"
+    echo "engineering_ssh_key_fingerprint=$(awk -F= '$1=="fingerprint" {print $2}' "$ENGKEY_FP" 2>/dev/null | head -n1)"
     if [[ -s "$ENGPASS_MARKER" ]]; then
       echo "engineering_password_status=configured"
     else
@@ -3955,6 +4027,8 @@ final_summary_check() {
     check_final_requirement "Default engineering account is not in field-tech group" bash -c "! id -nG '${ENGINEERING_USER}' | tr ' ' '\\n' | grep -qx '${FIELD_TECH_GROUP}'" || failures=$((failures + 1))
     check_final_requirement "Default engineering account uses Bash shell" bash -c "[[ "$(getent passwd '${ENGINEERING_USER}' | awk -F: '{print $7}')" == /bin/bash ]]" || failures=$((failures + 1))
     check_final_requirement "Default engineering account has authorized SSH key" bash -c "test -s \"$(getent passwd '${ENGINEERING_USER}' | awk -F: '{print $6}')/.ssh/authorized_keys\"" || failures=$((failures + 1))
+    check_final_requirement "Engineering SSH key fingerprint record present" test -s "${ENGINEERING_SSH_FINGERPRINT_FILE}" || failures=$((failures + 1))
+    check_final_requirement "Engineering SSH public-key authentication enabled" bash -c "sshd -T | grep -q '^pubkeyauthentication yes$'" || failures=$((failures + 1))
   fi
   if id "${TECHNICIAN_USER}" >/dev/null 2>&1; then
     check_final_requirement "Default technician account is in field-tech group" bash -c "id -nG '${TECHNICIAN_USER}' | tr ' ' '\\n' | grep -qx '${FIELD_TECH_GROUP}'" || failures=$((failures + 1))
@@ -4105,6 +4179,7 @@ main() {
     "domotz_activation_helper=${DOMOTZ_ACTIVATION_HELPER}" \
     "domotz_activation_config=${DOMOTZ_ACTIVATION_CONFIG}" \
     "engineering_login=${ENGINEERING_USER}" \
+    "engineering_ssh_key_fingerprint=$(awk -F= '$1=="fingerprint" {print $2}' "${ENGINEERING_SSH_FINGERPRINT_FILE}" 2>/dev/null | head -n1)" \
     "engineering_password_status=pending_engineering_menu_setup" \
     "engineering_password_provisioning=authenticated_solz_eng_menu_setup_after_phase2" \
     "setup_command=${SETUP_COMMAND}" \

@@ -11,6 +11,9 @@ set -Eeuo pipefail
 # Live Network Discovery Update: 2026-11-03
 # Integrated Domotz Activation Update: 2026-11-04
 # Optional LAN / UFW sysctl persistence / network-validator NTP update: 2026-11-04
+# Default engineering account / login-policy update: 2026-11-04
+# Post-reboot unified menu + engineering credential provisioning update: 2026-11-05
+# Engineering-key protected credential provisioning update: 2026-11-04
 #
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
@@ -28,8 +31,15 @@ set -Eeuo pipefail
 #     is recorded for audit, and updates are governed by operating policy.
 #   - The V1210 USB-C port labeled COM is a serial console, not USB Ethernet.
 #     This script exposes an authenticated login on ttyS0 and automatically
-#     launches the Solutionz local configuration menu after a successful USB-C
-#     COM login. Technicians do not need to type a Linux command to open it.
+#     launches the Solutionz local configuration menu for restricted technician
+#     accounts on interactive SSH, local console, or USB-C COM login. Engineering
+#     group members retain unrestricted administrative shell access.
+#   - The default engineering login is solz_eng. Setup creates/configures the
+#     account but never embeds a password. A Solutionz engineering SSH public key
+#     is installed for first access. After Phase 2 validates successfully, the
+#     first authenticated solz_eng interactive SSH login is forced through a
+#     one-time password-creation step before the engineering shell opens.
+#   - Technicians cannot create, change, or provision the solz_eng password.
 #   - Ubuntu 24.04 LTS is the controlled OS family. Supported Noble point
 #     releases include Ubuntu 24.04.4 LTS.
 #   - Network changes are staged and take effect after manual reboot unless the
@@ -138,9 +148,20 @@ SECURITY_APT_POLICY_FILE="/etc/apt/apt.conf.d/52solutionz-rmm-security-updates"
 INSTALLED_SCRIPT_COPY="/usr/local/share/solutionz-rmm/${REVISION}"
 FIELD_TECH_GROUP="solutionz-rmm-tech"
 ENGINEERING_GROUP="solutionz-rmm-engineering"
+TECHNICIAN_USER="${SOLUTIONZ_RMM_TECHNICIAN_USER:-solz_rmm}"
+ENGINEERING_USER="${SOLUTIONZ_RMM_ENGINEERING_USER:-solz_eng}"
+# Public keys are safe to store in source control. Set this once to the Solutionz
+# engineering public key before production use, or pass
+# SOLUTIONZ_RMM_ENGINEERING_SSH_PUBLIC_KEY when invoking Setup.
+ENGINEERING_SSH_PUBLIC_KEY_DEFAULT=""
+ENGINEERING_SSH_PUBLIC_KEY="${SOLUTIONZ_RMM_ENGINEERING_SSH_PUBLIC_KEY:-${ENGINEERING_SSH_PUBLIC_KEY_DEFAULT}}"
+ENGINEERING_PASSWORD_MARKER="${STATE_DIR}/engineering-password-provisioned"
+ENGINEERING_PASSWORD_TOOL="/usr/local/sbin/solutionz-rmm-engineering-password-setup"
+ENGINEERING_PASSWORD_SUDOERS_FILE="/etc/sudoers.d/solutionz-rmm-engineering-password-setup"
 GRUB_FILE="/etc/default/grub"
 MOTD_FILE="/etc/update-motd.d/slz-rsw-login"
-SERIAL_PROFILE_FILE="/etc/profile.d/solutionz-rmm-serial.sh"
+ACCESS_PROFILE_FILE="/etc/profile.d/solutionz-rmm-access.sh"
+LEGACY_SERIAL_PROFILE_FILE="/etc/profile.d/solutionz-rmm-serial.sh"
 LOCAL_CONFIG_TOOL="/usr/local/sbin/solutionz-rmm-local-config"
 LOCAL_CONFIG_SUDOERS_FILE="/etc/sudoers.d/solutionz-rmm-local-config"
 
@@ -595,11 +616,20 @@ This script will:
  13. Install post-reboot production validation.
  14. Stage all changes without automatically rebooting.
 
-USB-C COM direct laptop configuration:
-  After reboot, connect a laptop to the V1210 USB-C port labeled COM.
-  Use 115200 baud, 8 data bits, no parity, 1 stop bit (8N1).
-  Log in normally. When the login is through ttyS0, the Solutionz RMM local
-  configuration menu launches automatically. No Linux command is required.
+Technician and engineering access:
+  Default technician login: ${TECHNICIAN_USER}
+  Default engineering login: ${ENGINEERING_USER}
+  Members of solutionz-rmm-tech automatically enter the Solutionz RMM local
+  configuration menu on interactive SSH, local console, or USB-C COM login.
+  Members of solutionz-rmm-engineering are exempt and retain a normal shell.
+  The default engineering account is created with a Bash shell and sudo access.
+  Setup intentionally does not embed the engineering password.
+  The engineering account is initially reachable only with the configured
+  Solutionz engineering SSH key. After reboot and successful Phase 2 validation,
+  the first authenticated ${ENGINEERING_USER} interactive login is forced to
+  create its password before the engineering shell opens. Technician accounts
+  cannot perform or bypass this engineering credential step.
+  USB-C COM remains available at 115200 baud, 8 data bits, no parity, 1 stop bit.
 
 Domotz note:
   Domotz is intentionally not revision-pinned. The installed Snap revision is
@@ -1119,6 +1149,7 @@ FILES=(
   "/usr/local/sbin/solutionz-rmm-security-validate"
   "/usr/local/sbin/solutionz-rmm-integrity-baseline"
   "/usr/local/sbin/solutionz-rmm-local-config"
+  "/usr/local/sbin/solutionz-rmm-engineering-password-setup"
   "/usr/local/sbin/rswsolutionz-rmm-postreboot-validate"
   "/etc/solutionz-rmm/network-profile.json"
   "/etc/netplan/00-installer-config.yaml"
@@ -1130,8 +1161,9 @@ FILES=(
   "/etc/default/ufw"
   "/etc/ufw/sysctl.conf"
   "/etc/ufw/user.rules"
-  "/etc/profile.d/solutionz-rmm-serial.sh"
+  "/etc/profile.d/solutionz-rmm-access.sh"
   "/etc/sudoers.d/solutionz-rmm-local-config"
+  "/etc/sudoers.d/solutionz-rmm-engineering-password-setup"
 )
 usage(){ echo "Usage: $(basename "$0") --refresh|--verify"; }
 case "${1:-}" in
@@ -1171,7 +1203,11 @@ INTEGRITY="/usr/local/sbin/solutionz-rmm-integrity-baseline"
 BASELINE="/var/lib/rswsolutionz-rmm/security-baseline-V06.100626N.sha256"
 TECH_GROUP="solutionz-rmm-tech"
 ENG_GROUP="solutionz-rmm-engineering"
+TECH_USER="solz_rmm"
+ENG_USER="solz_eng"
 LOCALCFG="/usr/local/sbin/solutionz-rmm-local-config"
+ENGPASS="/usr/local/sbin/solutionz-rmm-engineering-password-setup"
+ENGPASS_SUDOERS="/etc/sudoers.d/solutionz-rmm-engineering-password-setup"
 LIVE="/usr/local/sbin/solutionz-rmm-live-network-discovery"
 LIVE_RESULT="/var/lib/rswsolutionz-rmm/network-live-discovery-V06.100626N.result"
 F=(); W=()
@@ -1234,6 +1270,43 @@ else
 fi
 getent group "$TECH_GROUP" >/dev/null 2>&1 && pass "Restricted field-tech group exists." || fail "Field-tech group missing."
 getent group "$ENG_GROUP" >/dev/null 2>&1 && pass "Engineering group exists." || fail "Engineering group missing."
+if [[ -s "$SSH_FILE" ]] && grep -q '^Match Group solutionz-rmm-tech,!solutionz-rmm-engineering$' "$SSH_FILE" && grep -q -- '--restricted-login' "$SSH_FILE"; then
+  pass "SSH technician sessions are forced to the menu with an engineering-group exception."
+else
+  fail "SSH technician restriction/engineering exception policy missing or invalid."
+fi
+if id "$TECH_USER" >/dev/null 2>&1; then
+  id -nG "$TECH_USER" | tr ' ' '\n' | grep -qx "$TECH_GROUP" && pass "$TECH_USER is assigned to the field-tech group." || fail "$TECH_USER is not assigned to the field-tech group."
+  if id -nG "$TECH_USER" | tr ' ' '\n' | grep -qx "$ENG_GROUP"; then
+    fail "$TECH_USER is also in the engineering group; engineering membership would bypass the technician menu."
+  else
+    pass "$TECH_USER is not in the engineering group."
+  fi
+  if id -nG "$TECH_USER" | tr ' ' '
+' | grep -qx sudo; then
+    fail "$TECH_USER has unrestricted sudo-group membership."
+  else
+    pass "$TECH_USER has no unrestricted sudo-group membership."
+  fi
+else
+  warn "Default technician account $TECH_USER does not exist on this appliance."
+fi
+if id "$ENG_USER" >/dev/null 2>&1; then
+  id -nG "$ENG_USER" | tr ' ' '\n' | grep -qx "$ENG_GROUP" && pass "$ENG_USER is assigned to the engineering group." || fail "$ENG_USER is not assigned to the engineering group."
+  id -nG "$ENG_USER" | tr ' ' '\n' | grep -qx 'sudo' && pass "$ENG_USER has sudo-group membership." || fail "$ENG_USER is missing sudo-group membership."
+  if id -nG "$ENG_USER" | tr ' ' '\n' | grep -qx "$TECH_GROUP"; then
+    fail "$ENG_USER is also in the field-tech group; default engineering account should not be classified as a technician."
+  else
+    pass "$ENG_USER is not in the field-tech group."
+  fi
+  [[ "$(getent passwd "$ENG_USER" | awk -F: '{print $7}')" == "/bin/bash" ]] && pass "$ENG_USER uses /bin/bash." || fail "$ENG_USER does not use /bin/bash."
+  ENG_HOME="$(getent passwd "$ENG_USER" | awk -F: '{print $6}')"
+  [[ -s "$ENG_HOME/.ssh/authorized_keys" ]] && pass "$ENG_USER authorized_keys installed." || fail "$ENG_USER authorized_keys missing."
+else
+  fail "Default engineering account $ENG_USER does not exist."
+fi
+[[ -x "$ENGPASS" ]] && pass "Engineering password provisioning helper installed." || fail "Engineering password provisioning helper missing."
+[[ -s "$ENGPASS_SUDOERS" ]] && visudo -cf "$ENGPASS_SUDOERS" >/dev/null 2>&1 && pass "Engineering password provisioning sudoers policy valid." || fail "Engineering password provisioning sudoers policy invalid."
 if [[ -x "$LOCALCFG" ]] && ! grep -q 'Open Linux shell' "$LOCALCFG"; then
   pass "Field configuration menu does not expose an unrestricted Linux shell option."
 else
@@ -1319,9 +1392,91 @@ configure_security_hardening() {
 
   groupadd -f "${FIELD_TECH_GROUP}"
   groupadd -f "${ENGINEERING_GROUP}"
-  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]] && id "${SUDO_USER}" >/dev/null 2>&1; then
-    usermod -aG "${ENGINEERING_GROUP}" "${SUDO_USER}" || warning_message "Unable to add ${SUDO_USER} to ${ENGINEERING_GROUP}."
+
+  # The default field account is a restricted technician account. Do not
+  # automatically grant it engineering-shell membership merely because it ran
+  # Setup with sudo. Engineering access is an explicit group assignment.
+  if id "${TECHNICIAN_USER}" >/dev/null 2>&1; then
+    usermod -aG "${FIELD_TECH_GROUP}" "${TECHNICIAN_USER}" || \
+      error_exit "Unable to add ${TECHNICIAN_USER} to ${FIELD_TECH_GROUP}."
+    if id -nG "${TECHNICIAN_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx "${ENGINEERING_GROUP}"; then
+      gpasswd -d "${TECHNICIAN_USER}" "${ENGINEERING_GROUP}" >/dev/null 2>&1 || \
+        error_exit "Unable to remove technician account ${TECHNICIAN_USER} from ${ENGINEERING_GROUP}."
+    fi
+    progress_message "Technician account ${TECHNICIAN_USER} assigned to ${FIELD_TECH_GROUP}; unrestricted engineering shell access removed."
+  else
+    warning_message "Default technician account ${TECHNICIAN_USER} does not exist; technician menu enforcement will apply to any account later added to ${FIELD_TECH_GROUP}."
   fi
+
+  # The default engineering account is explicit and repeatable. Setup never
+  # promotes the account that happened to invoke sudo into engineering access.
+  if id "${ENGINEERING_USER}" >/dev/null 2>&1; then
+    usermod -s /bin/bash -aG "${ENGINEERING_GROUP},sudo" "${ENGINEERING_USER}" || \
+      error_exit "Unable to configure engineering account ${ENGINEERING_USER}."
+  else
+    useradd --create-home --shell /bin/bash "${ENGINEERING_USER}" || \
+      error_exit "Unable to create default engineering account ${ENGINEERING_USER}."
+    usermod -aG "${ENGINEERING_GROUP},sudo" "${ENGINEERING_USER}" || \
+      error_exit "Unable to assign ${ENGINEERING_USER} to engineering/sudo groups."
+    progress_message "Created default engineering account ${ENGINEERING_USER}."
+  fi
+
+  # Engineering membership wins in the login policy, but the default engineering
+  # account must never also be classified as a field technician.
+  if id -nG "${ENGINEERING_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx "${FIELD_TECH_GROUP}"; then
+    gpasswd -d "${ENGINEERING_USER}" "${FIELD_TECH_GROUP}" >/dev/null 2>&1 || \
+      error_exit "Unable to remove ${ENGINEERING_USER} from ${FIELD_TECH_GROUP}."
+  fi
+
+  # The restricted technician account must not retain general sudo membership.
+  # It receives NOPASSWD permission only for the controlled local-config tool.
+  if id "${TECHNICIAN_USER}" >/dev/null 2>&1 && id -nG "${TECHNICIAN_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx sudo; then
+    gpasswd -d "${TECHNICIAN_USER}" sudo >/dev/null 2>&1 || \
+      error_exit "Unable to remove technician account ${TECHNICIAN_USER} from sudo."
+    progress_message "Removed unrestricted sudo membership from technician account ${TECHNICIAN_USER}."
+  fi
+
+  # First engineering access is authenticated with a Solutionz-held SSH private
+  # key. Only the public key is installed on the appliance and may safely reside
+  # in this Setup source. This creates the trusted distinction between an
+  # engineer and a technician before the engineering password exists.
+  local engineering_home engineering_key_to_install engineering_password_state
+  engineering_home="$(getent passwd "${ENGINEERING_USER}" | awk -F: '{print $6}')"
+  [[ -n "${engineering_home}" ]] || error_exit "Unable to determine home directory for ${ENGINEERING_USER}."
+  install -d -o "${ENGINEERING_USER}" -g "${ENGINEERING_USER}" -m 700 "${engineering_home}/.ssh"
+
+  engineering_key_to_install="${ENGINEERING_SSH_PUBLIC_KEY}"
+  if [[ -n "${engineering_key_to_install}" ]]; then
+    printf '%s\n' "${engineering_key_to_install}" > "${engineering_home}/.ssh/authorized_keys"
+  elif [[ ! -s "${engineering_home}/.ssh/authorized_keys" ]]; then
+    error_exit "No Solutionz engineering SSH public key is configured. Set ENGINEERING_SSH_PUBLIC_KEY_DEFAULT in Setup or provide SOLUTIONZ_RMM_ENGINEERING_SSH_PUBLIC_KEY before production installation."
+  fi
+  chown "${ENGINEERING_USER}:${ENGINEERING_USER}" "${engineering_home}/.ssh/authorized_keys"
+  chmod 600 "${engineering_home}/.ssh/authorized_keys"
+  ssh-keygen -l -f "${engineering_home}/.ssh/authorized_keys" >/dev/null 2>&1 || \
+    error_exit "Configured engineering authorized_keys file is not a valid SSH public key file."
+  progress_message "Engineering SSH public-key access configured for ${ENGINEERING_USER}."
+
+  # Existing explicitly provisioned passwords are preserved. A new/unprovisioned
+  # engineering account receives a high-entropy discarded password hash so the
+  # account is not OS-locked (and can authenticate by public key), while password
+  # authentication remains computationally unusable until the engineer replaces
+  # it after Phase 2. The random secret is never logged or retained.
+  engineering_password_state="$(passwd -S "${ENGINEERING_USER}" 2>/dev/null | awk '{print $2}' || true)"
+  if [[ -s "${ENGINEERING_PASSWORD_MARKER}" && "${engineering_password_state}" == "P" ]]; then
+    progress_message "Engineering password was previously provisioned; Setup preserved it unchanged."
+  else
+    local _eng_bootstrap_secret _eng_bootstrap_hash
+    _eng_bootstrap_secret="$(openssl rand -base64 48 | tr -d '\n')"
+    _eng_bootstrap_hash="$(printf '%s' "${_eng_bootstrap_secret}" | openssl passwd -6 -stdin)"
+    usermod -p "${_eng_bootstrap_hash}" "${ENGINEERING_USER}" || \
+      error_exit "Unable to establish key-only bootstrap state for ${ENGINEERING_USER}."
+    unset _eng_bootstrap_secret _eng_bootstrap_hash
+    rm -f "${ENGINEERING_PASSWORD_MARKER}"
+    info_message "Engineering password is pending. After Phase 2, the first SSH-key-authenticated ${ENGINEERING_USER} interactive login will be forced to create it."
+  fi
+
+  progress_message "Engineering login ${ENGINEERING_USER} assigned to ${ENGINEERING_GROUP} with sudo and unrestricted Bash shell access after credential provisioning."
 
   cat > "${SECURITY_SYSCTL_FILE}" <<'EOF'
 # Solutionz RMM host-network hardening. Do not enable IP forwarding on the dual-homed collector.
@@ -1380,12 +1535,13 @@ MaxAuthTries 3
 LoginGraceTime 30
 X11Forwarding no
 
-# Dedicated field technicians may use the controlled configuration menu but do
-# not receive an unrestricted SSH shell. Engineering accounts are not matched.
-Match Group solutionz-rmm-tech
-    ForceCommand sudo -n /usr/local/sbin/solutionz-rmm-local-config
+# Dedicated field technicians are forced into the controlled configuration
+# menu for SSH sessions. Membership in the engineering group is an explicit
+# exception and preserves an unrestricted administrative shell.
+Match Group solutionz-rmm-tech,!solutionz-rmm-engineering
+    ForceCommand sudo -n /usr/local/sbin/solutionz-rmm-local-config --restricted-login
+    DisableForwarding yes
     X11Forwarding no
-    AllowTcpForwarding no
     PermitTunnel no
 Match all
 EOF
@@ -2306,18 +2462,37 @@ POST_RESULT="/var/lib/rswsolutionz-rmm/postreboot-validation-V06.100626N.result"
 SECURITY_RESULT="/var/lib/rswsolutionz-rmm/security-validation-V06.100626N.result"
 INTEGRITY="/usr/local/sbin/solutionz-rmm-integrity-baseline"
 SECURITY_BASELINE="/var/lib/rswsolutionz-rmm/security-baseline-V06.100626N.sha256"
+INSTALL_STATE="/var/lib/rswsolutionz-rmm/install.state"
+ENGINEERING_USER="solz_eng"
+ENGINEERING_GROUP="solutionz-rmm-engineering"
+ENGINEERING_PASSWORD_TOOL="/usr/local/sbin/solutionz-rmm-engineering-password-setup"
+ENGINEERING_PASSWORD_MARKER="/var/lib/rswsolutionz-rmm/engineering-password-provisioned"
 AUTO=0
+SESSION_MODE="manual"
 PRODUCTION_VALIDATION_RESULT="NOT_RUN"
 PRE_NETPLAN_SHA256=""
 PRE_PROFILE_SHA256=""
 
-if [[ "${1:-}" == "--serial-auto" ]]; then
-  AUTO=1
-elif [[ $# -ne 0 ]]; then
-  echo "Usage: $(basename "$0") [--serial-auto]"
-  exit 2
-fi
+case "${1:-}" in
+  --restricted-login|--serial-auto)
+    # --serial-auto is retained as a backwards-compatible alias.
+    AUTO=1
+    SESSION_MODE="technician"
+    ;;
+  --engineering-login)
+    AUTO=1
+    SESSION_MODE="engineering"
+    ;;
+  "")
+    ;;
+  *)
+    echo "Usage: $(basename "$0") [--restricted-login|--engineering-login]"
+    exit 2
+    ;;
+esac
+[[ $# -le 1 ]] || { echo "Usage: $(basename "$0") [--restricted-login|--engineering-login]"; exit 2; }
 [[ $EUID -eq 0 ]] || { echo "Run with sudo."; exit 1; }
+
 
 sha_file() { [[ -f "$1" ]] && sha256sum "$1" | awk '{print $1}' || true; }
 bak() { [[ -f "$1" ]] && cp -a "$1" "$1.networkcfg.bak.$(date -u +%Y%m%dT%H%M%SZ)"; }
@@ -2684,6 +2859,86 @@ restore() {
   run_production_validation
 }
 
+engineering_session_authenticated() {
+  [[ "${SUDO_USER:-}" == "${ENGINEERING_USER}" ]] || return 1
+  id -nG "${ENGINEERING_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx "${ENGINEERING_GROUP}"
+}
+
+engineering_access() {
+  echo
+  echo "============================================================"
+  echo "ENGINEERING LOGIN / PASSWORD SETUP"
+  echo "============================================================"
+
+  if ! engineering_session_authenticated; then
+    if [[ -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
+      echo "Engineering password is already provisioned."
+      echo "Enter the engineering password to open an authenticated engineering session."
+      echo
+      /usr/bin/ssh -tt         -o PreferredAuthentications=password         -o PubkeyAuthentication=no         -o NumberOfPasswordPrompts=3         -o StrictHostKeyChecking=no         -o UserKnownHostsFile=/dev/null         "${ENGINEERING_USER}@127.0.0.1" || true
+    else
+      local wan_ip
+      wan_ip="$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+      echo "First-time engineering password creation is blocked from technician sessions."
+      echo "An engineer must authenticate as ${ENGINEERING_USER} using the approved Solutionz engineering SSH private key."
+      echo
+      if [[ -n "${wan_ip}" ]]; then
+        echo "From the engineering workstation:"
+        echo "  ssh -i <Solutionz-engineering-private-key> ${ENGINEERING_USER}@${wan_ip}"
+      else
+        echo "From the engineering workstation:"
+        echo "  ssh -i <Solutionz-engineering-private-key> ${ENGINEERING_USER}@<RMM-IP>"
+      fi
+      echo
+      echo "That authenticated engineering login opens this same menu in engineering mode."
+      echo "Select option 9 again to create the local ${ENGINEERING_USER} password."
+    fi
+    return 0
+  fi
+
+  if [[ "$(head -n1 "${INSTALL_STATE}" 2>/dev/null || true)" != "phase2_system_validated" ]]; then
+    echo "Engineering password setup is unavailable until Phase 2 reports phase2_system_validated."
+    return 1
+  fi
+
+  if [[ ! -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
+    echo "First-time engineering setup detected."
+    echo "The current session is authenticated as ${ENGINEERING_USER}."
+    echo
+    "${ENGINEERING_PASSWORD_TOOL}" || return $?
+  else
+    echo "Engineering password is already provisioned."
+  fi
+
+  while true; do
+    cat <<'ENGMENU'
+
+Engineering Session
+1) Open engineering shell
+2) Change solz_eng password
+3) Return to Solutionz RMM configuration menu
+ENGMENU
+    read -r -p "Engineering selection: " ec
+    case "${ec}" in
+      1)
+        local eng_home
+        eng_home="$(getent passwd "${ENGINEERING_USER}" | awk -F: '{print $6}')"
+        echo "Opening engineering shell. Type 'exit' to return to the RMM menu."
+        runuser -u "${ENGINEERING_USER}" -- env           HOME="${eng_home}" USER="${ENGINEERING_USER}" LOGNAME="${ENGINEERING_USER}"           SHELL=/bin/bash TERM="${TERM:-xterm}"           PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin           /bin/bash --noprofile --norc -i
+        ;;
+      2)
+        "${ENGINEERING_PASSWORD_TOOL}" --change || true
+        ;;
+      3)
+        return 0
+        ;;
+      *)
+        echo "Invalid engineering selection."
+        ;;
+    esac
+  done
+}
+
 echo
 echo "AUTO-DETECT CURRENT NETWORK"
 echo "------------------------------------------------"
@@ -2701,7 +2956,8 @@ Solutionz RMM Dual-Homed Network Configuration - Revision V06.100626N
 6) Refresh detected live network information
 7) Run automatic network + security validation
 8) Restore previous network configuration
-9) Log out
+9) Engineering Login / Password Setup
+10) Log out
 
 eth0 = WAN/cloud | eth1 = AV/control LAN | VLANs on eth1 | forwarding disabled
 Live detected state comes from the running Linux network stack, not Netplan.
@@ -2709,6 +2965,11 @@ Netplan remains the persistent configuration mechanism across reboot.
 USB-C COM = independent recovery/configuration path
 Every applied network change is automatically rediscovered and validated; local configuration failures roll back.
 MENU
+  if [[ "${SESSION_MODE}" == "engineering" ]]; then
+    echo "Session: ENGINEERING (${ENGINEERING_USER})"
+  elif [[ "${SESSION_MODE}" == "technician" ]]; then
+    echo "Session: TECHNICIAN"
+  fi
   read -r -p "Selection: " c
   case "$c" in
     1) wan ;;
@@ -2719,13 +2980,88 @@ MENU
     6) show_live ;;
     7) validate_full || true ;;
     8) restore ;;
-    9) if (( AUTO )); then exit 90; else exit 0; fi ;;
+    9) engineering_access ;;
+    10) if (( AUTO )); then exit 90; else exit 0; fi ;;
     *) echo "Invalid selection." ;;
   esac
 done
 LOCALCFG
   chmod 750 "${LOCAL_CONFIG_TOOL}"
   chown root:root "${LOCAL_CONFIG_TOOL}"
+
+  cat > "${ENGINEERING_PASSWORD_TOOL}" <<'ENGPASS'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ENGINEERING_USER="solz_eng"
+STATE_FILE="/var/lib/rswsolutionz-rmm/install.state"
+MARKER="/var/lib/rswsolutionz-rmm/engineering-password-provisioned"
+MODE="${1:-initial}"
+
+case "${MODE}" in
+  initial|--change) ;;
+  *)
+    echo "Usage: $(basename "$0") [--change]" >&2
+    exit 79
+    ;;
+esac
+
+[[ ${EUID} -eq 0 ]] || { echo "ERROR: engineering password setup must run through its authorized sudo rule." >&2; exit 80; }
+[[ "${SUDO_USER:-}" == "${ENGINEERING_USER}" ]] || { echo "ERROR: only ${ENGINEERING_USER} may provision the engineering password." >&2; exit 81; }
+[[ -t 0 && -t 1 ]] || { echo "ERROR: an interactive terminal is required." >&2; exit 82; }
+[[ "$(head -n1 "${STATE_FILE}" 2>/dev/null || true)" == "phase2_system_validated" ]] || {
+  echo "ERROR: engineering password provisioning is blocked until Phase 2 system validation passes." >&2
+  exit 83
+}
+
+if [[ -s "${MARKER}" && "${MODE}" == "initial" ]]; then
+  exit 0
+fi
+
+id "${ENGINEERING_USER}" >/dev/null 2>&1 || { echo "ERROR: ${ENGINEERING_USER} account is missing." >&2; exit 84; }
+
+echo
+echo "============================================================"
+if [[ "${MODE}" == "--change" ]]; then
+  echo "Solutionz RMM Engineering Password Change"
+else
+  echo "Solutionz RMM Engineering Credential Setup"
+fi
+echo "============================================================"
+echo "Engineering identity is authenticated as ${ENGINEERING_USER}."
+if [[ "${MODE}" == "--change" ]]; then
+  echo "Create the replacement local password for ${ENGINEERING_USER}."
+else
+  echo "Create the local password for ${ENGINEERING_USER}."
+fi
+echo "This password is not written to Setup, logs, or the provisioning marker."
+echo
+
+/usr/bin/passwd "${ENGINEERING_USER}" || { echo "Engineering password was not configured." >&2; exit 85; }
+
+mkdir -p "$(dirname "${MARKER}")"
+{
+  echo "engineering_login=${ENGINEERING_USER}"
+  echo "status=configured"
+  echo "timestamp_utc=$(date -u +%FT%TZ)"
+  if [[ "${MODE}" == "--change" ]]; then
+    echo "source=authenticated_engineering_menu_password_change"
+  else
+    echo "source=authenticated_engineering_menu_first_time_setup"
+  fi
+} > "${MARKER}"
+chmod 640 "${MARKER}"
+
+echo
+echo "Engineering password configured successfully."
+ENGPASS
+  chmod 750 "${ENGINEERING_PASSWORD_TOOL}"
+  chown root:root "${ENGINEERING_PASSWORD_TOOL}"
+
+  cat > "${ENGINEERING_PASSWORD_SUDOERS_FILE}" <<EOF
+${ENGINEERING_USER} ALL=(root) NOPASSWD: ${ENGINEERING_PASSWORD_TOOL}
+EOF
+  chmod 440 "${ENGINEERING_PASSWORD_SUDOERS_FILE}"
+  visudo -cf "${ENGINEERING_PASSWORD_SUDOERS_FILE}" >/dev/null || error_exit "Engineering password provisioning sudoers validation failed."
 
   cat > "${LOCAL_CONFIG_SUDOERS_FILE}" <<EOF
 %${FIELD_TECH_GROUP} ALL=(root) NOPASSWD: ${LOCAL_CONFIG_TOOL}
@@ -2735,28 +3071,58 @@ EOF
   chmod 440 "${LOCAL_CONFIG_SUDOERS_FILE}"
   visudo -cf "${LOCAL_CONFIG_SUDOERS_FILE}" >/dev/null || error_exit "Local config sudoers validation failed."
 
-  cat > "${SERIAL_PROFILE_FILE}" <<EOF
-#!/usr/bin/env bash
-if [[ "\${SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE:-0}" != 1 && "\$(tty 2>/dev/null || true)" == /dev/ttyS0 ]]; then
-  export SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE=1
-  _rc=0
-  echo
-  echo "Solutionz USB-C COM session detected; launching WAN/LAN/VLAN menu."
-  if [[ \${EUID} -eq 0 ]]; then
-    "${LOCAL_CONFIG_TOOL}" --serial-auto || _rc=\$?
-  else
-    sudo "${LOCAL_CONFIG_TOOL}" --serial-auto || _rc=\$?
+  # Remove the old serial-only launcher so it cannot compete with the new
+  # all-interactive-login access policy.
+  rm -f "${LEGACY_SERIAL_PROFILE_FILE}"
+
+  cat > "${ACCESS_PROFILE_FILE}" <<EOF
+# Solutionz RMM interactive access policy. This file is sourced by login shells.
+# Engineering membership always wins. A technician who is not an engineer is
+# placed directly into the controlled RMM configuration menu and is logged out
+# when the menu exits. SSH is independently protected by sshd ForceCommand.
+
+case "\$-" in
+  *i*) ;;
+  *) return 0 2>/dev/null || exit 0 ;;
+esac
+
+if [ "\${SOLUTIONZ_RMM_MENU_ACTIVE:-0}" != "1" ]; then
+  _solutionz_user="\$(id -un 2>/dev/null || true)"
+  _solutionz_groups="\$(id -nG "\${_solutionz_user}" 2>/dev/null || true)"
+
+  if printf '%s\n' "\${_solutionz_groups}" | tr ' ' '\n' | grep -qx '${ENGINEERING_GROUP}'; then
+    export SOLUTIONZ_RMM_MENU_ACTIVE=1
+    echo
+    echo "Solutionz engineering session detected; launching RMM configuration menu."
+    if [ "\${EUID:-\$(id -u)}" -eq 0 ]; then
+      "${LOCAL_CONFIG_TOOL}" --engineering-login || true
+    else
+      sudo -n "${LOCAL_CONFIG_TOOL}" --engineering-login || {
+        echo "ERROR: Unable to launch the Solutionz engineering menu." >&2
+      }
+    fi
+    unset SOLUTIONZ_RMM_MENU_ACTIVE _solutionz_user _solutionz_groups
+    exit 0
+  elif printf '%s\n' "\${_solutionz_groups}" | tr ' ' '\n' | grep -qx '${FIELD_TECH_GROUP}'; then
+    export SOLUTIONZ_RMM_MENU_ACTIVE=1
+    echo
+    echo "Solutionz technician session detected; launching RMM configuration menu."
+    if [ "\${EUID:-\$(id -u)}" -eq 0 ]; then
+      "${LOCAL_CONFIG_TOOL}" --restricted-login || true
+    else
+      sudo -n "${LOCAL_CONFIG_TOOL}" --restricted-login || {
+        echo "ERROR: Unable to launch the Solutionz technician menu." >&2
+      }
+    fi
+    unset SOLUTIONZ_RMM_MENU_ACTIVE _solutionz_user _solutionz_groups
+    exit 0
   fi
-  unset SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE
-  if [[ \${EUID} -ne 0 ]] && ! id -nG "\${USER:-}" 2>/dev/null | tr ' ' '\n' | grep -qx '${ENGINEERING_GROUP}'; then
-    exit
-  fi
-  [[ \$_rc -eq 90 ]] && exit
-  unset _rc
+
+  unset _solutionz_user _solutionz_groups
 fi
 EOF
-  chmod 644 "${SERIAL_PROFILE_FILE}"
-  progress_message "Field WAN/LAN/VLAN utility installed; live NIC discovery runs automatically before configuration, unrestricted field-menu shell access is removed, and USB-C COM/session-safety/automatic validation/rollback remain enabled."
+  chmod 644 "${ACCESS_PROFILE_FILE}"
+  progress_message "Interactive access policy installed: technician and engineering interactive logins both enter the Solutionz RMM menu; authenticated solz_eng sessions receive engineering-mode password setup and shell options."
 }
 
 update_banner() {
@@ -2808,8 +3174,16 @@ PR="/var/lib/rswsolutionz-rmm/network-profile-V06.100626N.result"
 DOM="domotzpro-agent-publicstore"
 SER="serial-getty@ttyS0.service"
 CFG="/usr/local/sbin/solutionz-rmm-local-config"
-SP="/etc/profile.d/solutionz-rmm-serial.sh"
+AP="/etc/profile.d/solutionz-rmm-access.sh"
 SD="/etc/sudoers.d/solutionz-rmm-local-config"
+ENGPASS="/usr/local/sbin/solutionz-rmm-engineering-password-setup"
+ENGPASS_SD="/etc/sudoers.d/solutionz-rmm-engineering-password-setup"
+SSHCFG="/etc/ssh/sshd_config.d/99-solutionz-rmm-hardening.conf"
+TECH_USER="solz_rmm"
+ENG_USER="solz_eng"
+TECH_GROUP="solutionz-rmm-tech"
+ENG_GROUP="solutionz-rmm-engineering"
+ENGPASS_MARKER="/var/lib/rswsolutionz-rmm/engineering-password-provisioned"
 GRUB="/etc/default/grub"
 IPF="/etc/sysctl.d/90-solutionz-rmm-no-forwarding.conf"
 SV="/usr/local/sbin/solutionz-rmm-security-validate"
@@ -2912,7 +3286,27 @@ systemctl is-active --quiet systemd-timesyncd.service && pass "systemd-timesyncd
 waitntp && pass "NTP synchronized." || fail "NTP synchronization failed."
 [[ -c /dev/ttyS0 ]] && pass "ttyS0 present." || fail "ttyS0 missing."
 check "Serial service active" systemctl is-active --quiet "$SER"
-[[ -x "$CFG" && -s "$SP" ]] && grep -q '/dev/ttyS0' "$SP" && pass "USB-C COM network menu installed." || fail "USB-C COM menu missing."
+[[ -x "$CFG" && -s "$AP" ]] && grep -q 'solutionz-rmm-tech' "$AP" && grep -q 'solutionz-rmm-engineering' "$AP" && grep -q -- '--restricted-login' "$AP" && grep -q -- '--engineering-login' "$AP" && pass "Unified technician/engineering interactive menu policy installed." || fail "Unified interactive menu policy missing."
+[[ -s "$SSHCFG" ]] && grep -q '^Match Group solutionz-rmm-tech,!solutionz-rmm-engineering$' "$SSHCFG" && grep -q -- '--restricted-login' "$SSHCFG" && pass "SSH technician menu policy with engineering exception installed." || fail "SSH technician menu policy missing/invalid."
+if id "$TECH_USER" >/dev/null 2>&1; then
+  id -nG "$TECH_USER" | tr ' ' '\n' | grep -qx "$TECH_GROUP" && pass "$TECH_USER field-tech membership present." || fail "$TECH_USER field-tech membership missing."
+  if id -nG "$TECH_USER" | tr ' ' '\n' | grep -qx "$ENG_GROUP"; then fail "$TECH_USER incorrectly has engineering-group shell bypass."; else pass "$TECH_USER engineering shell bypass absent."; fi
+  if id -nG "$TECH_USER" | tr ' ' '\n' | grep -qx sudo; then fail "$TECH_USER incorrectly has unrestricted sudo membership."; else pass "$TECH_USER unrestricted sudo membership absent."; fi
+else
+  warn "Default technician account $TECH_USER does not exist."
+fi
+if id "$ENG_USER" >/dev/null 2>&1; then
+  id -nG "$ENG_USER" | tr ' ' '\n' | grep -qx "$ENG_GROUP" && pass "$ENG_USER engineering membership present." || fail "$ENG_USER engineering membership missing."
+  id -nG "$ENG_USER" | tr ' ' '\n' | grep -qx 'sudo' && pass "$ENG_USER sudo membership present." || fail "$ENG_USER sudo membership missing."
+  if id -nG "$ENG_USER" | tr ' ' '\n' | grep -qx "$TECH_GROUP"; then fail "$ENG_USER incorrectly has field-tech classification."; else pass "$ENG_USER field-tech classification absent."; fi
+  [[ "$(getent passwd "$ENG_USER" | awk -F: '{print $7}')" == "/bin/bash" ]] && pass "$ENG_USER Bash shell present." || fail "$ENG_USER Bash shell missing."
+  ENG_HOME="$(getent passwd "$ENG_USER" | awk -F: '{print $6}')"
+  [[ -s "$ENG_HOME/.ssh/authorized_keys" ]] && pass "$ENG_USER engineering SSH public key installed." || fail "$ENG_USER engineering SSH public key missing."
+else
+  fail "Default engineering account $ENG_USER does not exist."
+fi
+[[ -x "$ENGPASS" ]] && pass "Engineering password provisioning helper installed." || fail "Engineering password provisioning helper missing."
+[[ -s "$ENGPASS_SD" ]] && visudo -cf "$ENGPASS_SD" >/dev/null 2>&1 && pass "Engineering password provisioning sudoers policy valid." || fail "Engineering password provisioning sudoers policy invalid."
 [[ -s "$SD" ]] && visudo -cf "$SD" >/dev/null 2>&1 && pass "sudoers policy valid." || fail "sudoers policy invalid."
 grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=.*console=ttyS0,115200n8' "$GRUB" && pass "GRUB serial console configured." || fail "GRUB serial console missing."
 
@@ -2952,6 +3346,13 @@ if (( f == 0 )); then
     echo "network_live_discovery_result=$LDR"
     echo "security_validation_result=$SVR"
     echo "security_baseline=$IB"
+    echo "engineering_login=$ENG_USER"
+    if [[ -s "$ENGPASS_MARKER" ]]; then
+      echo "engineering_password_status=configured"
+    else
+      echo "engineering_password_status=pending_engineering_menu_setup"
+    fi
+    echo "engineering_password_provisioning=authenticated_solz_eng_menu_setup_after_phase2"
     echo "log=$LOG"
   } > "$STATE"
   chmod 640 "$STATE"
@@ -3414,6 +3815,8 @@ prepare_deployment() {
   local phase answer
   phase="$(head -n1 "${STATE_FILE}" 2>/dev/null || true)"
   [[ "${phase}" == "phase2_system_validated" ]] || error_exit "Deployment preparation requires phase2_system_validated. Current state: ${phase:-missing}."
+  [[ -s "${ENGINEERING_PASSWORD_MARKER}" ]] || \
+    error_exit "Deployment preparation requires the ${ENGINEERING_USER} password to be provisioned by an authenticated ${ENGINEERING_USER} engineering-key login after Phase 2."
   [[ -x "${DOMOTZ_ACTIVATION_HELPER}" ]] || error_exit "Integrated Domotz activation helper is not installed."
 
   systemctl stop solutionz-domotz-activate.timer solutionz-domotz-activate.service >/dev/null 2>&1 || true
@@ -3522,11 +3925,16 @@ final_summary_check() {
   check_final_requirement "GRUB serial console configured for ttyS0 at 115200 8N1"     grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=.*console=ttyS0,115200n8' "${GRUB_FILE}" || failures=$((failures + 1))
   check_final_requirement "Local network configuration utility installed" test -x "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Live network discovery utility installed" test -x "${LIVE_DISCOVERY_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "USB-C COM automatic-menu profile installed" test -s "${SERIAL_PROFILE_FILE}" || failures=$((failures + 1))
-  check_final_requirement "USB-C COM automatic-menu profile targets ttyS0" grep -q '/dev/ttyS0' "${SERIAL_PROFILE_FILE}" || failures=$((failures + 1))
-  check_final_requirement "USB-C COM automatic-menu profile launches serial-auto mode" grep -q -- '--serial-auto' "${SERIAL_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Technician interactive-login access profile installed" test -s "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Technician access profile checks field-tech group" grep -q "${FIELD_TECH_GROUP}" "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Interactive access profile recognizes engineering group" grep -q "${ENGINEERING_GROUP}" "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Technician access profile launches restricted-login mode" grep -q -- '--restricted-login' "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Engineering access profile launches engineering-login mode" grep -q -- '--engineering-login' "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "SSH field-tech policy excludes engineering group" grep -q '^Match Group solutionz-rmm-tech,!solutionz-rmm-engineering$' "${SSH_HARDENING_FILE}" || failures=$((failures + 1))
   check_final_requirement "Local config sudoers policy installed" test -s "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
   check_final_requirement "Local config sudoers policy valid" visudo -cf "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Engineering password provisioning helper installed" test -x "${ENGINEERING_PASSWORD_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Engineering password provisioning sudoers policy valid" visudo -cf "${ENGINEERING_PASSWORD_SUDOERS_FILE}" || failures=$((failures + 1))
   check_final_requirement "Protectli V1210 hardware" bash -c 'vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null); model=$(cat /sys/class/dmi/id/product_name 2>/dev/null); [[ "${vendor,,}" == *protectli* && "$model" == "V1210" ]]' || failures=$((failures + 1))
   check_final_requirement "SSH active" systemctl is-active --quiet ssh || failures=$((failures + 1))
   check_final_requirement "UFW active" bash -c "ufw status | grep -q 'Status: active'" || failures=$((failures + 1))
@@ -3540,6 +3948,21 @@ final_summary_check() {
   check_final_requirement "SSH root login disabled" bash -c "sshd -T | grep -q '^permitrootlogin no$'" || failures=$((failures + 1))
   check_final_requirement "Restricted field-tech group exists" getent group "${FIELD_TECH_GROUP}" || failures=$((failures + 1))
   check_final_requirement "Engineering group exists" getent group "${ENGINEERING_GROUP}" || failures=$((failures + 1))
+  check_final_requirement "Default engineering account exists" id "${ENGINEERING_USER}" || failures=$((failures + 1))
+  if id "${ENGINEERING_USER}" >/dev/null 2>&1; then
+    check_final_requirement "Default engineering account is in engineering group" bash -c "id -nG '${ENGINEERING_USER}' | tr ' ' '\\n' | grep -qx '${ENGINEERING_GROUP}'" || failures=$((failures + 1))
+    check_final_requirement "Default engineering account has sudo membership" bash -c "id -nG '${ENGINEERING_USER}' | tr ' ' '\\n' | grep -qx sudo" || failures=$((failures + 1))
+    check_final_requirement "Default engineering account is not in field-tech group" bash -c "! id -nG '${ENGINEERING_USER}' | tr ' ' '\\n' | grep -qx '${FIELD_TECH_GROUP}'" || failures=$((failures + 1))
+    check_final_requirement "Default engineering account uses Bash shell" bash -c "[[ "$(getent passwd '${ENGINEERING_USER}' | awk -F: '{print $7}')" == /bin/bash ]]" || failures=$((failures + 1))
+    check_final_requirement "Default engineering account has authorized SSH key" bash -c "test -s \"$(getent passwd '${ENGINEERING_USER}' | awk -F: '{print $6}')/.ssh/authorized_keys\"" || failures=$((failures + 1))
+  fi
+  if id "${TECHNICIAN_USER}" >/dev/null 2>&1; then
+    check_final_requirement "Default technician account is in field-tech group" bash -c "id -nG '${TECHNICIAN_USER}' | tr ' ' '\\n' | grep -qx '${FIELD_TECH_GROUP}'" || failures=$((failures + 1))
+    check_final_requirement "Default technician account does not have engineering shell bypass" bash -c "! id -nG '${TECHNICIAN_USER}' | tr ' ' '\\n' | grep -qx '${ENGINEERING_GROUP}'" || failures=$((failures + 1))
+    check_final_requirement "Default technician account has no unrestricted sudo membership" bash -c "! id -nG '${TECHNICIAN_USER}' | tr ' ' '\\n' | grep -qx sudo" || failures=$((failures + 1))
+  else
+    warning_message "Default technician account ${TECHNICIAN_USER} does not exist; group-based policy remains installed for later technician accounts."
+  fi
   check_final_requirement "Field network menu has no unrestricted Linux shell option" bash -c "! grep -q 'Open Linux shell' '${LOCAL_CONFIG_TOOL}'" || failures=$((failures + 1))
   check_final_requirement "auditd active" systemctl is-active --quiet auditd || failures=$((failures + 1))
   check_final_requirement "Solutionz audit rules installed" test -s "${AUDIT_RULES_FILE}" || failures=$((failures + 1))
@@ -3681,6 +4104,9 @@ main() {
     "security_baseline=${SECURITY_BASELINE_FILE}" \
     "domotz_activation_helper=${DOMOTZ_ACTIVATION_HELPER}" \
     "domotz_activation_config=${DOMOTZ_ACTIVATION_CONFIG}" \
+    "engineering_login=${ENGINEERING_USER}" \
+    "engineering_password_status=pending_engineering_menu_setup" \
+    "engineering_password_provisioning=authenticated_solz_eng_menu_setup_after_phase2" \
     "setup_command=${SETUP_COMMAND}" \
     "log=${LOG_FILE}"
 
@@ -3689,6 +4115,14 @@ main() {
   progress_message "Completion Time: $(date -u +%FT%TZ)"
   progress_message "Hostname: $(hostname)"
   progress_message "Script Revision: ${REVISION}"
+  progress_message "Default technician login: ${TECHNICIAN_USER} (restricted configuration menu)."
+  progress_message "Default engineering login: ${ENGINEERING_USER} (engineering shell + sudo)."
+  if [[ -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
+    progress_message "Engineering password status: configured; existing credential preserved by Setup."
+  else
+    progress_message "Engineering password status: pending authenticated engineering menu provisioning."
+    info_message "Reboot normally. After Phase 2 passes, both technician and engineering interactive logins open the Solutionz RMM configuration menu. Engineering authenticates as ${ENGINEERING_USER} with the configured Solutionz private key, then selects option 9 to create the local engineering password."
+  fi
   progress_message "Network mode after reboot is generated from ${NETWORK_PROFILE_FILE}. Default profile: eth0 WAN DHCP + optional eth1 LAN DHCP with LAN routes/DNS suppressed."
   progress_message "eth0 is WAN/cloud and owns the only default route. eth1 is optional AV/control LAN unless a static LAN or VLAN profile requires it; 802.1Q VLANs, when used, are linked to eth1."
   progress_message "Automatic network validation tool: ${NETWORK_VALIDATOR}"
@@ -3697,9 +4131,12 @@ main() {
   progress_message "State File: ${STATE_FILE}"
   progress_message "Log File: ${LOG_FILE}"
   warning_message "Manual reboot is required. Post-reboot validation will run automatically after restart."
-  info_message "After Phase 2 reaches phase2_system_validated, run: sudo solutionz-rmm-setup --prepare-deployment"
+  info_message "After Phase 2 reaches phase2_system_validated, engineering logs in as ${ENGINEERING_USER} with the Solutionz engineering SSH private key. The same Solutionz RMM menu opens in engineering mode; option 9 performs the one-time local password setup."
+  info_message "Technician account ${TECHNICIAN_USER} cannot create or change the ${ENGINEERING_USER} password and remains restricted to the technician menu."
+  info_message "Deployment preparation is blocked until the engineering password has been provisioned; then run: sudo solutionz-rmm-setup --prepare-deployment"
   info_message "That same Setup source configures and arms Domotz activation for the next boot, then powers the appliance off by default."
-  info_message "USB-C COM recovery/configuration: connect at 115200 8N1 and log in; the WAN/LAN/VLAN menu launches automatically."
+  info_message "Interactive access: ${FIELD_TECH_GROUP} and ${ENGINEERING_GROUP} members both enter the Solutionz RMM configuration menu. Only an authenticated ${ENGINEERING_USER} session can create/change the engineering password or open the unrestricted engineering shell."
+  info_message "USB-C COM recovery/configuration remains available at 115200 8N1."
   info_message "After every network change the script validates WAN eth0, LAN eth1/VLANs, default-route ownership, DNS/Domotz reachability, IPv4 forwarding, firewall/SSH hardening, audit state, and file integrity."
   info_message "Automated VLAN deployment: use --network-profile <json> or network-menu option 3/4 onsite; VLANs are created on eth1."
   info_message "Domotz is not revision-pinned; the installed revision is recorded in ${SNAP_BASELINE_FILE}."

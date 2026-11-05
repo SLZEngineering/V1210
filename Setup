@@ -166,7 +166,7 @@ ENGINEERING_USER="${SOLUTIONZ_RMM_ENGINEERING_USER:-solz_eng}"
 # The private key MUST remain with Solutionz Engineering and MUST NOT be placed
 # in GitHub, this script, an appliance image, a ticket, or technician materials.
 # An environment override is retained for controlled testing/recovery builds.
-ENGINEERING_SSH_PUBLIC_KEY_DEFAULT=""
+ENGINEERING_SSH_PUBLIC_KEY_DEFAULT="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID+1eabf+qtPdaR33oTrQPTl1GV3Ru/1xsFklfa1Sbfv Solutionz RMM Engineering"
 ENGINEERING_SSH_PUBLIC_KEY="${SOLUTIONZ_RMM_ENGINEERING_SSH_PUBLIC_KEY:-${ENGINEERING_SSH_PUBLIC_KEY_DEFAULT}}"
 ENGINEERING_SSH_FINGERPRINT_FILE="${STATE_DIR}/engineering-ssh-key-${REVISION}.fingerprint"
 ENGINEERING_PASSWORD_MARKER="${STATE_DIR}/engineering-password-provisioned"

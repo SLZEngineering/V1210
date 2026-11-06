@@ -1659,29 +1659,62 @@ install_network_profile_tool() {
   install -d -m 755 /usr/local/sbin
   cat > "${NETWORK_PROFILE_TOOL}" <<'PYNETPROFILE'
 #!/usr/bin/env python3
-import argparse, ipaddress, json, os, sys
+import argparse, ipaddress, json, os, re, sys
 from pathlib import Path
 REVISION="V06.100626N"; WAN_IFACE="eth0"; LAN_IFACE="eth1"; MAX_VLANS=32
 class ProfileError(ValueError): pass
 def fail(msg): raise ProfileError(msg)
+def invalid(msg): fail(f"INVALID ADDRESS: {msg}")
+def reject_ipv6_or_malformed(value,label):
+    text=str(value).strip()
+    if ":" not in text:return
+    host=text.split("/",1)[0]
+    try:obj=ipaddress.ip_address(host)
+    except ValueError:invalid(f"{label} contains malformed IPv6 syntax. IPv6 is not enabled in revision {REVISION}.")
+    if obj.version==6:invalid(f"{label} is IPv6. IPv6 is not enabled in revision {REVISION}.")
+def strict_ipv4(value,label):
+    text=str(value).strip()
+    reject_ipv6_or_malformed(text,label)
+    if "/" in text:invalid(f"{label} must be a plain IPv4 address without CIDR notation.")
+    parts=text.split(".")
+    if len(parts)!=4:invalid(f"{label} must contain exactly 4 decimal octets.")
+    for part in parts:
+        if not part or not part.isdigit():invalid(f"{label} must contain only decimal octets 0-255.")
+        if len(part)>1 and part.startswith("0"):invalid(f"{label} must not use leading-zero octets.")
+        if int(part)>255:invalid(f"{label} octets must be between 0 and 255.")
+    try:ip=ipaddress.IPv4Address(text)
+    except ipaddress.AddressValueError:invalid(f"{label} is not a valid IPv4 address.")
+    if ip.is_unspecified:invalid(f"{label} may not be 0.0.0.0.")
+    if ip.is_multicast:invalid(f"{label} may not be multicast.")
+    if ip==ipaddress.IPv4Address("255.255.255.255"):invalid(f"{label} may not be the limited broadcast address.")
+    return ip
+def parse_static(entry,label):
+    address=str(entry.get("address","")).strip()
+    if not address:invalid(f"{label} requires IPv4/CIDR in A.B.C.D/prefix format.")
+    reject_ipv6_or_malformed(address,label)
+    if "/" not in address:invalid(f"{label} is missing CIDR. Enter A.B.C.D/prefix, for example 192.168.50.15/24.")
+    host,prefix=address.rsplit("/",1)
+    ip=strict_ipv4(host,label)
+    if not prefix.isdigit():invalid(f"{label} CIDR prefix must be a number from 1 through 30.")
+    prefix_n=int(prefix)
+    if not 1<=prefix_n<=30:invalid(f"{label} CIDR prefix must be from /1 through /30.")
+    iface=ipaddress.IPv4Interface(f"{ip}/{prefix_n}")
+    if iface.ip in (iface.network.network_address,iface.network.broadcast_address):invalid(f"{label} host address cannot be the subnet network or broadcast address.")
+    return iface
+def validate_gateway(iface,value,label="WAN gateway"):
+    g=strict_ipv4(value,label)
+    if g not in iface.network:invalid(f"{label} {g} must be inside WAN subnet {iface.network}.")
+    if g in (iface.network.network_address,iface.network.broadcast_address):invalid(f"{label} cannot be the WAN network or broadcast address.")
+    if g==iface.ip:invalid(f"{label} cannot be the same address assigned to eth0 ({iface.ip}).")
+    return g
 def normalize_dns(values,label):
     if values is None:return []
     if not isinstance(values,list):fail(f"{label} dns must be a JSON array.")
     out=[]
     for value in values:
-        try: ip=ipaddress.ip_address(str(value).strip())
-        except ValueError: fail(f"{label} contains invalid DNS address: {value}")
-        if ip.version!=4:fail(f"{label} DNS must be IPv4: {value}")
+        ip=strict_ipv4(str(value).strip(),f"{label} DNS")
         out.append(str(ip))
     return out
-def parse_static(entry,label):
-    address=str(entry.get("address","")).strip()
-    if not address:fail(f"{label} static mode requires address in CIDR notation.")
-    try:iface=ipaddress.ip_interface(address)
-    except ValueError:fail(f"{label} has invalid address/CIDR: {address}")
-    if iface.version!=4:fail(f"{label} must use IPv4.")
-    if iface.ip in (iface.network.network_address,iface.network.broadcast_address):fail(f"{label} host address cannot be network/broadcast.")
-    return iface
 def validate_profile(raw):
     if not isinstance(raw,dict):fail("Profile root must be a JSON object.")
     rev=raw.get("revision")
@@ -1696,10 +1729,8 @@ def validate_profile(raw):
     if wm=="static":
         wi=parse_static(wan,"wan")
         if not wg:fail("wan static mode requires gateway.")
-        try:g=ipaddress.ip_address(wg)
-        except ValueError:fail(f"wan has invalid gateway: {wg}")
-        if g.version!=4 or g not in wi.network:fail("wan gateway must be inside WAN subnet.")
-        if not wd:fail("wan static mode requires at least one DNS server.")
+        g=validate_gateway(wi,wg)
+        if not wd:invalid("WAN static mode requires at least one IPv4 DNS server.")
     elif wan.get("address") or wg:fail("wan DHCP mode cannot define address or gateway.")
     lm=str(lan.get("mode","dhcp")).strip().lower(); li=None
     if lm not in {"dhcp","static","none"}:fail("lan.mode must be dhcp, static, or none.")
@@ -1772,18 +1803,35 @@ def choice(prompt,opts,default):
         print("Invalid choice.")
 def cidr(prompt):
     while True:
-        v=input(prompt+": ").strip()
-        try:i=ipaddress.ip_interface(v);assert i.version==4 and i.ip not in (i.network.network_address,i.network.broadcast_address);return str(i)
-        except Exception:print("Enter valid IPv4/CIDR.")
+        v=input(f"{prompt} [A.B.C.D/1-30]: ").strip()
+        try:return str(parse_static({"address":v},prompt))
+        except ProfileError as e:print(e)
 def ipv4(prompt):
     while True:
-        v=input(prompt+": ").strip()
-        try:i=ipaddress.ip_address(v);assert i.version==4;return str(i)
-        except Exception:print("Enter valid IPv4 address.")
+        v=input(f"{prompt} [A.B.C.D]: ").strip()
+        try:return str(strict_ipv4(v,prompt))
+        except ProfileError as e:print(e)
+def gateway(prompt,wan_cidr):
+    iface=parse_static({"address":wan_cidr},"WAN IPv4/CIDR")
+    while True:
+        v=input(f"{prompt} [A.B.C.D; same WAN subnet]: ").strip()
+        try:return str(validate_gateway(iface,v,prompt))
+        except ProfileError as e:print(e)
+def dns_list(prompt):
+    while True:
+        raw=input(f"{prompt} [IPv4, comma separated]: ").strip()
+        values=[x.strip() for x in raw.split(',') if x.strip()]
+        if not values:
+            print("INVALID ADDRESS: At least one IPv4 DNS server is required.");continue
+        try:return normalize_dns(values,"WAN")
+        except ProfileError as e:print(e)
 def wizard(path):
     print("Solutionz dual-homed profile builder - eth0 WAN / eth1 AV LAN")
+    print("Address rules: IPv4 only; exactly 4 octets (0-255); static addresses require CIDR /1-/30. IPv6 is rejected in this revision.")
     wm=choice("WAN eth0 mode",["dhcp","static"],"dhcp");wan={"interface":"eth0","mode":wm,"dns":[]}
-    if wm=="static":wan.update(address=cidr("WAN IPv4/CIDR"),gateway=ipv4("WAN gateway"),dns=[x.strip() for x in input("WAN DNS comma separated: ").split(',') if x.strip()])
+    if wm=="static":
+        wa=cidr("WAN IPv4/CIDR")
+        wan.update(address=wa,gateway=gateway("WAN gateway",wa),dns=dns_list("WAN DNS"))
     lm=choice("LAN eth1 native mode",["dhcp","static","none"],"dhcp");lan={"interface":"eth1","mode":lm}
     if lm=="static":lan["address"]=cidr("LAN eth1 IPv4/CIDR")
     while True:
@@ -1802,9 +1850,23 @@ def main():
     a=argparse.ArgumentParser();sub=a.add_subparsers(dest="cmd",required=True)
     for c in ("validate","default-interface","summary"):q=sub.add_parser(c);q.add_argument("profile")
     q=sub.add_parser("render");q.add_argument("profile");q.add_argument("netplan");q.add_argument("result")
-    q=sub.add_parser("wizard");q.add_argument("profile");args=a.parse_args()
+    q=sub.add_parser("wizard");q.add_argument("profile")
+    q=sub.add_parser("check-cidr");q.add_argument("value")
+    q=sub.add_parser("check-ipv4");q.add_argument("value")
+    q=sub.add_parser("check-dns");q.add_argument("value")
+    q=sub.add_parser("check-gateway");q.add_argument("cidr");q.add_argument("value")
+    args=a.parse_args()
     try:
         if args.cmd=="wizard":wizard(args.profile);return 0
+        if args.cmd=="check-cidr":print(str(parse_static({"address":args.value},"IPv4/CIDR")));return 0
+        if args.cmd=="check-ipv4":print(str(strict_ipv4(args.value,"IPv4 address")));return 0
+        if args.cmd=="check-dns":
+            values=[x.strip() for x in args.value.split(',') if x.strip()]
+            if not values:invalid("At least one IPv4 DNS server is required.")
+            print(",".join(normalize_dns(values,"WAN")));return 0
+        if args.cmd=="check-gateway":
+            iface=parse_static({"address":args.cidr},"WAN IPv4/CIDR")
+            print(str(validate_gateway(iface,args.value)));return 0
         pf=load_profile(args.profile)
         if args.cmd=="validate":print("PASS");return 0
         if args.cmd=="default-interface":print("eth0");return 0
@@ -2577,6 +2639,42 @@ ip4() { ip -o -4 addr show dev "$1" scope global 2>/dev/null | awk 'NR==1 {print
 def() { ip -4 route show default 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'; }
 gw() { ip -4 route show default 2>/dev/null | awk -v i="$1" '$0 ~ (" dev " i "( |$)") {print $3; exit}'; }
 
+prompt_ipv4_cidr() {
+  local __var="$1" prompt="$2" value normalized
+  while true; do
+    read -r -p "$prompt [A.B.C.D/1-30]: " value
+    if normalized="$("$TOOL" check-cidr "$value" 2>&1)"; then
+      printf -v "$__var" '%s' "$normalized"
+      return 0
+    fi
+    echo "$normalized"
+  done
+}
+
+prompt_ipv4_gateway() {
+  local __var="$1" wan_cidr="$2" value normalized
+  while true; do
+    read -r -p "Gateway [A.B.C.D; same WAN subnet]: " value
+    if normalized="$("$TOOL" check-gateway "$wan_cidr" "$value" 2>&1)"; then
+      printf -v "$__var" '%s' "$normalized"
+      return 0
+    fi
+    echo "$normalized"
+  done
+}
+
+prompt_ipv4_dns() {
+  local __var="$1" value normalized
+  while true; do
+    read -r -p "DNS IPv4 comma separated: " value
+    if normalized="$("$TOOL" check-dns "$value" 2>&1)"; then
+      printf -v "$__var" '%s' "$normalized"
+      return 0
+    fi
+    echo "$normalized"
+  done
+}
+
 active_ssh_iface() {
   local client=""
   if [[ -n "${SSH_CONNECTION:-}" ]]; then client="${SSH_CONNECTION%% *}"; fi
@@ -2802,8 +2900,12 @@ else:
 json.dump(p,open(out,'w'),indent=2)
 open(out,'a').write('\n')
 MODIFYPY
-  stage "$tmp"
+  if ! stage "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
   rm -f "$tmp"
+  return 0
 }
 
 wan() {
@@ -2812,12 +2914,18 @@ wan() {
   read -r -p "WAN mode [dhcp/static]: " m
   m="${m:-dhcp}"
   if [[ "$m" == "static" ]]; then
-    read -r -p "WAN IPv4/CIDR: " a
-    read -r -p "Gateway: " g
-    read -r -p "DNS comma separated: " d
-    modify wan "$m" "$a" "$g" "$d"
+    prompt_ipv4_cidr a "WAN IPv4/CIDR"
+    prompt_ipv4_gateway g "$a"
+    prompt_ipv4_dns d
+    if ! modify wan "$m" "$a" "$g" "$d"; then
+      echo "CONFIGURATION REJECTED: address/profile validation failed. Netplan was not applied."
+      return 1
+    fi
   elif [[ "$m" == "dhcp" ]]; then
-    modify wan dhcp
+    if ! modify wan dhcp; then
+      echo "CONFIGURATION REJECTED: profile validation failed. Netplan was not applied."
+      return 1
+    fi
   else
     echo "Invalid WAN mode."
     return 1
@@ -2831,10 +2939,16 @@ lan() {
   read -r -p "LAN native mode [dhcp/static/none]: " m
   m="${m:-dhcp}"
   if [[ "$m" == "static" ]]; then
-    read -r -p "LAN IPv4/CIDR (no gateway): " a
-    modify lan "$m" "$a"
+    prompt_ipv4_cidr a "LAN IPv4/CIDR (no gateway)"
+    if ! modify lan "$m" "$a"; then
+      echo "CONFIGURATION REJECTED: address/profile validation failed. Netplan was not applied."
+      return 1
+    fi
   elif [[ "$m" == "dhcp" || "$m" == "none" ]]; then
-    modify lan "$m"
+    if ! modify lan "$m"; then
+      echo "CONFIGURATION REJECTED: profile validation failed. Netplan was not applied."
+      return 1
+    fi
   else
     echo "Invalid LAN mode."
     return 1
@@ -3019,6 +3133,8 @@ Solutionz RMM Dual-Homed Network Configuration - Revision V06.100626N
 10) Log out
 
 eth0 = WAN/cloud | eth1 = AV/control LAN | VLANs on eth1 | forwarding disabled
+Address entry = IPv4 only in this revision | exactly 4 octets (0-255) | static CIDR /1-/30 | IPv6 rejected
+Invalid address/gateway/DNS input is rejected before profile staging or netplan apply.
 Live detected state comes from the running Linux network stack, not Netplan.
 Netplan remains the persistent configuration mechanism across reboot.
 USB-C COM = independent recovery/configuration path

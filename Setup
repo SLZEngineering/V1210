@@ -2614,6 +2614,7 @@ LOCAL_CONFIG_TOOL="/usr/local/sbin/solutionz-rmm-local-config"
 AUTO=0
 SESSION_MODE="manual"
 ENGINEERING_TOOLS_DIRECT=0
+REGISTER_NEW_DOMOTZ_DIRECT=0
 PRODUCTION_VALIDATION_RESULT="NOT_RUN"
 PRE_NETPLAN_SHA256=""
 PRE_PROFILE_SHA256=""
@@ -2633,14 +2634,19 @@ case "${1:-}" in
     SESSION_MODE="engineering"
     ENGINEERING_TOOLS_DIRECT=1
     ;;
+  --register-new-domotz)
+    AUTO=1
+    SESSION_MODE="engineering"
+    REGISTER_NEW_DOMOTZ_DIRECT=1
+    ;;
   "")
     ;;
   *)
-    echo "Usage: $(basename "$0") [--restricted-login|--engineering-login|--engineering-tools]"
+    echo "Usage: $(basename "$0") [--restricted-login|--engineering-login|--engineering-tools|--register-new-domotz]"
     exit 2
     ;;
 esac
-[[ $# -le 1 ]] || { echo "Usage: $(basename "$0") [--restricted-login|--engineering-login|--engineering-tools]"; exit 2; }
+[[ $# -le 1 ]] || { echo "Usage: $(basename "$0") [--restricted-login|--engineering-login|--engineering-tools|--register-new-domotz]"; exit 2; }
 [[ $EUID -eq 0 ]] || { echo "Run with sudo."; exit 1; }
 
 
@@ -3000,6 +3006,141 @@ saved() {
   stage "$p" && apply saved_profile
 }
 
+profile_iface_info() {
+  local iface="$1"
+  python3 - "$PROFILE" "$iface" <<'PYPROFILE'
+import ipaddress
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+iface = sys.argv[2]
+if not path.exists():
+    print("unconfigured||")
+    raise SystemExit(0)
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    section = data.get("wan", {}) if iface == "eth0" else data.get("lan", {})
+    mode = str(section.get("mode", "unconfigured")).strip().lower() or "unconfigured"
+    address = str(section.get("address", "")).strip()
+    network = ""
+    if address:
+        network = str(ipaddress.ip_interface(address).network)
+    print(f"{mode}|{address}|{network}")
+except Exception:
+    print("invalid||")
+PYPROFILE
+}
+
+nic_status_line() {
+  local iface="$1" role="$2"
+  local carrier="unknown" operstate="unknown" speed="unknown" duplex="unknown"
+  local live_cidr="" live_ip="" live_network="" gateway="" mac="unknown"
+  local profile_mode="unconfigured" expected_cidr="" expected_network="" profile_info=""
+  local link_text="UNKNOWN" speed_text="n/a" profile_text="UNCONFIGURED" match_text=""
+
+  if [[ ! -e "/sys/class/net/${iface}" ]]; then
+    printf '%-4s %-3s | LINK: MISSING INTERFACE\n' "${iface}" "${role}"
+    printf '     LIVE IPv4: NONE | SUBNET: NONE | GATEWAY: NONE\n'
+    printf '     PROFILE: unavailable | STATUS: INTERFACE NOT DETECTED\n'
+    return 0
+  fi
+
+  carrier="$(cat "/sys/class/net/${iface}/carrier" 2>/dev/null || echo unknown)"
+  operstate="$(cat "/sys/class/net/${iface}/operstate" 2>/dev/null || echo unknown)"
+  speed="$(cat "/sys/class/net/${iface}/speed" 2>/dev/null || echo unknown)"
+  duplex="$(cat "/sys/class/net/${iface}/duplex" 2>/dev/null || echo unknown)"
+  mac="$(cat "/sys/class/net/${iface}/address" 2>/dev/null || echo unknown)"
+
+  live_cidr="$(ip -4 -o addr show dev "${iface}" scope global 2>/dev/null | awk 'NR==1 {print $4}')"
+  live_ip="${live_cidr%%/*}"
+  [[ "${live_ip}" == "${live_cidr}" ]] && [[ "${live_cidr}" != */* ]] && live_ip="${live_cidr}"
+  live_network="$(ip -4 route show dev "${iface}" scope link 2>/dev/null | awk '$1 ~ /^[0-9]+\./ && $1 != "default" {print $1; exit}')"
+  gateway="$(ip -4 route show default dev "${iface}" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')"
+
+  [[ -n "${live_cidr}" ]] || live_cidr="NONE"
+  [[ -n "${live_network}" ]] || live_network="NONE"
+  [[ -n "${gateway}" ]] || gateway="NONE"
+
+  case "${carrier}:${operstate}" in
+    1:up|1:unknown) link_text="CONNECTED" ;;
+    1:*) link_text="CONNECTED (${operstate})" ;;
+    0:*) link_text="NO CARRIER - CHECK CABLE/PORT" ;;
+    *) link_text="${operstate^^} / CARRIER ${carrier}" ;;
+  esac
+
+  if [[ "${speed}" =~ ^[0-9]+$ ]] && (( speed > 0 )); then
+    speed_text="${speed} Mb/s ${duplex^}"
+  fi
+
+  profile_info="$(profile_iface_info "${iface}")"
+  IFS='|' read -r profile_mode expected_cidr expected_network <<<"${profile_info}"
+  case "${profile_mode}" in
+    static)
+      profile_text="STATIC ${expected_cidr:-UNKNOWN}"
+      if [[ "${live_cidr}" == "NONE" ]]; then
+        match_text="NO LIVE IPv4 - CHECK LINK/CONFIG"
+      elif [[ "${live_cidr}" == "${expected_cidr}" ]]; then
+        match_text="IP MATCH"
+      elif [[ -n "${expected_network}" && "${live_network}" == "${expected_network}" ]]; then
+        match_text="SUBNET MATCH / IP DIFFERENT"
+      else
+        match_text="SUBNET MISMATCH"
+      fi
+      ;;
+    dhcp)
+      profile_text="DHCP"
+      if [[ "${carrier}" == "0" ]]; then
+        match_text="NO CARRIER"
+      elif [[ "${live_cidr}" == "NONE" ]]; then
+        match_text="LINK UP / NO IPv4 LEASE"
+      else
+        match_text="IPv4 ASSIGNED"
+      fi
+      ;;
+    none)
+      profile_text="UNNUMBERED/TRUNK"
+      if [[ "${carrier}" == "0" ]]; then
+        match_text="NO CARRIER"
+      else
+        match_text="LINK PRESENT"
+      fi
+      ;;
+    invalid)
+      profile_text="INVALID PROFILE"
+      match_text="PROFILE REVIEW REQUIRED"
+      ;;
+    *)
+      profile_text="UNCONFIGURED"
+      if [[ "${carrier}" == "0" ]]; then
+        match_text="NO CARRIER"
+      elif [[ "${live_cidr}" == "NONE" ]]; then
+        match_text="LINK UP / NO IPv4"
+      else
+        match_text="LIVE ADDRESS DETECTED"
+      fi
+      ;;
+  esac
+
+  printf '%-4s %-3s | LINK: %s | SPEED: %s\n' "${iface}" "${role}" "${link_text}" "${speed_text}"
+  printf '     LIVE IPv4: %s | SUBNET: %s | GATEWAY: %s\n' "${live_cidr}" "${live_network}" "${gateway}"
+  printf '     PROFILE: %s | STATUS: %s | MAC: %s\n' "${profile_text}" "${match_text}" "${mac}"
+}
+
+show_nic_banner() {
+  echo
+  echo "============================================================"
+  echo "LIVE NIC / CABLING STATUS"
+  echo "============================================================"
+  nic_status_line eth0 WAN
+  nic_status_line eth1 LAN
+  echo "------------------------------------------------------------"
+  echo "Carrier/speed confirm Ethernet link negotiation; they do not replace cable certification."
+  echo "Static STATUS compares the live address/subnet with the saved Solutionz network profile."
+  echo "============================================================"
+}
+
 show_live() {
   echo
   echo "Scanning live network interfaces..."
@@ -3114,16 +3255,49 @@ SETUPMENU
   done
 }
 
-engineering_tools_entry() {
-  # An already-authenticated engineering session can enter tools immediately.
-  if engineering_session_authenticated; then
-    engineering_access
-    return $?
+engineering_password_transition() {
+  local direct_mode="$1"
+  local invoking_user="${SUDO_USER:-}"
+  local direct_arg
+
+  case "${direct_mode}" in
+    tools) direct_arg="--engineering-tools" ;;
+    register) direct_arg="--register-new-domotz" ;;
+    *) echo "ERROR: invalid engineering transition mode." >&2; return 2 ;;
+  esac
+
+  if [[ ! -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
+    echo "Engineering password has not been provisioned yet."
+    echo "Authenticate as ${ENGINEERING_USER} with the approved Solutionz engineering SSH private key first."
+    return 1
   fi
 
-  # First-time engineering credential creation must still be established with
-  # the Solutionz-held private SSH key. A technician session cannot create it.
-  if [[ ! -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
+  if [[ -z "${invoking_user}" || "${invoking_user}" == "root" ]]; then
+    echo "ERROR: unable to identify a restricted invoking user for local engineering authentication." >&2
+    echo "Log in directly as ${ENGINEERING_USER} with the approved engineering credential." >&2
+    return 1
+  fi
+
+  if ! id -nG "${invoking_user}" 2>/dev/null | tr ' ' '\n' | grep -qx "${FIELD_TECH_GROUP}"; then
+    echo "ERROR: local engineering transition is permitted only from an authenticated technician session." >&2
+    return 1
+  fi
+
+  echo
+  echo "Authenticate as ${ENGINEERING_USER}."
+  echo "The technician session will not inherit engineering privileges."
+  echo
+
+  # Run su as the original technician rather than as root. This forces PAM to
+  # validate the engineering password locally and does not depend on SSH
+  # PasswordAuthentication being enabled.
+  runuser -u "${invoking_user}" -- \
+    /bin/su - "${ENGINEERING_USER}" -c \
+    "sudo -n ${LOCAL_CONFIG_TOOL} ${direct_arg}" || true
+}
+
+engineering_tools_entry() {
+  if engineering_session_authenticated; then
     engineering_access
     return $?
   fi
@@ -3132,18 +3306,88 @@ engineering_tools_entry() {
   echo "============================================================"
   echo "ENGINEERING TOOLS AUTHENTICATION"
   echo "============================================================"
-  echo "Authenticate as ${ENGINEERING_USER} to open the Solutionz RMM engineering tools."
-  echo "The technician session does not receive engineering privileges."
+  engineering_password_transition tools
+}
+
+domotz_register_new_now() {
+  local phase answer rc
+
+  if ! engineering_session_authenticated; then
+    echo "ERROR: NEW Domotz Collector registration requires an authenticated ${ENGINEERING_USER} session." >&2
+    return 81
+  fi
+
+  phase="$(head -n1 "${INSTALL_STATE}" 2>/dev/null || true)"
+  [[ "${phase}" == "phase2_system_validated" ]] || {
+    echo "ERROR: NEW Domotz Collector registration requires phase2_system_validated. Current state: ${phase:-missing}." >&2
+    return 1
+  }
+
+  [[ -x "${DOMOTZ_REGISTRATION_HELPER}" ]] || {
+    echo "ERROR: Domotz registration helper is not installed." >&2
+    return 1
+  }
+
+  echo
+  echo "============================================================"
+  echo "REGISTER NEW DOMOTZ COLLECTOR NOW"
+  echo "============================================================"
+  echo "This action is only for a NEW/unregistered Domotz Collector."
+  echo "It will NOT overwrite or re-register a Collector that is already active."
   echo
 
-  /usr/bin/ssh -tt \
-    -o PreferredAuthentications=password \
-    -o PubkeyAuthentication=no \
-    -o NumberOfPasswordPrompts=3 \
-    -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    "${ENGINEERING_USER}@127.0.0.1" \
-    "sudo -n ${LOCAL_CONFIG_TOOL} --engineering-tools" || true
+  "${DOMOTZ_REGISTRATION_HELPER}" --preflight-new || return $?
+
+  read -r -p "Type REGISTER to configure and register this NEW Collector now: " answer
+  [[ "${answer}" == "REGISTER" ]] || {
+    echo "Domotz registration cancelled."
+    return 0
+  }
+
+  "${DOMOTZ_REGISTRATION_HELPER}" --configure || return $?
+  "${DOMOTZ_REGISTRATION_HELPER}" --arm || return $?
+
+  systemctl enable solutionz-domotz-activate.timer >/dev/null || {
+    echo "ERROR: unable to enable Domotz registration retry timer." >&2
+    return 1
+  }
+
+  echo
+  echo "Attempting Domotz Collector registration now..."
+  set +e
+  "${DOMOTZ_REGISTRATION_HELPER}" --attempt
+  rc=$?
+  set -e
+
+  if (( rc == 0 )); then
+    "${DOMOTZ_REGISTRATION_HELPER}" --check || true
+    return 0
+  fi
+
+  if (( rc == 75 )); then
+    echo "Domotz is not ready/reachable yet. Registration remains armed."
+    echo "The retry timer will attempt registration automatically every two minutes."
+    systemctl enable --now solutionz-domotz-activate.timer >/dev/null || true
+    "${DOMOTZ_REGISTRATION_HELPER}" --check || true
+    return 0
+  fi
+
+  echo "Domotz registration requires engineering review. Automatic duplicate POST attempts remain blocked."
+  "${DOMOTZ_REGISTRATION_HELPER}" --check || true
+  return "${rc}"
+}
+
+engineering_register_entry() {
+  if engineering_session_authenticated; then
+    domotz_register_new_now
+    return $?
+  fi
+
+  echo
+  echo "============================================================"
+  echo "NEW DOMOTZ COLLECTOR - ENGINEERING AUTHENTICATION"
+  echo "============================================================"
+  engineering_password_transition register
 }
 
 engineering_access() {
@@ -3155,9 +3399,7 @@ engineering_access() {
   if ! engineering_session_authenticated; then
     if [[ -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
       echo "Engineering password is already provisioned."
-      echo "Enter the engineering password to open an authenticated engineering session."
-      echo
-      /usr/bin/ssh -tt         -o PreferredAuthentications=password         -o PubkeyAuthentication=no         -o NumberOfPasswordPrompts=3         -o StrictHostKeyChecking=no         -o UserKnownHostsFile=/dev/null         "${ENGINEERING_USER}@127.0.0.1" || true
+      engineering_password_transition tools
     else
       local wan_ip
       wan_ip="$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)"
@@ -3200,8 +3442,9 @@ Engineering Session
 2) Change solz_eng password
 3) Configure and arm automatic Domotz registration for next boot (keep powered on)
 4) Show Domotz registration status
-5) Open Solutionz RMM Setup / Deployment Script
-6) Return to Solutionz RMM configuration menu
+5) Register NEW Domotz Collector Now
+6) Open Solutionz RMM Setup / Deployment Script
+7) Return to Solutionz RMM configuration menu
 ENGMENU
     read -r -p "Engineering selection: " ec
     case "${ec}" in
@@ -3231,9 +3474,12 @@ ENGMENU
         fi
         ;;
       5)
-        setup_script_menu
+        domotz_register_new_now || true
         ;;
       6)
+        setup_script_menu
+        ;;
+      7)
         return 0
         ;;
       *)
@@ -3252,12 +3498,17 @@ if (( ENGINEERING_TOOLS_DIRECT == 1 )); then
   exit 0
 fi
 
-echo
-echo "AUTO-DETECT CURRENT NETWORK"
-echo "------------------------------------------------"
-show_live
+if (( REGISTER_NEW_DOMOTZ_DIRECT == 1 )); then
+  if ! engineering_session_authenticated; then
+    echo "ERROR: --register-new-domotz requires an authenticated ${ENGINEERING_USER} session." >&2
+    exit 81
+  fi
+  domotz_register_new_now
+  exit $?
+fi
 
 while true; do
+  show_nic_banner
   cat <<'MENU'
 
 Solutionz RMM Dual-Homed Network Configuration - Revision V06.100626N
@@ -3272,6 +3523,7 @@ Solutionz RMM Dual-Homed Network Configuration - Revision V06.100626N
 9) Engineering Login / Password Setup
 10) Log out
 11) Engineering Tools / Setup Script (engineering authentication required)
+12) Register NEW Domotz Collector Now (engineering authentication required)
 
 eth0 = WAN/cloud | eth1 = AV/control LAN | VLANs on eth1 | forwarding disabled
 Address entry = IPv4 only in this revision | exactly 4 octets (0-255) | static CIDR /1-/30 | IPv6 rejected
@@ -3299,6 +3551,7 @@ MENU
     9) engineering_access ;;
     10) if (( AUTO )); then exit 90; else exit 0; fi ;;
     11) engineering_tools_entry ;;
+    12) engineering_register_entry || true ;;
     *) echo "Invalid selection." ;;
   esac
 done
@@ -3963,6 +4216,30 @@ def mark_registration_complete(c: dict, status: str) -> None:
     disable_registration_timer(status)
 
 
+def preflight_new():
+    try:
+        status = local_status(timeout=8)
+    except Exception as e:
+        print(f'ERROR: local Domotz API is not ready: {type(e).__name__}: {e}', file=sys.stderr)
+        return 75
+
+    mode = str(status.get('mode', ''))
+    agent_version = str(status.get('agent_version', ''))
+    print(f'Local collector mode: {mode or "unknown"}')
+    print(f'Local collector version: {agent_version or "unknown"}')
+
+    if mode != 'RESTRICTED':
+        print('ERROR: this Domotz Collector is already configured/registered. No NEW registration will be allowed.', file=sys.stderr)
+        return 3
+
+    if version_tuple(agent_version) < (3, 3, 0):
+        print('ERROR: Collector version is older than the supported registration minimum.', file=sys.stderr)
+        return 2
+
+    print('PASS: Collector is unregistered (RESTRICTED) and eligible for NEW registration.')
+    return 0
+
+
 def configure():
     print('Solutionz Domotz collector registration configuration')
     print('The Collector Activation Key is stored root-only and scrubbed after an accepted registration.')
@@ -4233,6 +4510,7 @@ def main():
     g.add_argument('--disarm', action='store_true')
     g.add_argument('--check', action='store_true')
     g.add_argument('--attempt', action='store_true')
+    g.add_argument('--preflight-new', action='store_true')
     g.add_argument('--reset-result', action='store_true')
     a = p.parse_args()
     try:
@@ -4244,6 +4522,8 @@ def main():
             arm(False); return 0
         if a.check:
             return check()
+        if a.preflight_new:
+            return preflight_new()
         if a.reset_result:
             reset_result(); return 0
         return attempt()
@@ -4456,6 +4736,8 @@ final_summary_check() {
   check_final_requirement "Technician access profile launches restricted-login mode" grep -q -- '--restricted-login' "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Engineering access profile launches engineering-login mode" grep -q -- '--engineering-login' "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Network menu provides authenticated engineering-tools transition" grep -q -- '--engineering-tools' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Network menu displays live eth0/eth1 IP and cabling banner" grep -q 'LIVE NIC / CABLING STATUS' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Network menu provides engineering-only NEW Domotz registration" grep -q -- '--register-new-domotz' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "SSH field-tech policy excludes engineering group" grep -q '^Match Group solutionz-rmm-tech,!solutionz-rmm-engineering$' "${SSH_HARDENING_FILE}" || failures=$((failures + 1))
   check_final_requirement "Local config sudoers policy installed" test -s "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
   check_final_requirement "Local config sudoers policy valid" visudo -cf "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))

@@ -4082,6 +4082,60 @@ def version_tuple(value: str):
     return tuple(nums)
 
 
+def snap_collector_version():
+    """Return the installed Domotz Snap version when available."""
+    try:
+        cp = subprocess.run(
+            ['snap', 'list', 'domotzpro-agent-publicstore'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if cp.returncode == 0:
+            lines = [line.strip() for line in cp.stdout.splitlines() if line.strip()]
+            if len(lines) >= 2:
+                fields = lines[1].split()
+                if len(fields) >= 2 and fields[1] not in {'-', 'unknown'}:
+                    return fields[1]
+    except Exception:
+        pass
+    return ''
+
+
+def resolve_collector_version(status: dict):
+    """Resolve collector version from known status schemas, then Snap metadata.
+
+    Domotz documents agent_version in /api/v1/status, but some collector builds
+    may omit or rename that field. Do not turn a missing informational field
+    into a destructive/terminal registration failure.
+    """
+    candidates = (
+        'agent_version',
+        'agentVersion',
+        'collector_version',
+        'collectorVersion',
+        'version',
+    )
+    if isinstance(status, dict):
+        for key in candidates:
+            value = status.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                return str(value).strip(), f'local-status:{key}'
+        for parent in ('agent', 'collector', 'info', 'data'):
+            nested = status.get(parent)
+            if isinstance(nested, dict):
+                for key in candidates:
+                    value = nested.get(key)
+                    if isinstance(value, (str, int, float)) and str(value).strip():
+                        return str(value).strip(), f'local-status:{parent}.{key}'
+    snap_version = snap_collector_version()
+    if snap_version:
+        return snap_version, 'snap-list'
+    return '', 'unresolved'
+
+
 def validate_endpoint(endpoint: str):
     u = urllib.parse.urlparse(endpoint)
     if u.scheme != 'https' or not u.hostname:
@@ -4224,14 +4278,18 @@ def preflight_new():
         return 75
 
     mode = str(status.get('mode', ''))
-    agent_version = str(status.get('agent_version', ''))
+    agent_version, version_source = resolve_collector_version(status)
     print(f'Local collector mode: {mode or "unknown"}')
     print(f'Local collector version: {agent_version or "unknown"}')
+    print(f'Collector version source: {version_source}')
 
     if mode != 'RESTRICTED':
         print('ERROR: this Domotz Collector is already configured/registered. No NEW registration will be allowed.', file=sys.stderr)
         return 3
 
+    if not agent_version:
+        print('WAIT: Collector version is not yet available from the local API or Snap metadata; retry later.', file=sys.stderr)
+        return 75
     if version_tuple(agent_version) < (3, 3, 0):
         print('ERROR: Collector version is older than the supported registration minimum.', file=sys.stderr)
         return 2
@@ -4339,8 +4397,13 @@ def check():
         print(f"Result reason: {r.get('reason')}")
     try:
         s = local_status(timeout=5)
+        resolved_version, version_source = resolve_collector_version(s)
         print(f"Local collector mode: {s.get('mode', 'unknown')}")
-        print(f"Local collector version: {s.get('agent_version', 'unknown')}")
+        print(f"Local collector version: {resolved_version or 'unknown'}")
+        print(f"Collector version source: {version_source}")
+        if not resolved_version:
+            visible_keys = ', '.join(sorted(str(k) for k in s.keys()))
+            print(f"Local status fields: {visible_keys or 'none'}")
     except Exception as e:
         print(f'Local collector status: unavailable ({type(e).__name__})')
     return 0
@@ -4395,18 +4458,23 @@ def attempt():
         return 75
 
     mode = str(status.get('mode', ''))
-    agent_version = str(status.get('agent_version', ''))
+    agent_version, version_source = resolve_collector_version(status)
     if mode != 'RESTRICTED':
         atomic_json(RESULT, {
             'status': 'existing_configuration_review',
             'reason': 'collector_not_restricted',
             'collector_mode': mode or 'unknown',
             'agent_version': agent_version or 'unknown',
+            'version_source': version_source,
             'timestamp_utc': utcnow(),
         })
         print('Collector is not in RESTRICTED mode. No registration POST was sent.')
         pause_registration(c, 'collector is already configured')
         return 0
+
+    if not agent_version:
+        print('Collector version is not yet available from the local API or Snap metadata; retry later.', file=sys.stderr)
+        return 75
 
     vt = version_tuple(agent_version)
     if vt < (3, 3, 0):
@@ -4414,6 +4482,7 @@ def attempt():
             'status': 'review_required',
             'reason': 'unsupported_collector_version',
             'agent_version': agent_version or 'unknown',
+            'version_source': version_source,
             'timestamp_utc': utcnow(),
         })
         print('Collector version is older than the supported command-line registration minimum.', file=sys.stderr)
@@ -4424,6 +4493,7 @@ def attempt():
             'status': 'review_required',
             'reason': 'scanning_flag_requires_newer_collector',
             'agent_version': agent_version or 'unknown',
+            'version_source': version_source,
             'timestamp_utc': utcnow(),
         })
         print('Scanning-disabled registration requires Collector 3.9.3 or newer.', file=sys.stderr)
@@ -4444,6 +4514,7 @@ def attempt():
         'status': 'submission_started',
         'collector_name': c['name'],
         'agent_version': agent_version or 'unknown',
+        'version_source': version_source,
         'timestamp_utc': utcnow(),
     })
 
@@ -4471,6 +4542,7 @@ def attempt():
             'status': final_status,
             'collector_name': c['name'],
             'agent_version': agent_version or 'unknown',
+            'version_source': version_source,
             'http_status': code,
             'collector_mode_after_request': str(post_status.get('mode', 'unknown')),
             'response': response_body[:4096],
@@ -4494,6 +4566,7 @@ def attempt():
             'reason': 'post_submission_error_or_uncertain_response',
             'collector_name': c['name'],
             'agent_version': agent_version or 'unknown',
+            'version_source': version_source,
             'detail': detail[:4096],
             'timestamp_utc': utcnow(),
         })
@@ -4614,6 +4687,10 @@ activation_status() {
   echo "------------------------------------------------------------"
   echo "Activation timer enabled: $(systemctl is-enabled solutionz-domotz-activate.timer 2>/dev/null || echo no)"
   echo "Activation timer active:  $(systemctl is-active solutionz-domotz-activate.timer 2>/dev/null || echo no)"
+  echo "Activation service active: $(systemctl is-active solutionz-domotz-activate.service 2>/dev/null || echo inactive)"
+  echo "Activation service result: $(systemctl show solutionz-domotz-activate.service -p Result --value 2>/dev/null || echo unknown)"
+  echo "Activation service exit:   $(systemctl show solutionz-domotz-activate.service -p ExecMainStatus --value 2>/dev/null || echo unknown)"
+  echo "Activation timer next:     $(systemctl list-timers solutionz-domotz-activate.timer --all --no-legend 2>/dev/null | awk '{print $1, $2, $3, $4}' | head -n1)"
 }
 
 prepare_deployment() {

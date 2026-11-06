@@ -10,11 +10,13 @@ set -Eeuo pipefail
 # Security Hardening Update: 2026-11-03
 # Live Network Discovery Update: 2026-11-03
 # Integrated Domotz Activation Update: 2026-11-04
+# Automated Domotz Registration Hardening Update: 2026-11-06
 # Optional LAN / UFW sysctl persistence / network-validator NTP update: 2026-11-04
 # Default engineering account / login-policy update: 2026-11-04
 # Post-reboot unified menu + engineering credential provisioning update: 2026-11-05
 # Engineering-key protected credential provisioning update: 2026-11-05
 # Production engineering-key preflight/fingerprint validation update: 2026-11-05
+# Embedded Domotz deployment credential update: 2026-11-06
 #
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
@@ -111,6 +113,17 @@ SUPPORTED_MODEL="V1210"
 # governed operationally rather than by hard-coding a revision in this script.
 DOMOTZ_SNAP_NAME="domotzpro-agent-publicstore"
 
+# Domotz collector deployment credential. This TEST credential is intentionally
+# embedded for the current development/imaging workflow. Before production,
+# replace it with a dedicated production Collector Activation Key and restrict
+# repository access. The installed on-box Setup copy is sanitized automatically.
+DOMOTZ_PUBLIC_ENDPOINT_DEFAULT="https://api-us-east-1-cell-1.domotz.com/public-api/v1/"
+DOMOTZ_COLLECTOR_ACTIVATION_KEY_NAME_DEFAULT="Solutionz RMM V1210 Deployment"
+DOMOTZ_COLLECTOR_ACTIVATION_KEY_DEFAULT="klfmqv7SQBht68RjZydlqhkS5BBP8btaKCQpcEm6jpw"
+DOMOTZ_PUBLIC_ENDPOINT="${SOLUTIONZ_RMM_DOMOTZ_PUBLIC_ENDPOINT:-${DOMOTZ_PUBLIC_ENDPOINT_DEFAULT}}"
+DOMOTZ_COLLECTOR_ACTIVATION_KEY_NAME="${SOLUTIONZ_RMM_DOMOTZ_ACTIVATION_KEY_NAME:-${DOMOTZ_COLLECTOR_ACTIVATION_KEY_NAME_DEFAULT}}"
+DOMOTZ_COLLECTOR_ACTIVATION_KEY="${SOLUTIONZ_RMM_DOMOTZ_ACTIVATION_KEY:-${DOMOTZ_COLLECTOR_ACTIVATION_KEY_DEFAULT}}"
+
 LOG_DIR="/var/log/solutionz-rmm/setup"
 RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG_FILE="${LOG_DIR}/install-${REVISION}-${RUN_TIMESTAMP}.log"
@@ -200,6 +213,7 @@ DOMOTZ_ACTIVATION_TIMER="/etc/systemd/system/solutionz-domotz-activate.timer"
 DOMOTZ_ACTIVATION_CONFIG="/etc/solutionz-rmm/domotz-activation.json"
 DOMOTZ_ACTIVATION_STATE_DIR="/var/lib/solutionz-domotz-activation"
 DOMOTZ_ACTIVATION_RESULT="${DOMOTZ_ACTIVATION_STATE_DIR}/result.json"
+DOMOTZ_PROVISIONING_DEFAULTS="/etc/solutionz-rmm/domotz-provisioning-defaults.json"
 SETUP_COMMAND="/usr/local/sbin/solutionz-rmm-setup"
 
 NON_INTERACTIVE=0
@@ -1437,6 +1451,12 @@ configure_security_hardening() {
   install -d -m 750 /usr/local/share/solutionz-rmm
   if [[ -r "$0" ]]; then
     install -o root -g root -m 640 "$0" "${INSTALLED_SCRIPT_COPY}"
+    # The source used by the imaging workflow may contain a Collector Activation
+    # Key. Never preserve that plaintext credential in the installed Setup copy.
+    sed -i -E 's|^DOMOTZ_COLLECTOR_ACTIVATION_KEY_DEFAULT=.*$|DOMOTZ_COLLECTOR_ACTIVATION_KEY_DEFAULT=""|' "${INSTALLED_SCRIPT_COPY}"
+    if [[ -n "${DOMOTZ_COLLECTOR_ACTIVATION_KEY}" ]] && printf '%s\n' "${DOMOTZ_COLLECTOR_ACTIVATION_KEY}" | grep -Fqf - "${INSTALLED_SCRIPT_COPY}"; then
+      error_exit "Unable to sanitize the Domotz Collector Activation Key from the installed Setup copy."
+    fi
   else
     warning_message "Unable to preserve an installed copy of the setup script for integrity validation."
   fi
@@ -2588,6 +2608,8 @@ ENGINEERING_USER="solz_eng"
 ENGINEERING_GROUP="solutionz-rmm-engineering"
 ENGINEERING_PASSWORD_TOOL="/usr/local/sbin/solutionz-rmm-engineering-password-setup"
 ENGINEERING_PASSWORD_MARKER="/var/lib/rswsolutionz-rmm/engineering-password-provisioned"
+SETUP_COMMAND="/usr/local/sbin/solutionz-rmm-setup"
+DOMOTZ_REGISTRATION_HELPER="/usr/local/sbin/solutionz-domotz-activate"
 AUTO=0
 SESSION_MODE="manual"
 PRODUCTION_VALIDATION_RESULT="NOT_RUN"
@@ -3089,7 +3111,9 @@ engineering_access() {
 Engineering Session
 1) Open engineering shell
 2) Change solz_eng password
-3) Return to Solutionz RMM configuration menu
+3) Configure and arm automatic Domotz registration for next boot (keep powered on)
+4) Show Domotz registration status
+5) Return to Solutionz RMM configuration menu
 ENGMENU
     read -r -p "Engineering selection: " ec
     case "${ec}" in
@@ -3103,6 +3127,22 @@ ENGMENU
         "${ENGINEERING_PASSWORD_TOOL}" --change || true
         ;;
       3)
+        if [[ -x "${SETUP_COMMAND}" ]]; then
+          "${SETUP_COMMAND}" --prepare-deployment --no-poweroff || true
+        else
+          echo "ERROR: ${SETUP_COMMAND} is not installed." >&2
+        fi
+        ;;
+      4)
+        if [[ -x "${SETUP_COMMAND}" ]]; then
+          "${SETUP_COMMAND}" --activation-status || true
+        elif [[ -x "${DOMOTZ_REGISTRATION_HELPER}" ]]; then
+          "${DOMOTZ_REGISTRATION_HELPER}" --check || true
+        else
+          echo "ERROR: Domotz registration helper is not installed." >&2
+        fi
+        ;;
+      5)
         return 0
         ;;
       *)
@@ -3588,9 +3628,35 @@ EOF
 }
 
 install_domotz_activation() {
-  step_message 17 "Install integrated Domotz activation workflow"
+  step_message 17 "Install integrated Domotz automatic registration workflow"
 
   install -d -m 750 /etc/solutionz-rmm "${DOMOTZ_ACTIVATION_STATE_DIR}"
+
+  # Stage the reusable deployment credential in a root-only defaults file so
+  # engineers do not have to type the activation key for each appliance. The
+  # helper copies it into the per-collector registration config and deletes this
+  # defaults file after successful registration. The secret is never logged.
+  local _domotz_registration_complete=0
+  if [[ -s "${DOMOTZ_ACTIVATION_CONFIG}" ]] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); raise SystemExit(0 if d.get("registration_complete") is True else 1)' "${DOMOTZ_ACTIVATION_CONFIG}" >/dev/null 2>&1; then
+    _domotz_registration_complete=1
+  fi
+  if (( _domotz_registration_complete == 1 )); then
+    rm -f "${DOMOTZ_PROVISIONING_DEFAULTS}"
+    progress_message "Domotz registration is already complete; deployment credential was not restaged on this appliance."
+  elif [[ -n "${DOMOTZ_COLLECTOR_ACTIVATION_KEY}" ]]; then
+    umask 077
+    printf '%s\n%s\n%s\n' \
+      "${DOMOTZ_PUBLIC_ENDPOINT}" \
+      "${DOMOTZ_COLLECTOR_ACTIVATION_KEY_NAME}" \
+      "${DOMOTZ_COLLECTOR_ACTIVATION_KEY}" | \
+      python3 -c 'import json, os, sys, tempfile; p=sys.argv[1]; endpoint=sys.stdin.readline().rstrip("\n"); key_name=sys.stdin.readline().rstrip("\n"); key=sys.stdin.readline().rstrip("\n"); d={"schema_version":1,"endpoint":endpoint,"activation_key_name":key_name,"activation_key":key}; fd,tmp=tempfile.mkstemp(prefix=os.path.basename(p)+".",dir=os.path.dirname(p)); f=os.fdopen(fd,"w",encoding="utf-8"); json.dump(d,f,indent=2,sort_keys=True); f.write("\n"); f.flush(); os.fsync(f.fileno()); f.close(); os.chmod(tmp,0o600); os.replace(tmp,p)' "${DOMOTZ_PROVISIONING_DEFAULTS}" || \
+      error_exit "Unable to stage the Domotz provisioning credential."
+    chown root:root "${DOMOTZ_PROVISIONING_DEFAULTS}"
+    chmod 600 "${DOMOTZ_PROVISIONING_DEFAULTS}"
+    progress_message "Domotz deployment credential staged securely (${DOMOTZ_COLLECTOR_ACTIVATION_KEY_NAME}); secret value not logged."
+  else
+    warning_message "No embedded Domotz Collector Activation Key is configured; engineering will be prompted during deployment preparation."
+  fi
 
   cat > "${DOMOTZ_ACTIVATION_HELPER}" <<'PYACTIVATION'
 #!/usr/bin/env python3
@@ -3600,24 +3666,35 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 CONFIG = Path('/etc/solutionz-rmm/domotz-activation.json')
+DEFAULTS = Path('/etc/solutionz-rmm/domotz-provisioning-defaults.json')
 STATE_DIR = Path('/var/lib/solutionz-domotz-activation')
 RESULT = STATE_DIR / 'result.json'
 LOCAL_STATUS = 'http://127.0.0.1:3000/api/v1/status'
 LOCAL_AGENT = 'http://127.0.0.1:3000/api/v1/agent'
+TIMER_UNIT = 'solutionz-domotz-activate.timer'
+SERVICE_UNIT = 'solutionz-domotz-activate.service'
 TERMINAL_STATUSES = {
+    'registration_verified',
     'activation_request_accepted',
     'existing_configuration_review',
     'submission_started',
     'review_required',
 }
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def atomic_json(path: Path, data: dict, mode: int = 0o600) -> None:
@@ -3655,24 +3732,45 @@ def validate_endpoint(endpoint: str):
     if u.scheme != 'https' or not u.hostname:
         raise ValueError('Domotz API endpoint must be an https:// URL.')
     if '/public-api/' not in (u.path or ''):
-        raise ValueError('Domotz API endpoint must be the Public API endpoint supplied with the activation key.')
+        raise ValueError('Domotz API endpoint must be the Public API endpoint supplied with the Collector Activation Key.')
     return u
 
 
 def validate_config(c: dict):
     if not isinstance(c, dict):
-        raise ValueError('Activation configuration must be a JSON object.')
-    for key in ('enabled', 'name', 'endpoint', 'activation_key', 'deny_all_interfaces'):
+        raise ValueError('Registration configuration must be a JSON object.')
+    for key in ('enabled', 'name', 'endpoint', 'deny_all_interfaces'):
         if key not in c:
-            raise ValueError(f'Missing activation configuration field: {key}')
+            raise ValueError(f'Missing registration configuration field: {key}')
     if not isinstance(c['enabled'], bool) or not isinstance(c['deny_all_interfaces'], bool):
         raise ValueError('enabled and deny_all_interfaces must be JSON booleans.')
     if not isinstance(c['name'], str) or not c['name'].strip():
         raise ValueError('Collector name is required.')
-    if not isinstance(c['activation_key'], str) or not c['activation_key'].strip():
-        raise ValueError('Collector Activation Key is required.')
     validate_endpoint(c['endpoint'])
+    complete = bool(c.get('registration_complete', False))
+    key = c.get('activation_key', '')
+    if not complete and (not isinstance(key, str) or not key.strip()):
+        raise ValueError('Collector Activation Key is required until registration completes.')
+    if complete and key not in ('', None):
+        raise ValueError('Registration is marked complete but the activation key has not been scrubbed.')
+    c.setdefault('schema_version', 2)
+    c.setdefault('registration_complete', False)
     return c
+
+
+def read_provisioning_defaults():
+    if not DEFAULTS.exists():
+        return None
+    d = load_json(DEFAULTS)
+    if not isinstance(d, dict):
+        raise ValueError('Domotz provisioning defaults must be a JSON object.')
+    endpoint = str(d.get('endpoint', '')).strip()
+    key = str(d.get('activation_key', '')).strip()
+    key_name = str(d.get('activation_key_name', '')).strip() or 'embedded deployment credential'
+    validate_endpoint(endpoint)
+    if not key:
+        raise ValueError('Domotz provisioning defaults do not contain a Collector Activation Key.')
+    return {'endpoint': endpoint, 'activation_key': key, 'activation_key_name': key_name}
 
 
 def read_config():
@@ -3693,7 +3791,7 @@ def read_result():
 
 
 def local_status(timeout=12):
-    req = urllib.request.Request(LOCAL_STATUS, method='GET')
+    req = urllib.request.Request(LOCAL_STATUS, headers={'Accept': 'application/json'}, method='GET')
     with urllib.request.urlopen(req, timeout=timeout) as r:
         raw = r.read(65536)
     data = json.loads(raw.decode('utf-8'))
@@ -3720,39 +3818,122 @@ def cloud_preflight(endpoint: str, timeout=7):
     raise OSError(f'Unable to connect to {u.hostname}:{port}: {last}')
 
 
+def disable_registration_timer(reason: str) -> None:
+    try:
+        cp = subprocess.run(
+            ['systemctl', 'disable', '--now', TIMER_UNIT],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if cp.returncode == 0:
+            print(f'Domotz automatic registration timer disabled: {reason}.')
+        else:
+            detail = (cp.stderr or '').strip().splitlines()[-1:] or ['unknown systemctl error']
+            print(f'WARNING: unable to disable {TIMER_UNIT}: {detail[0]}', file=sys.stderr)
+    except Exception as e:
+        print(f'WARNING: unable to disable {TIMER_UNIT}: {type(e).__name__}: {e}', file=sys.stderr)
+
+
+def pause_registration(c: dict, reason: str) -> None:
+    c['enabled'] = False
+    c['paused_utc'] = utcnow()
+    c['pause_reason'] = reason
+    atomic_json(CONFIG, c)
+    disable_registration_timer(reason)
+
+
+def mark_registration_complete(c: dict, status: str) -> None:
+    c['enabled'] = False
+    c['registration_complete'] = True
+    c['activation_key'] = ''
+    c['registered_utc'] = utcnow()
+    c['registration_status'] = status
+    c.pop('pause_reason', None)
+    c.pop('paused_utc', None)
+    atomic_json(CONFIG, c)
+    try:
+        DEFAULTS.unlink()
+    except FileNotFoundError:
+        pass
+    disable_registration_timer(status)
+
+
 def configure():
-    print('Solutionz Domotz activation configuration')
-    print('The activation key is hidden and is never written to the setup log.')
-    name = input('Collector name: ').strip()
-    endpoint = input('Domotz API endpoint (include https:// and /public-api/v1/): ').strip()
-    key = getpass.getpass('Collector Activation Key: ').strip()
-    deny = input('Keep network scanning disabled after activation? [y/N]: ').strip().lower() in {'y', 'yes'}
+    print('Solutionz Domotz collector registration configuration')
+    print('The Collector Activation Key is stored root-only and scrubbed after an accepted registration.')
+    defaults = read_provisioning_defaults()
+    default_name = socket.gethostname().strip()
+    prompt = f'Collector name [{default_name}]: ' if default_name else 'Collector name: '
+    name = input(prompt).strip() or default_name
+    if defaults:
+        endpoint = defaults['endpoint']
+        key = defaults['activation_key']
+        key_name = defaults['activation_key_name']
+        print(f'Domotz API endpoint: {endpoint} (preconfigured)')
+        print(f'Collector Activation Key: PRECONFIGURED ({key_name})')
+    else:
+        endpoint = input('Domotz API endpoint (include https:// and /public-api/v1/): ').strip()
+        key = getpass.getpass('Collector Activation Key: ').strip()
+        key_name = 'manually entered'
+    deny = input('Keep network scanning disabled after registration? [y/N]: ').strip().lower() in {'y', 'yes'}
     c = {
+        'schema_version': 2,
         'enabled': False,
+        'registration_complete': False,
         'name': name,
         'endpoint': endpoint,
         'activation_key': key,
+        'activation_key_name': key_name,
         'deny_all_interfaces': deny,
+        'configured_utc': utcnow(),
     }
     validate_config(c)
     atomic_json(CONFIG, c)
-    print(f'Configuration saved securely to {CONFIG}. Activation remains DISARMED.')
+    try:
+        RESULT.unlink()
+    except FileNotFoundError:
+        pass
+    print(f'Registration configuration saved securely to {CONFIG}. Registration remains DISARMED.')
+
+
+def reset_result():
+    c = read_config()
+    if c is None:
+        raise RuntimeError('Registration configuration does not exist.')
+    if c.get('registration_complete'):
+        raise RuntimeError('Registration is already complete; create a new registration configuration instead of resetting the result.')
+    try:
+        RESULT.unlink()
+    except FileNotFoundError:
+        pass
+    c['enabled'] = False
+    c.pop('pause_reason', None)
+    c.pop('paused_utc', None)
+    atomic_json(CONFIG, c)
+    print('Domotz registration result cleared. Registration remains DISARMED until explicitly armed.')
 
 
 def arm(enabled: bool):
     c = read_config()
     if c is None:
-        raise RuntimeError('Activation configuration does not exist. Run --configure first.')
+        raise RuntimeError('Registration configuration does not exist. Run --configure first.')
+    if c.get('registration_complete'):
+        raise RuntimeError('This collector registration is already complete. Reconfiguration is required before a new registration can be armed.')
     existing = read_result()
     if enabled and existing and existing.get('status') in TERMINAL_STATUSES:
-        raise RuntimeError(f"Activation result already requires review: {existing.get('status')}. Refusing to arm automatically.")
+        raise RuntimeError(f"Registration result requires review: {existing.get('status')}. Run --reset-result only after engineering review, or run --configure to replace the registration data.")
     c['enabled'] = enabled
+    if enabled:
+        c['armed_utc'] = utcnow()
     atomic_json(CONFIG, c)
-    print('Domotz activation ARMED for a future boot.' if enabled else 'Domotz activation DISARMED.')
+    print('Domotz automatic registration ARMED for a future boot.' if enabled else 'Domotz automatic registration DISARMED.')
 
 
 def check():
-    print('Solutionz Domotz activation status')
+    print('Solutionz Domotz collector registration status')
     print(f'Configuration: {CONFIG}')
     try:
         c = read_config()
@@ -3763,13 +3944,20 @@ def check():
         print('Configuration: NOT CREATED')
     else:
         mode = oct(CONFIG.stat().st_mode & 0o777)
+        key_state = 'SCRUBBED' if c.get('registration_complete') else ('PRESENT' if c.get('activation_key') else 'MISSING')
         print(f"Collector name: {c['name']}")
         print(f"Endpoint: {c['endpoint']}")
+        if c.get('activation_key_name'):
+            print(f"Activation key label: {c['activation_key_name']}")
         print(f"Armed: {c['enabled']}")
-        print(f"Scanning disabled after activation: {c['deny_all_interfaces']}")
+        print(f"Registration complete: {bool(c.get('registration_complete'))}")
+        print(f"Activation key state: {key_state}")
+        print(f"Scanning disabled after registration: {c['deny_all_interfaces']}")
         print(f'Config permissions: {mode}')
     r = read_result()
     print(f"Result: {r.get('status') if r else 'none'}")
+    if r and r.get('reason'):
+        print(f"Result reason: {r.get('reason')}")
     try:
         s = local_status(timeout=5)
         print(f"Local collector mode: {s.get('mode', 'unknown')}")
@@ -3779,23 +3967,46 @@ def check():
     return 0
 
 
+def verify_after_submission(attempts=12, delay=5):
+    last = None
+    for _ in range(attempts):
+        try:
+            last = local_status(timeout=5)
+            if str(last.get('mode', '')) != 'RESTRICTED':
+                return True, last
+        except Exception:
+            pass
+        time.sleep(delay)
+    return False, last or {}
+
+
 def attempt():
     try:
         c = read_config()
     except Exception as e:
-        atomic_json(RESULT, {'status': 'review_required', 'reason': 'invalid_configuration', 'detail': str(e)})
-        print(f'Activation configuration invalid: {e}', file=sys.stderr)
+        atomic_json(RESULT, {'status': 'review_required', 'reason': 'invalid_configuration', 'detail': str(e), 'timestamp_utc': utcnow()})
+        print(f'Registration configuration invalid: {e}', file=sys.stderr)
+        disable_registration_timer('invalid configuration')
         return 2
     if c is None:
-        print('Domotz activation not configured; nothing to do.')
+        print('Domotz registration not configured; nothing to do.')
+        return 0
+    if c.get('registration_complete'):
+        print('Domotz collector registration is already complete; no request will be sent.')
+        disable_registration_timer('registration already complete')
         return 0
     if not c['enabled']:
-        print('Domotz activation is configured but disarmed; nothing to do.')
+        print('Domotz registration is configured but disarmed; nothing to do.')
         return 0
 
     existing = read_result()
     if existing and existing.get('status') in TERMINAL_STATUSES:
-        print(f"Existing activation result '{existing.get('status')}' prevents another POST.")
+        status = existing.get('status')
+        print(f"Existing registration result '{status}' prevents another POST.")
+        if status in {'registration_verified', 'activation_request_accepted'}:
+            mark_registration_complete(c, status)
+        else:
+            pause_registration(c, f'terminal result: {status}')
         return 0
 
     try:
@@ -3812,8 +4023,10 @@ def attempt():
             'reason': 'collector_not_restricted',
             'collector_mode': mode or 'unknown',
             'agent_version': agent_version or 'unknown',
+            'timestamp_utc': utcnow(),
         })
-        print('Collector is not in RESTRICTED mode. No activation POST was sent.')
+        print('Collector is not in RESTRICTED mode. No registration POST was sent.')
+        pause_registration(c, 'collector is already configured')
         return 0
 
     vt = version_tuple(agent_version)
@@ -3822,16 +4035,20 @@ def attempt():
             'status': 'review_required',
             'reason': 'unsupported_collector_version',
             'agent_version': agent_version or 'unknown',
+            'timestamp_utc': utcnow(),
         })
-        print('Collector version is older than the supported command-line activation minimum.', file=sys.stderr)
+        print('Collector version is older than the supported command-line registration minimum.', file=sys.stderr)
+        pause_registration(c, 'unsupported collector version')
         return 2
     if c['deny_all_interfaces'] and vt < (3, 9, 3):
         atomic_json(RESULT, {
             'status': 'review_required',
             'reason': 'scanning_flag_requires_newer_collector',
             'agent_version': agent_version or 'unknown',
+            'timestamp_utc': utcnow(),
         })
-        print('Scanning-disabled activation requires Collector 3.9.3 or newer.', file=sys.stderr)
+        print('Scanning-disabled registration requires Collector 3.9.3 or newer.', file=sys.stderr)
+        pause_registration(c, 'collector too old for deny_all_interfaces')
         return 2
 
     try:
@@ -3848,6 +4065,7 @@ def attempt():
         'status': 'submission_started',
         'collector_name': c['name'],
         'agent_version': agent_version or 'unknown',
+        'timestamp_utc': utcnow(),
     })
 
     body = json.dumps(payload).encode('utf-8')
@@ -3856,6 +4074,8 @@ def attempt():
         data=body,
         headers={
             'x-api-key': c['activation_key'],
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
         },
         method='POST',
     )
@@ -3865,14 +4085,23 @@ def attempt():
             code = int(resp.getcode())
         if not 200 <= code < 300:
             raise RuntimeError(f'Unexpected local API HTTP status {code}')
+
+        verified, post_status = verify_after_submission()
+        final_status = 'registration_verified' if verified else 'activation_request_accepted'
         atomic_json(RESULT, {
-            'status': 'activation_request_accepted',
+            'status': final_status,
             'collector_name': c['name'],
             'agent_version': agent_version or 'unknown',
             'http_status': code,
+            'collector_mode_after_request': str(post_status.get('mode', 'unknown')),
             'response': response_body[:4096],
+            'timestamp_utc': utcnow(),
         })
-        print('Domotz local activation API accepted the request. Verify the collector in the Domotz portal.')
+        mark_registration_complete(c, final_status)
+        if verified:
+            print('Domotz collector registration verified locally. Activation key scrubbed and retry timer disabled.')
+        else:
+            print('Domotz local registration API accepted the request. Activation key scrubbed and retry timer disabled; verify the collector in the Domotz portal.')
         return 0
     except Exception as e:
         detail = f'{type(e).__name__}: {e}'
@@ -3887,19 +4116,22 @@ def attempt():
             'collector_name': c['name'],
             'agent_version': agent_version or 'unknown',
             'detail': detail[:4096],
+            'timestamp_utc': utcnow(),
         })
-        print('Activation POST was attempted but the result is uncertain or failed. Automatic POST retries are paused.', file=sys.stderr)
+        pause_registration(c, 'POST attempted; engineering review required before retry')
+        print('Registration POST was attempted but the result is uncertain or failed. Automatic retries are paused to prevent duplicate registration.', file=sys.stderr)
         return 2
 
 
 def main():
-    p = argparse.ArgumentParser(description='Solutionz Domotz collector activation helper')
+    p = argparse.ArgumentParser(description='Solutionz Domotz collector registration helper')
     g = p.add_mutually_exclusive_group()
     g.add_argument('--configure', action='store_true')
     g.add_argument('--arm', action='store_true')
     g.add_argument('--disarm', action='store_true')
     g.add_argument('--check', action='store_true')
     g.add_argument('--attempt', action='store_true')
+    g.add_argument('--reset-result', action='store_true')
     a = p.parse_args()
     try:
         if a.configure:
@@ -3910,6 +4142,8 @@ def main():
             arm(False); return 0
         if a.check:
             return check()
+        if a.reset_result:
+            reset_result(); return 0
         return attempt()
     except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as e:
         print(f'ERROR: {e}', file=sys.stderr)
@@ -3933,11 +4167,12 @@ ConditionPathExists=/usr/local/sbin/solutionz-domotz-activate
 Type=oneshot
 ExecStart=/usr/local/sbin/solutionz-domotz-activate --attempt
 SuccessExitStatus=0 75
+TimeoutStartSec=180
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/solutionz-domotz-activation
+ReadWritePaths=/var/lib/solutionz-domotz-activation /etc/solutionz-rmm
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=true
 MemoryDenyWriteExecute=true
@@ -3976,12 +4211,12 @@ EOF
   chmod 750 "${SETUP_COMMAND}"
   chown root:root "${SETUP_COMMAND}"
 
-  progress_message "Integrated Domotz activation workflow installed but left disarmed until Phase 2 passes."
+  progress_message "Integrated Domotz automatic registration workflow installed but left disarmed until Phase 2 passes."
 }
 
 activation_status() {
   echo "============================================================"
-  echo "Solutionz RMM build and activation status"
+  echo "Solutionz RMM build and Domotz registration status"
   echo "============================================================"
   if [[ -s "${STATE_FILE}" ]]; then
     cat "${STATE_FILE}"
@@ -3992,7 +4227,7 @@ activation_status() {
   if [[ -x "${DOMOTZ_ACTIVATION_HELPER}" ]]; then
     "${DOMOTZ_ACTIVATION_HELPER}" --check || true
   else
-    echo "Domotz activation helper: not installed"
+    echo "Domotz registration helper: not installed"
   fi
   echo "------------------------------------------------------------"
   echo "Activation timer enabled: $(systemctl is-enabled solutionz-domotz-activate.timer 2>/dev/null || echo no)"
@@ -4022,22 +4257,22 @@ prepare_deployment() {
     fi
   fi
 
-  "${DOMOTZ_ACTIVATION_HELPER}" --check || error_exit "Domotz activation pre-arm check failed."
+  "${DOMOTZ_ACTIVATION_HELPER}" --check || error_exit "Domotz registration pre-arm check failed."
 
   if (( NON_INTERACTIVE == 0 )); then
     echo
-    warning_message "This will arm this appliance to activate as a NEW Domotz collector on its next boot."
+    warning_message "This will arm this appliance to register/activate as a NEW Domotz collector on its next boot."
     warning_message "Do not use this mode for an RMA/migration that must retain an existing collector identity."
     read -r -p "Type DEPLOY to arm this appliance for its next boot: " answer
     [[ "${answer}" == "DEPLOY" ]] || error_exit "Deployment preparation cancelled before arming."
   fi
 
-  "${DOMOTZ_ACTIVATION_HELPER}" --arm || error_exit "Unable to arm Domotz activation."
+  "${DOMOTZ_ACTIVATION_HELPER}" --arm || error_exit "Unable to arm Domotz automatic registration."
   systemctl enable solutionz-domotz-activate.timer >/dev/null || error_exit "Unable to enable Domotz activation timer for the next boot."
   systemctl stop solutionz-domotz-activate.timer solutionz-domotz-activate.service >/dev/null 2>&1 || true
 
-  progress_message "Domotz activation is armed for the next boot. The timer is enabled but intentionally stopped now."
-  info_message "At the customer site, connect the approved WAN to eth0 and power on. The first activation attempt starts after approximately 90 seconds."
+  progress_message "Domotz automatic registration is armed for the next boot. The timer is enabled but intentionally stopped now."
+  info_message "At the customer site, connect the approved WAN to eth0 and power on. The first automatic Domotz registration attempt starts after approximately 90 seconds."
 
   if (( NO_POWEROFF == 1 )); then
     warning_message "Appliance remains powered on. Do not manually start the activation timer in the lab."
@@ -4197,6 +4432,10 @@ check_final_requirement "Solutionz security validator installed" test -x "${SECU
   check_final_requirement "Automatic dual-homed network validator installed" test -x "${NETWORK_VALIDATOR}" || failures=$((failures + 1))
   check_final_requirement "Persistent IPv4 forwarding disable policy installed" grep -Eq '^net\.ipv4\.ip_forward=0$' "${IP_FORWARD_SYSCTL_FILE}" || failures=$((failures + 1))
   check_final_requirement "Current IPv4 forwarding is disabled" bash -c '[[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "0" ]]' || failures=$((failures + 1))
+  check_final_requirement "Installed Setup copy does not retain embedded Domotz activation key" grep -q '^DOMOTZ_COLLECTOR_ACTIVATION_KEY_DEFAULT=""$' "${INSTALLED_SCRIPT_COPY}" || failures=$((failures + 1))
+  if [[ -n "${DOMOTZ_COLLECTOR_ACTIVATION_KEY}" ]]; then
+    check_final_requirement "Domotz provisioning defaults staged root-only" bash -c 'f="$1"; [[ -s "$f" && "$(stat -c %U:%G "$f")" == root:root && "$(stat -c %a "$f")" == 600 ]]' _ "${DOMOTZ_PROVISIONING_DEFAULTS}" || failures=$((failures + 1))
+  fi
   check_final_requirement "Integrated Domotz activation helper installed" test -x "${DOMOTZ_ACTIVATION_HELPER}" || failures=$((failures + 1))
   check_final_requirement "Domotz activation service unit installed" test -s "${DOMOTZ_ACTIVATION_SERVICE}" || failures=$((failures + 1))
   check_final_requirement "Domotz activation timer unit installed" test -s "${DOMOTZ_ACTIVATION_TIMER}" || failures=$((failures + 1))
@@ -4325,7 +4564,7 @@ main() {
   info_message "After Phase 2 reaches phase2_system_validated, engineering logs in as ${ENGINEERING_USER} with the Solutionz engineering SSH private key. The same Solutionz RMM menu opens in engineering mode; option 9 performs the one-time local password setup."
   info_message "Technician account ${TECHNICIAN_USER} cannot create or change the ${ENGINEERING_USER} password and remains restricted to the technician menu."
   info_message "Deployment preparation is blocked until the engineering password has been provisioned; then run: sudo solutionz-rmm-setup --prepare-deployment"
-  info_message "That same Setup source configures and arms Domotz activation for the next boot, then powers the appliance off by default."
+  info_message "That same Setup source securely stages and arms automatic Domotz registration for the next boot, then powers the appliance off by default."
   info_message "Interactive access: ${FIELD_TECH_GROUP} and ${ENGINEERING_GROUP} members both enter the Solutionz RMM configuration menu. Only an authenticated ${ENGINEERING_USER} session can create/change the engineering password or open the unrestricted engineering shell."
   info_message "USB-C COM recovery/configuration remains available at 115200 8N1."
   info_message "After every network change the script validates WAN eth0, LAN eth1/VLANs, default-route ownership, DNS/Domotz reachability, IPv4 forwarding, firewall/SSH hardening, audit state, and file integrity."

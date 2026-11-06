@@ -609,7 +609,36 @@ error_exit() {
 
 trap 'on_error "${LINENO}" "${BASH_COMMAND}"' ERR
 
+prompt_yes_no() {
+  local __var="$1" prompt="$2" value
+  while true; do
+    read -r -p "${prompt} [YES/NO]: " value
+    case "${value}" in
+      YES) printf -v "${__var}" '%s' "YES"; return 0 ;;
+      NO)  printf -v "${__var}" '%s' "NO";  return 0 ;;
+      *)
+        echo "INVALID ENTRY: type exactly YES or NO."
+        ;;
+    esac
+  done
+}
+
+prompt_keyword_or_cancel() {
+  local __var="$1" keyword="$2" prompt="$3" value
+  while true; do
+    read -r -p "${prompt} [${keyword}/CANCEL]: " value
+    case "${value}" in
+      "${keyword}") printf -v "${__var}" '%s' "${keyword}"; return 0 ;;
+      CANCEL)       printf -v "${__var}" '%s' "CANCEL"; return 0 ;;
+      *)
+        echo "INVALID ENTRY: type exactly ${keyword} or CANCEL."
+        ;;
+    esac
+  done
+}
+
 prompt_confirmation() {
+  local confirmation1 confirmation2
   if (( NON_INTERACTIVE == 1 )); then
     progress_message "Non-interactive mode selected; confirmation prompts skipped."
     return 0
@@ -664,13 +693,17 @@ Domotz note:
   recorded for audit and support.
 EOF
 
-  printf "Type 'yes' to proceed: "
-  read -r confirmation1
-  [[ "${confirmation1}" == "yes" ]] || error_exit "Confirmation not received."
+  prompt_yes_no confirmation1 "Proceed with Solutionz RMM Setup?"
+  if [[ "${confirmation1}" == "NO" ]]; then
+    info_message "Setup cancelled before any installation state or configuration was changed."
+    exit 0
+  fi
 
-  printf "Type 'yes' again to confirm production configuration changes: "
-  read -r confirmation2
-  [[ "${confirmation2}" == "yes" ]] || error_exit "Second confirmation not received."
+  prompt_yes_no confirmation2 "Confirm production configuration changes?"
+  if [[ "${confirmation2}" == "NO" ]]; then
+    info_message "Setup cancelled before any installation state or configuration was changed."
+    exit 0
+  fi
 }
 
 read_dmi_value() {
@@ -2683,6 +2716,30 @@ ip4() { ip -o -4 addr show dev "$1" scope global 2>/dev/null | awk 'NR==1 {print
 def() { ip -4 route show default 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'; }
 gw() { ip -4 route show default 2>/dev/null | awk -v i="$1" '$0 ~ (" dev " i "( |$)") {print $3; exit}'; }
 
+prompt_yes_no() {
+  local __var="$1" prompt="$2" value
+  while true; do
+    read -r -p "$prompt [YES/NO]: " value
+    case "$value" in
+      YES) printf -v "$__var" '%s' "YES"; return 0 ;;
+      NO)  printf -v "$__var" '%s' "NO";  return 0 ;;
+      *) echo "INVALID ENTRY: type exactly YES or NO." ;;
+    esac
+  done
+}
+
+prompt_keyword_or_cancel() {
+  local __var="$1" keyword="$2" prompt="$3" value
+  while true; do
+    read -r -p "$prompt [$keyword/CANCEL]: " value
+    case "$value" in
+      "$keyword") printf -v "$__var" '%s' "$keyword"; return 0 ;;
+      CANCEL)      printf -v "$__var" '%s' "CANCEL"; return 0 ;;
+      *) echo "INVALID ENTRY: type exactly $keyword or CANCEL." ;;
+    esac
+  done
+}
+
 prompt_ipv4_cidr() {
   local __var="$1" prompt="$2" value normalized
   while true; do
@@ -2843,8 +2900,8 @@ apply() {
   echo "Generated Netplan:"
   cat "$NETPLAN"
   echo
-  read -r -p "Apply now? Type 'yes': " a
-  if [[ "$a" != "yes" ]]; then
+  prompt_yes_no a "Apply this network configuration now?"
+  if [[ "$a" == "NO" ]]; then
     echo "Change cancelled; restoring the previously committed Netplan/profile."
     restore_prev || true
     return 0
@@ -3200,8 +3257,8 @@ restore() {
   p="$(latest "$PROFILE")"
   echo "Netplan: ${n:-none}"
   echo "Profile: ${p:-none}"
-  read -r -p "Restore? Type yes: " a
-  [[ "$a" == "yes" ]] || return 0
+  prompt_yes_no a "Restore the previous network configuration?"
+  [[ "$a" == "YES" ]] || { echo "Restore cancelled."; return 0; }
   [[ -n "$n" ]] && cp -a "$n" "$NETPLAN"
   [[ -n "$p" ]] && cp -a "$p" "$PROFILE"
   netplan generate && netplan apply
@@ -3357,11 +3414,11 @@ domotz_register_new_now() {
 
   "${DOMOTZ_REGISTRATION_HELPER}" --preflight-new || return $?
 
-  read -r -p "Type REGISTER to configure and register this NEW Collector now: " answer
-  [[ "${answer}" == "REGISTER" ]] || {
-    echo "Domotz registration cancelled."
+  prompt_keyword_or_cancel answer REGISTER "Register this NEW Domotz Collector now?"
+  if [[ "${answer}" == "CANCEL" ]]; then
+    echo "Domotz registration cancelled. No registration state was changed."
     return 0
-  }
+  fi
 
   "${DOMOTZ_REGISTRATION_HELPER}" --configure || return $?
   "${DOMOTZ_REGISTRATION_HELPER}" --arm || return $?
@@ -4805,8 +4862,8 @@ prepare_deployment() {
   else
     "${DOMOTZ_ACTIVATION_HELPER}" --check || error_exit "Existing Domotz activation configuration is invalid."
     if (( NON_INTERACTIVE == 0 )); then
-      read -r -p "Use the existing protected Domotz activation configuration? Type yes to continue: " answer
-      if [[ "${answer}" != "yes" ]]; then
+      prompt_yes_no answer "Use the existing protected Domotz activation configuration?"
+      if [[ "${answer}" == "NO" ]]; then
         "${DOMOTZ_ACTIVATION_HELPER}" --configure || error_exit "Domotz activation reconfiguration failed."
       fi
     fi
@@ -4818,8 +4875,11 @@ prepare_deployment() {
     echo
     warning_message "This will arm this appliance to register/activate as a NEW Domotz collector on its next boot."
     warning_message "Do not use this mode for an RMA/migration that must retain an existing collector identity."
-    read -r -p "Type DEPLOY to arm this appliance for its next boot: " answer
-    [[ "${answer}" == "DEPLOY" ]] || error_exit "Deployment preparation cancelled before arming."
+    prompt_keyword_or_cancel answer DEPLOY "Arm this appliance for NEW Domotz registration on its next boot?"
+    if [[ "${answer}" == "CANCEL" ]]; then
+      info_message "Deployment preparation cancelled before arming. No failure state was written."
+      return 0
+    fi
   fi
 
   "${DOMOTZ_ACTIVATION_HELPER}" --arm || error_exit "Unable to arm Domotz automatic registration."
@@ -5050,11 +5110,12 @@ main() {
   info_message "Revision ${REVISION} | Release ${RELEASE_DATE}"
   info_message "Command output is displayed on the console and recorded in ${LOG_FILE}."
 
+  prompt_confirmation
+
   backup_previous_state
   write_state "phase1_in_progress"
   record_network_requirements
 
-  prompt_confirmation
   preflight_checks
   capture_manufacturer_baseline
   install_required_packages

@@ -1114,8 +1114,17 @@ install_domotz() {
   fi
 
   if (( installed == 0 )); then
-    if ! snap install "${DOMOTZ_SNAP_NAME}"; then
-error_exit "Domotz Snap installation failed."
+    if ! snap install "${DOMOTZ_SNAP_NAME}" --channel=latest/stable; then
+      error_exit "Domotz Snap installation failed."
+    fi
+  else
+    # This build intentionally does not pin Domotz. During an approved Setup
+    # maintenance run, refresh an existing Collector to the current stable
+    # channel so Linux Collector persistence/discovery fixes are not deferred.
+    if snap refresh "${DOMOTZ_SNAP_NAME}" --channel=latest/stable; then
+      progress_message "Domotz existing installation checked/refreshed against latest/stable."
+    else
+      warning_message "Domotz refresh to latest/stable did not complete; retaining the installed revision and recording it for review."
     fi
   fi
 
@@ -2636,7 +2645,7 @@ case "${1:-}" in
     ;;
   --register-new-domotz)
     AUTO=1
-    SESSION_MODE="engineering"
+    SESSION_MODE="technician"
     REGISTER_NEW_DOMOTZ_DIRECT=1
     ;;
   "")
@@ -3310,10 +3319,10 @@ engineering_tools_entry() {
 }
 
 domotz_register_new_now() {
-  local phase answer rc
+  local phase answer rc av_networks
 
-  if ! engineering_session_authenticated; then
-    echo "ERROR: NEW Domotz Collector registration requires an authenticated ${ENGINEERING_USER} session." >&2
+  if [[ "${SESSION_MODE}" != "technician" && "${SESSION_MODE}" != "engineering" ]]; then
+    echo "ERROR: NEW Domotz Collector registration requires an authenticated technician or engineering menu session." >&2
     return 81
   fi
 
@@ -3327,6 +3336,16 @@ domotz_register_new_now() {
     echo "ERROR: Domotz registration helper is not installed." >&2
     return 1
   }
+
+  av_networks="$(ip -4 -o addr show 2>/dev/null | awk '$2 == "eth1" || $2 ~ /^eth1[.]/ {print $2 "=" $4}' | paste -sd', ' -)"
+  if [[ -z "${av_networks}" ]]; then
+    echo "WARNING: No live IPv4 network is currently assigned to eth1 or an eth1 VLAN."
+    echo "Domotz can register, but it will have no AV-side IPv4 subnet to scan until eth1/VLAN addressing is active."
+    echo "Verify the LAN cable, switch port, VLANs, and network profile before continuing."
+    echo
+  else
+    echo "AV-side scan networks detected: ${av_networks}"
+  fi
 
   echo
   echo "============================================================"
@@ -3499,10 +3518,6 @@ if (( ENGINEERING_TOOLS_DIRECT == 1 )); then
 fi
 
 if (( REGISTER_NEW_DOMOTZ_DIRECT == 1 )); then
-  if ! engineering_session_authenticated; then
-    echo "ERROR: --register-new-domotz requires an authenticated ${ENGINEERING_USER} session." >&2
-    exit 81
-  fi
   domotz_register_new_now
   exit $?
 fi
@@ -3523,7 +3538,7 @@ Solutionz RMM Dual-Homed Network Configuration - Revision V06.100626N
 9) Engineering Login / Password Setup
 10) Log out
 11) Engineering Tools / Setup Script (engineering authentication required)
-12) Register NEW Domotz Collector Now (engineering authentication required)
+12) Register NEW Domotz Collector Now (technician or engineering)
 
 eth0 = WAN/cloud | eth1 = AV/control LAN | VLANs on eth1 | forwarding disabled
 Address entry = IPv4 only in this revision | exactly 4 octets (0-255) | static CIDR /1-/30 | IPv6 rejected
@@ -3551,7 +3566,7 @@ MENU
     9) engineering_access ;;
     10) if (( AUTO )); then exit 90; else exit 0; fi ;;
     11) engineering_tools_entry ;;
-    12) engineering_register_entry || true ;;
+    12) domotz_register_new_now || true ;;
     *) echo "Invalid selection." ;;
   esac
 done
@@ -3853,6 +3868,27 @@ for p in firewall-control network-observe raw-usb shutdown system-observe; do
   snap connections "$DOM" 2>/dev/null | awk -v p="$p" '$1==p && $3!="-" {f=1} END {exit f?0:1}' && \
     pass "Domotz ${p} connected." || fail "Domotz ${p} missing."
 done
+# If this appliance was previously registered, verify that the Domotz local
+# identity survives reboot. A registered collector returning to RESTRICTED
+# mode is a persistence failure and must not be silently accepted.
+REGCFG="/etc/solutionz-rmm/domotz-activation.json"
+if [[ -s "$REGCFG" ]] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); raise SystemExit(0 if d.get("registration_complete") is True else 1)' "$REGCFG" >/dev/null 2>&1; then
+  domotz_mode=""
+  for _ in $(seq 1 18); do
+    domotz_mode="$(curl -fsS --max-time 5 http://127.0.0.1:3000/api/v1/status 2>/dev/null | python3 -c 'import json,sys;
+try: print(json.load(sys.stdin).get("mode", ""))
+except Exception: pass' 2>/dev/null || true)"
+    [[ -n "$domotz_mode" ]] && break
+    sleep 5
+  done
+  if [[ -z "$domotz_mode" ]]; then
+    fail "Registered Domotz identity could not be checked after reboot; local API unavailable."
+  elif [[ "$domotz_mode" == "RESTRICTED" ]]; then
+    fail "Registered Domotz identity did not persist across reboot; collector returned to RESTRICTED mode."
+  else
+    pass "Registered Domotz identity persisted across reboot (mode=${domotz_mode})."
+  fi
+fi
 systemctl is-active --quiet systemd-timesyncd.service && pass "systemd-timesyncd active." || fail "systemd-timesyncd inactive."
 waitntp && pass "NTP synchronized." || fail "NTP synchronization failed."
 [[ -c /dev/ttyS0 ]] && pass "ttyS0 present." || fail "ttyS0 missing."
@@ -4041,7 +4077,6 @@ TIMER_UNIT = 'solutionz-domotz-activate.timer'
 SERVICE_UNIT = 'solutionz-domotz-activate.service'
 TERMINAL_STATUSES = {
     'registration_verified',
-    'activation_request_accepted',
     'existing_configuration_review',
     'submission_started',
     'review_required',
@@ -4315,7 +4350,11 @@ def configure():
         endpoint = input('Domotz API endpoint (include https:// and /public-api/v1/): ').strip()
         key = getpass.getpass('Collector Activation Key: ').strip()
         key_name = 'manually entered'
-    deny = input('Keep network scanning disabled after registration? [y/N]: ').strip().lower() in {'y', 'yes'}
+    # Solutionz production policy: new collectors must discover attached
+    # monitoring networks. Domotz documents deny_all_interfaces=true as a
+    # deny-all scan policy, so never set it for standard RMM deployment.
+    deny = False
+    print('Network scanning after registration: ENABLED (Solutionz policy; all attached OS interfaces allowed by default)')
     c = {
         'schema_version': 2,
         'enabled': False,
@@ -4389,7 +4428,7 @@ def check():
         print(f"Armed: {c['enabled']}")
         print(f"Registration complete: {bool(c.get('registration_complete'))}")
         print(f"Activation key state: {key_state}")
-        print(f"Scanning disabled after registration: {c['deny_all_interfaces']}")
+        print(f"Network scanning policy: {'DISABLED - DENY ALL INTERFACES' if c['deny_all_interfaces'] else 'ENABLED - DEFAULT INTERFACE DISCOVERY'}")
         print(f'Config permissions: {mode}')
     r = read_result()
     print(f"Result: {r.get('status') if r else 'none'}")
@@ -4398,9 +4437,15 @@ def check():
     try:
         s = local_status(timeout=5)
         resolved_version, version_source = resolve_collector_version(s)
-        print(f"Local collector mode: {s.get('mode', 'unknown')}")
+        local_mode = str(s.get('mode', 'unknown'))
+        print(f"Local collector mode: {local_mode}")
         print(f"Local collector version: {resolved_version or 'unknown'}")
         print(f"Collector version source: {version_source}")
+        if c is not None and c.get('registration_complete'):
+            if local_mode == 'RESTRICTED':
+                print('REGISTRATION PERSISTENCE: FAILED - collector returned to RESTRICTED mode after registration')
+            else:
+                print('REGISTRATION PERSISTENCE: PASS - local registered identity is present')
         if not resolved_version:
             visible_keys = ', '.join(sorted(str(k) for k in s.keys()))
             print(f"Local status fields: {visible_keys or 'none'}")
@@ -4409,15 +4454,27 @@ def check():
     return 0
 
 
-def verify_after_submission(attempts=12, delay=5):
+def verify_after_submission(attempts=24, delay=5, stable_checks=3):
+    """Require a stable registered identity, not a one-sample transition.
+
+    A successful activation is considered locally verified only after the
+    collector remains out of RESTRICTED mode for multiple consecutive checks.
+    This gives Domotz time to persist its identity before the appliance is
+    considered safe to reboot or ship.
+    """
     last = None
+    stable = 0
     for _ in range(attempts):
         try:
             last = local_status(timeout=5)
-            if str(last.get('mode', '')) != 'RESTRICTED':
-                return True, last
+            if str(last.get('mode', '')) and str(last.get('mode', '')) != 'RESTRICTED':
+                stable += 1
+                if stable >= stable_checks:
+                    return True, last
+            else:
+                stable = 0
         except Exception:
-            pass
+            stable = 0
         time.sleep(delay)
     return False, last or {}
 
@@ -4442,10 +4499,30 @@ def attempt():
         return 0
 
     existing = read_result()
+    if existing and existing.get('status') == 'activation_request_accepted_pending_verification':
+        try:
+            current = local_status(timeout=8)
+        except Exception as e:
+            print(f'Local Domotz API not ready while verifying accepted registration: {type(e).__name__}: {e}', file=sys.stderr)
+            return 75
+        current_mode = str(current.get('mode', ''))
+        if current_mode and current_mode != 'RESTRICTED':
+            atomic_json(RESULT, {
+                **existing,
+                'status': 'registration_verified',
+                'collector_mode_after_request': current_mode,
+                'verified_utc': utcnow(),
+            })
+            mark_registration_complete(c, 'registration_verified')
+            print('Previously accepted Domotz registration is now verified locally. Activation key scrubbed.')
+            return 0
+        print('Registration request was already accepted; local identity is still RESTRICTED. No duplicate POST will be sent.', file=sys.stderr)
+        return 75
+
     if existing and existing.get('status') in TERMINAL_STATUSES:
         status = existing.get('status')
         print(f"Existing registration result '{status}' prevents another POST.")
-        if status in {'registration_verified', 'activation_request_accepted'}:
+        if status == 'registration_verified':
             mark_registration_complete(c, status)
         else:
             pause_registration(c, f'terminal result: {status}')
@@ -4537,9 +4614,31 @@ def attempt():
             raise RuntimeError(f'Unexpected local API HTTP status {code}')
 
         verified, post_status = verify_after_submission()
-        final_status = 'registration_verified' if verified else 'activation_request_accepted'
+        if verified:
+            final_status = 'registration_verified'
+            atomic_json(RESULT, {
+                'status': final_status,
+                'collector_name': c['name'],
+                'agent_version': agent_version or 'unknown',
+                'version_source': version_source,
+                'http_status': code,
+                'collector_mode_after_request': str(post_status.get('mode', 'unknown')),
+                'response': response_body[:4096],
+                'timestamp_utc': utcnow(),
+            })
+            mark_registration_complete(c, final_status)
+            try:
+                os.sync()
+            except AttributeError:
+                pass
+            print('Domotz collector registration verified and stable locally. Activation key scrubbed and retry timer disabled.')
+            print('Registration is now safe for a controlled reboot test.')
+            return 0
+
+        # The POST reached Domotz, but local identity has not transitioned yet.
+        # Record a pending-verification state and never submit a duplicate POST.
         atomic_json(RESULT, {
-            'status': final_status,
+            'status': 'activation_request_accepted_pending_verification',
             'collector_name': c['name'],
             'agent_version': agent_version or 'unknown',
             'version_source': version_source,
@@ -4548,12 +4647,9 @@ def attempt():
             'response': response_body[:4096],
             'timestamp_utc': utcnow(),
         })
-        mark_registration_complete(c, final_status)
-        if verified:
-            print('Domotz collector registration verified locally. Activation key scrubbed and retry timer disabled.')
-        else:
-            print('Domotz local registration API accepted the request. Activation key scrubbed and retry timer disabled; verify the collector in the Domotz portal.')
-        return 0
+        print('Domotz accepted the registration request, but local registered identity is not yet verified. No duplicate POST will be sent.', file=sys.stderr)
+        pause_registration(c, 'activation accepted; awaiting local identity verification')
+        return 2
     except Exception as e:
         detail = f'{type(e).__name__}: {e}'
         if isinstance(e, urllib.error.HTTPError):
@@ -4814,6 +4910,8 @@ final_summary_check() {
   check_final_requirement "Engineering access profile launches engineering-login mode" grep -q -- '--engineering-login' "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Network menu provides authenticated engineering-tools transition" grep -q -- '--engineering-tools' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Network menu displays live eth0/eth1 IP and cabling banner" grep -q 'LIVE NIC / CABLING STATUS' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Solutionz registration policy forces network scanning enabled" grep -q 'deny = False' "${DOMOTZ_ACTIVATION_HELPER}" || failures=$((failures + 1))
+  check_final_requirement "Network menu provides technician-accessible NEW Domotz registration" grep -q 'Register NEW Domotz Collector Now (technician or engineering)' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Network menu provides engineering-only NEW Domotz registration" grep -q -- '--register-new-domotz' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "SSH field-tech policy excludes engineering group" grep -q '^Match Group solutionz-rmm-tech,!solutionz-rmm-engineering$' "${SSH_HARDENING_FILE}" || failures=$((failures + 1))
   check_final_requirement "Local config sudoers policy installed" test -s "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))

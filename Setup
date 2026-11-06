@@ -2610,8 +2610,10 @@ ENGINEERING_PASSWORD_TOOL="/usr/local/sbin/solutionz-rmm-engineering-password-se
 ENGINEERING_PASSWORD_MARKER="/var/lib/rswsolutionz-rmm/engineering-password-provisioned"
 SETUP_COMMAND="/usr/local/sbin/solutionz-rmm-setup"
 DOMOTZ_REGISTRATION_HELPER="/usr/local/sbin/solutionz-domotz-activate"
+LOCAL_CONFIG_TOOL="/usr/local/sbin/solutionz-rmm-local-config"
 AUTO=0
 SESSION_MODE="manual"
+ENGINEERING_TOOLS_DIRECT=0
 PRODUCTION_VALIDATION_RESULT="NOT_RUN"
 PRE_NETPLAN_SHA256=""
 PRE_PROFILE_SHA256=""
@@ -2626,14 +2628,19 @@ case "${1:-}" in
     AUTO=1
     SESSION_MODE="engineering"
     ;;
+  --engineering-tools)
+    AUTO=1
+    SESSION_MODE="engineering"
+    ENGINEERING_TOOLS_DIRECT=1
+    ;;
   "")
     ;;
   *)
-    echo "Usage: $(basename "$0") [--restricted-login|--engineering-login]"
+    echo "Usage: $(basename "$0") [--restricted-login|--engineering-login|--engineering-tools]"
     exit 2
     ;;
 esac
-[[ $# -le 1 ]] || { echo "Usage: $(basename "$0") [--restricted-login|--engineering-login]"; exit 2; }
+[[ $# -le 1 ]] || { echo "Usage: $(basename "$0") [--restricted-login|--engineering-login|--engineering-tools]"; exit 2; }
 [[ $EUID -eq 0 ]] || { echo "Run with sudo."; exit 1; }
 
 
@@ -3059,6 +3066,86 @@ engineering_session_authenticated() {
   id -nG "${ENGINEERING_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx "${ENGINEERING_GROUP}"
 }
 
+setup_script_menu() {
+  while true; do
+    cat <<'SETUPMENU'
+
+Solutionz RMM Setup / Deployment Script
+1) Show Setup help / supported modes
+2) Show build + Domotz registration status
+3) Prepare deployment / arm Domotz registration (keep powered on)
+4) Prepare deployment / arm Domotz registration and power off
+5) Return to Engineering Session
+SETUPMENU
+    read -r -p "Setup selection: " sc
+    case "${sc}" in
+      1)
+        if [[ -x "${SETUP_COMMAND}" ]]; then
+          "${SETUP_COMMAND}" --help || true
+        else
+          echo "ERROR: ${SETUP_COMMAND} is not installed." >&2
+        fi
+        ;;
+      2)
+        if [[ -x "${SETUP_COMMAND}" ]]; then
+          "${SETUP_COMMAND}" --activation-status || true
+        else
+          echo "ERROR: ${SETUP_COMMAND} is not installed." >&2
+        fi
+        ;;
+      3)
+        if [[ -x "${SETUP_COMMAND}" ]]; then
+          "${SETUP_COMMAND}" --prepare-deployment --no-poweroff || true
+        else
+          echo "ERROR: ${SETUP_COMMAND} is not installed." >&2
+        fi
+        ;;
+      4)
+        if [[ -x "${SETUP_COMMAND}" ]]; then
+          echo "WARNING: successful deployment preparation will power off this appliance."
+          "${SETUP_COMMAND}" --prepare-deployment || true
+        else
+          echo "ERROR: ${SETUP_COMMAND} is not installed." >&2
+        fi
+        ;;
+      5) return 0 ;;
+      *) echo "Invalid Setup selection." ;;
+    esac
+  done
+}
+
+engineering_tools_entry() {
+  # An already-authenticated engineering session can enter tools immediately.
+  if engineering_session_authenticated; then
+    engineering_access
+    return $?
+  fi
+
+  # First-time engineering credential creation must still be established with
+  # the Solutionz-held private SSH key. A technician session cannot create it.
+  if [[ ! -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
+    engineering_access
+    return $?
+  fi
+
+  echo
+  echo "============================================================"
+  echo "ENGINEERING TOOLS AUTHENTICATION"
+  echo "============================================================"
+  echo "Authenticate as ${ENGINEERING_USER} to open the Solutionz RMM engineering tools."
+  echo "The technician session does not receive engineering privileges."
+  echo
+
+  /usr/bin/ssh -tt \
+    -o PreferredAuthentications=password \
+    -o PubkeyAuthentication=no \
+    -o NumberOfPasswordPrompts=3 \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    "${ENGINEERING_USER}@127.0.0.1" \
+    "sudo -n ${LOCAL_CONFIG_TOOL} --engineering-tools" || true
+}
+
 engineering_access() {
   echo
   echo "============================================================"
@@ -3113,7 +3200,8 @@ Engineering Session
 2) Change solz_eng password
 3) Configure and arm automatic Domotz registration for next boot (keep powered on)
 4) Show Domotz registration status
-5) Return to Solutionz RMM configuration menu
+5) Open Solutionz RMM Setup / Deployment Script
+6) Return to Solutionz RMM configuration menu
 ENGMENU
     read -r -p "Engineering selection: " ec
     case "${ec}" in
@@ -3143,6 +3231,9 @@ ENGMENU
         fi
         ;;
       5)
+        setup_script_menu
+        ;;
+      6)
         return 0
         ;;
       *)
@@ -3151,6 +3242,15 @@ ENGMENU
     esac
   done
 }
+
+if (( ENGINEERING_TOOLS_DIRECT == 1 )); then
+  if ! engineering_session_authenticated; then
+    echo "ERROR: --engineering-tools requires an authenticated ${ENGINEERING_USER} session." >&2
+    exit 81
+  fi
+  engineering_access
+  exit 0
+fi
 
 echo
 echo "AUTO-DETECT CURRENT NETWORK"
@@ -3171,6 +3271,7 @@ Solutionz RMM Dual-Homed Network Configuration - Revision V06.100626N
 8) Restore previous network configuration
 9) Engineering Login / Password Setup
 10) Log out
+11) Engineering Tools / Setup Script (engineering authentication required)
 
 eth0 = WAN/cloud | eth1 = AV/control LAN | VLANs on eth1 | forwarding disabled
 Address entry = IPv4 only in this revision | exactly 4 octets (0-255) | static CIDR /1-/30 | IPv6 rejected
@@ -3197,6 +3298,7 @@ MENU
     8) restore ;;
     9) engineering_access ;;
     10) if (( AUTO )); then exit 90; else exit 0; fi ;;
+    11) engineering_tools_entry ;;
     *) echo "Invalid selection." ;;
   esac
 done
@@ -3502,7 +3604,7 @@ systemctl is-active --quiet systemd-timesyncd.service && pass "systemd-timesyncd
 waitntp && pass "NTP synchronized." || fail "NTP synchronization failed."
 [[ -c /dev/ttyS0 ]] && pass "ttyS0 present." || fail "ttyS0 missing."
 check "Serial service active" systemctl is-active --quiet "$SER"
-[[ -x "$CFG" && -s "$AP" ]] && grep -q 'solutionz-rmm-tech' "$AP" && grep -q 'solutionz-rmm-engineering' "$AP" && grep -q -- '--restricted-login' "$AP" && grep -q -- '--engineering-login' "$AP" && pass "Unified technician/engineering interactive menu policy installed." || fail "Unified interactive menu policy missing."
+[[ -x "$CFG" && -s "$AP" ]] && grep -q 'solutionz-rmm-tech' "$AP" && grep -q 'solutionz-rmm-engineering' "$AP" && grep -q -- '--restricted-login' "$AP" && grep -q -- '--engineering-login' "$AP" && grep -q -- '--engineering-tools' "$CFG" && pass "Unified technician/engineering interactive menu policy installed, including engineering-tools transition." || fail "Unified interactive menu policy missing or engineering-tools transition unavailable."
 [[ -s "$SSHCFG" ]] && grep -q '^Match Group solutionz-rmm-tech,!solutionz-rmm-engineering$' "$SSHCFG" && grep -q -- '--restricted-login' "$SSHCFG" && pass "SSH technician menu policy with engineering exception installed." || fail "SSH technician menu policy missing/invalid."
 if id "$TECH_USER" >/dev/null 2>&1; then
   id -nG "$TECH_USER" | tr ' ' '\n' | grep -qx "$TECH_GROUP" && pass "$TECH_USER field-tech membership present." || fail "$TECH_USER field-tech membership missing."
@@ -4353,6 +4455,7 @@ final_summary_check() {
   check_final_requirement "Interactive access profile recognizes engineering group" grep -q "${ENGINEERING_GROUP}" "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Technician access profile launches restricted-login mode" grep -q -- '--restricted-login' "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Engineering access profile launches engineering-login mode" grep -q -- '--engineering-login' "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Network menu provides authenticated engineering-tools transition" grep -q -- '--engineering-tools' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "SSH field-tech policy excludes engineering group" grep -q '^Match Group solutionz-rmm-tech,!solutionz-rmm-engineering$' "${SSH_HARDENING_FILE}" || failures=$((failures + 1))
   check_final_requirement "Local config sudoers policy installed" test -s "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
   check_final_requirement "Local config sudoers policy valid" visudo -cf "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))

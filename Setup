@@ -216,6 +216,18 @@ else
   COLOR_RESET=""
 fi
 
+# Preserve the original interactive console before init_logging redirects
+# stdout/stderr through tee. Prompts and fatal messages use this descriptor so
+# they remain visible to the operator while command output is still logged.
+exec {UI_FD}>&1
+
+append_ui_log() {
+  local message="$1"
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    printf '%s\n' "${message}" >> "${LOG_FILE}" 2>/dev/null || true
+  fi
+}
+
 REQUIRED_DOMOTZ_PERMISSIONS=(
   "firewall-control"
   "network-observe"

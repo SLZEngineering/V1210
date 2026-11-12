@@ -18,6 +18,7 @@ set -Eeuo pipefail
 # Production engineering-key preflight/fingerprint validation update: 2026-11-05
 # Embedded Domotz deployment credential update: 2026-11-06
 # Network transaction/locking + offline USB-C staging hardening update: 2026-11-11
+# Offline preload PENDING / explicit restore reporting / OVS removal update: 2026-11-11
 #
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
@@ -261,7 +262,6 @@ REQUIRED_DOMOTZ_PERMISSIONS=(
 # and only those missing packages are installed by this script.
 REQUIRED_PACKAGES=(
   net-tools
-  openvswitch-switch
   traceroute
   dnsutils
   curl
@@ -2450,20 +2450,35 @@ fi
 # WAN/cloud checks. These do not cause rollback of a locally valid Netplan.
 # NTP is intentionally excluded from the network validator. Time synchronization
 # is validated by the dedicated Phase 1 and Phase 2 NTP checks with bounded retry.
-getent ahostsv4 api.snapcraft.io >/dev/null 2>&1 && ok "WAN DNS resolves api.snapcraft.io." || xf "WAN DNS cannot resolve api.snapcraft.io."
-getent ahostsv4 portal.domotz.com >/dev/null 2>&1 && ok "WAN DNS resolves portal.domotz.com." || xf "WAN DNS cannot resolve portal.domotz.com."
-tcp_open portal.domotz.com 443 && ok "Domotz TCP 443 reachable through WAN." || xf "Domotz TCP 443 unreachable through WAN."
-tcp_open messaging-us-east-1-cell-1.domotz.com 5671 && ok "Domotz TCP 5671 reachable through WAN." || xf "Domotz TCP 5671 unreachable through WAN."
+# During authenticated USB-C offline preload, carrier/cloud state is not evidence
+# of a bad configuration. Report it as PENDING and validate it once Ethernet is live.
+if [[ "$OFFLINE_STAGING" == "1" ]]; then
+  info "WAN/cloud connectivity validation PENDING for offline USB-C preload; Ethernet carrier/connectivity will be verified when links are present."
+else
+  getent ahostsv4 api.snapcraft.io >/dev/null 2>&1 && ok "WAN DNS resolves api.snapcraft.io." || xf "WAN DNS cannot resolve api.snapcraft.io."
+  getent ahostsv4 portal.domotz.com >/dev/null 2>&1 && ok "WAN DNS resolves portal.domotz.com." || xf "WAN DNS cannot resolve portal.domotz.com."
+  tcp_open portal.domotz.com 443 && ok "Domotz TCP 443 reachable through WAN." || xf "Domotz TCP 443 unreachable through WAN."
+  tcp_open messaging-us-east-1-cell-1.domotz.com 5671 && ok "Domotz TCP 5671 reachable through WAN." || xf "Domotz TCP 5671 unreachable through WAN."
+fi
+
 configuration_result="PASS"
 connectivity_result="PASS"
 result="PASS"
 failure_category="NONE"
+connectivity_reason="NONE"
 if (( ${#CONFIG_FAILS[@]} > 0 )); then
   configuration_result="FAIL"
   result="FAIL"
   failure_category="CONFIGURATION"
 fi
-if (( ${#CONNECT_FAILS[@]} > 0 )); then
+if [[ "$OFFLINE_STAGING" == "1" ]]; then
+  connectivity_result="PENDING"
+  connectivity_reason="OFFLINE_USB_CARRIER_CONNECTIVITY_PENDING"
+  if [[ "$configuration_result" == "PASS" ]]; then
+    result="PENDING"
+    failure_category="NONE"
+  fi
+elif (( ${#CONNECT_FAILS[@]} > 0 )); then
   connectivity_result="FAIL"
   result="FAIL"
   if [[ "$failure_category" == "CONFIGURATION" ]]; then
@@ -2479,8 +2494,9 @@ fi
   echo "timestamp_utc=$(date -u +%FT%TZ)"
   echo "configuration_result=${configuration_result}"
   echo "connectivity_result=${connectivity_result}"
+  echo "connectivity_reason=${connectivity_reason}"
   echo "failure_category=${failure_category}"
-echo "wan_interface=${WAN}"
+  echo "wan_interface=${WAN}"
   echo "wan_carrier=$(carrier "$WAN" && echo UP || echo DOWN)"
   echo "wan_ipv4=$(ip4 "$WAN")"
   echo "wan_gateway=$(default_gateway "$WAN")"
@@ -3467,29 +3483,128 @@ validate_full() {
 restore_locked() {
   guard_change all || return 1
   prechange_integrity_verify || return 1
-  local tx a
+  local tx a pre_restore rc validation_state="UNKNOWN"
   tx="$(latest_transaction)"
   [[ -n "$tx" ]] || { echo "No prior network transaction is available to restore."; return 0; }
   echo "Previous network transaction: $(basename "$tx")"
   cat "$tx/manifest"
   prompt_yes_no a "Restore this exact network transaction?"
   [[ "$a" == "YES" ]] || { echo "Restore cancelled."; return 0; }
-  # Preserve the current state as its own exact transaction before restoring.
-  create_transaction manual-restore-current || return 1
-  restore_transaction "$tx" || return 1
-  if ! netplan generate || ! netplan apply; then
-    echo "Restore transaction could not be applied; restoring the configuration that was active before the restore request."
-    restore_transaction "$CURRENT_TRANSACTION" || true
-    netplan generate >/dev/null 2>&1 && netplan apply >/dev/null 2>&1 || true
+
+  # Preserve the currently active Netplan/profile as one exact transaction so a
+  # failed manual restore can return to precisely the state that preceded it.
+  create_transaction manual-restore-current || {
+    echo "MANUAL RESTORE: FAIL - unable to capture the current configuration transaction."
+    return 1
+  }
+  pre_restore="$CURRENT_TRANSACTION"
+
+  if ! restore_transaction "$tx"; then
+    echo "MANUAL RESTORE: FAIL - transaction files could not be restored."
     return 1
   fi
+  echo "MANUAL RESTORE SNAPSHOT: PASS - exact Netplan/profile transaction restored from disk."
+
+  if netplan generate; then
+    echo "MANUAL RESTORE NETPLAN GENERATE: PASS"
+  else
+    echo "MANUAL RESTORE NETPLAN GENERATE: FAIL"
+    echo "Recovering the exact configuration that was active before the restore request..."
+    if restore_transaction "$pre_restore" && netplan generate && netplan apply; then
+      echo "MANUAL RESTORE RECOVERY: PASS - pre-restore configuration regenerated and reapplied."
+    else
+      echo "MANUAL RESTORE RECOVERY: FAIL - use USB-C COM recovery; pre-restore state could not be reapplied cleanly."
+    fi
+    return 1
+  fi
+
+  if netplan apply; then
+    echo "MANUAL RESTORE NETPLAN APPLY: PASS"
+  else
+    echo "MANUAL RESTORE NETPLAN APPLY: FAIL"
+    echo "Recovering the exact configuration that was active before the restore request..."
+    if restore_transaction "$pre_restore" && netplan generate && netplan apply; then
+      echo "MANUAL RESTORE RECOVERY: PASS - pre-restore configuration regenerated and reapplied."
+    else
+      echo "MANUAL RESTORE RECOVERY: FAIL - use USB-C COM recovery; pre-restore state could not be reapplied cleanly."
+    fi
+    return 1
+  fi
+
   [[ -x "$LIVE" ]] && "$LIVE" || true
-  validate || true
-  refresh_integrity_baseline || true
-  run_production_validation
+  echo
+  echo "Running post-restore network validation..."
+  set +e
+  if usb_c_offline_staging; then
+    SOLUTIONZ_RMM_OFFLINE_STAGING=1 "$VALIDATOR"
+    rc=$?
+  else
+    "$VALIDATOR"
+    rc=$?
+  fi
+  set -e
+  [[ -s "$RESULT" ]] && cat "$RESULT" || true
+
+  case "$rc" in
+    0)
+      if grep -q '^connectivity_result=PENDING$' "$RESULT" 2>/dev/null; then
+        validation_state="PENDING"
+        echo "MANUAL RESTORE VALIDATION: PENDING - configuration is valid; carrier/connectivity checks are deferred for offline USB-C preload."
+      else
+        validation_state="PASS"
+        echo "MANUAL RESTORE VALIDATION: PASS"
+      fi
+      ;;
+    10)
+      validation_state="CONFIGURATION_FAIL"
+      echo "MANUAL RESTORE VALIDATION: FAIL - restored configuration failed structural/local network validation."
+      echo "Recovering the exact configuration that was active before the restore request..."
+      if restore_transaction "$pre_restore" && netplan generate && netplan apply; then
+        echo "MANUAL RESTORE RECOVERY: PASS - pre-restore configuration regenerated and reapplied."
+      else
+        echo "MANUAL RESTORE RECOVERY: FAIL - use USB-C COM recovery; pre-restore state could not be reapplied cleanly."
+      fi
+      return 1
+      ;;
+    20)
+      validation_state="CONNECTIVITY_FAIL"
+      echo "MANUAL RESTORE VALIDATION: CONNECTIVITY FAIL - Netplan generated/applied successfully, but WAN/DNS/Domotz reachability did not pass."
+      echo "The restored configuration is retained because local configuration validation passed."
+      ;;
+    *)
+      validation_state="VALIDATOR_ERROR"
+      echo "MANUAL RESTORE VALIDATION: ERROR - validator exited with unexpected status ${rc}."
+      return 1
+      ;;
+  esac
+
+  if refresh_integrity_baseline; then
+    echo "MANUAL RESTORE INTEGRITY BASELINE: PASS"
+  else
+    echo "MANUAL RESTORE INTEGRITY BASELINE: FAIL"
+    return 1
+  fi
+
+  if [[ "$validation_state" == "PASS" ]]; then
+    run_production_validation
+    if [[ "$PRODUCTION_VALIDATION_RESULT" == "PASS" ]]; then
+      echo "MANUAL RESTORE PRODUCTION VALIDATION: PASS"
+    else
+      echo "MANUAL RESTORE PRODUCTION VALIDATION: FAIL - restored network remains applied; review ${POST_RESULT}."
+    fi
+  elif [[ "$validation_state" == "PENDING" ]]; then
+    echo "MANUAL RESTORE PRODUCTION VALIDATION: PENDING - run full validation after Ethernet carrier/connectivity is available."
+  else
+    echo "MANUAL RESTORE PRODUCTION VALIDATION: NOT RUN because connectivity validation did not pass."
+  fi
+
+  echo "MANUAL RESTORE COMPLETE: Netplan/profile transaction restored and apply result reported above."
+  return 0
 }
 
 restore() {
+  # Keep the menu alive after an explicitly reported restore failure. The
+  # restore routine itself prints every generate/apply/validation outcome.
   with_network_lock restore restore_locked || true
 }
 
@@ -3828,7 +3943,7 @@ Live detected state comes from the running Linux network stack, not Netplan.
 Netplan remains the persistent configuration mechanism across reboot.
 USB-C COM = independent recovery/configuration path
 Every applied network change is automatically rediscovered and validated; local configuration failures roll back as one exact transaction.
-USB-C offline staging retains valid profiles when Ethernet carrier is absent; live-link checks are deferred until connectivity is present.
+USB-C offline staging retains valid profiles when Ethernet carrier is absent; carrier/connectivity is reported PENDING until Ethernet is present.
 Network configuration changes are serialized with a lock so USB-C, SSH, and Setup cannot modify Netplan/profile state simultaneously.
 MENU
   if [[ "${SESSION_MODE}" == "engineering" ]]; then

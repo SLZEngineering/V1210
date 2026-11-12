@@ -19,6 +19,7 @@ set -Eeuo pipefail
 # Embedded Domotz deployment credential update: 2026-11-06
 # Network transaction/locking + offline USB-C staging hardening update: 2026-11-11
 # Offline preload PENDING / explicit restore reporting / OVS removal update: 2026-11-11
+# Domotz API endpoint persistence / post-registration fallback update: 2026-11-12
 #
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
@@ -4529,6 +4530,13 @@ LOCAL_STATUS = 'http://127.0.0.1:3000/api/v1/status'
 LOCAL_AGENT = 'http://127.0.0.1:3000/api/v1/agent'
 TIMER_UNIT = 'solutionz-domotz-activate.timer'
 SERVICE_UNIT = 'solutionz-domotz-activate.service'
+
+# The Domotz Public API endpoint is non-secret deployment configuration and must
+# remain available after the Collector Activation Key is scrubbed. Keep the same
+# Solutionz default here as the Bash installer so reconfiguration never requires
+# a technician to re-enter the endpoint manually.
+PUBLIC_API_ENDPOINT_DEFAULT = 'https://api-us-east-1-cell-1.domotz.com/public-api/v1/'
+
 TERMINAL_STATUSES = {
     'registration_verified',
     'existing_configuration_review',
@@ -4744,6 +4752,11 @@ def pause_registration(c: dict, reason: str) -> None:
 
 
 def mark_registration_complete(c: dict, status: str) -> None:
+    # Registration completion scrubs only the secret. The Public API endpoint is
+    # non-secret configuration and must remain in the per-collector config.
+    endpoint = str(c.get('endpoint', '')).strip() or PUBLIC_API_ENDPOINT_DEFAULT
+    validate_endpoint(endpoint)
+    c['endpoint'] = endpoint
     c['enabled'] = False
     c['registration_complete'] = True
     c['activation_key'] = ''
@@ -4801,7 +4814,17 @@ def configure():
         print(f'Domotz API endpoint: {endpoint} (preconfigured)')
         print(f'Collector Activation Key: PRECONFIGURED ({key_name})')
     else:
-        endpoint = input('Domotz API endpoint (include https:// and /public-api/v1/): ').strip()
+        # The endpoint is not a secret and must never disappear merely because
+        # the reusable activation credential was scrubbed after registration.
+        # Preserve the endpoint from an existing collector config when present;
+        # otherwise fall back to the Solutionz US Public API endpoint.
+        existing = read_config()
+        if existing and str(existing.get('endpoint', '')).strip():
+            endpoint = str(existing['endpoint']).strip()
+            print(f'Domotz API endpoint: {endpoint} (preserved from existing configuration)')
+        else:
+            endpoint = PUBLIC_API_ENDPOINT_DEFAULT
+            print(f'Domotz API endpoint: {endpoint} (Solutionz preconfigured default)')
         key = getpass.getpass('Collector Activation Key: ').strip()
         key_name = 'manually entered'
     # Solutionz production policy: new collectors must discover attached
@@ -5352,10 +5375,10 @@ validate_domotz_provisioning_lifecycle() {
   if (( registration_complete == 1 )); then
     [[ "$(stat -c %U:%G "${DOMOTZ_ACTIVATION_CONFIG}" 2>/dev/null || true)" == "root:root" ]] || return 1
     [[ "$(stat -c %a "${DOMOTZ_ACTIVATION_CONFIG}" 2>/dev/null || true)" == "600" ]] || return 1
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); raise SystemExit(0 if d.get("registration_complete") is True and d.get("activation_key","") in ("",None) else 1)' \
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); e=str(d.get("endpoint","")).strip(); raise SystemExit(0 if d.get("registration_complete") is True and d.get("activation_key","") in ("",None) and e.startswith("https://") and "/public-api/" in e else 1)' \
       "${DOMOTZ_ACTIVATION_CONFIG}" >/dev/null 2>&1 || return 1
     [[ ! -e "${DOMOTZ_PROVISIONING_DEFAULTS}" ]] || return 1
-    echo "INFO - Domotz provisioning lifecycle state: REGISTERED_SANITIZED"
+    echo "INFO - Domotz provisioning lifecycle state: REGISTERED_SANITIZED_ENDPOINT_PRESERVED"
     return 0
   fi
 
@@ -5363,9 +5386,9 @@ validate_domotz_provisioning_lifecycle() {
     [[ -s "${DOMOTZ_PROVISIONING_DEFAULTS}" ]] || return 1
     [[ "$(stat -c %U:%G "${DOMOTZ_PROVISIONING_DEFAULTS}" 2>/dev/null || true)" == "root:root" ]] || return 1
     [[ "$(stat -c %a "${DOMOTZ_PROVISIONING_DEFAULTS}" 2>/dev/null || true)" == "600" ]] || return 1
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); raise SystemExit(0 if str(d.get("activation_key","")).strip() else 1)' \
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); e=str(d.get("endpoint","")).strip(); k=str(d.get("activation_key","")).strip(); raise SystemExit(0 if k and e.startswith("https://") and "/public-api/" in e else 1)' \
       "${DOMOTZ_PROVISIONING_DEFAULTS}" >/dev/null 2>&1 || return 1
-    echo "INFO - Domotz provisioning lifecycle state: PRE_REGISTRATION_STAGED"
+    echo "INFO - Domotz provisioning lifecycle state: PRE_REGISTRATION_STAGED_ENDPOINT_PRESENT"
     return 0
   fi
 

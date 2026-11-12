@@ -5335,6 +5335,52 @@ write_prereboot_result() {
   chmod 640 "${PREREBOOT_RESULT_FILE}"
 }
 
+validate_domotz_provisioning_lifecycle() {
+  local registration_complete=0
+
+  # Registration config is authoritative once a Collector has completed
+  # registration. In that state the reusable deployment credential MUST be gone
+  # and the per-collector activation key MUST be scrubbed. Before registration,
+  # a configured deployment credential is valid only when the reusable defaults
+  # file exists root:root mode 600 and contains a non-empty activation key.
+  if [[ -s "${DOMOTZ_ACTIVATION_CONFIG}" ]] && \
+     python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); raise SystemExit(0 if d.get("registration_complete") is True else 1)' \
+       "${DOMOTZ_ACTIVATION_CONFIG}" >/dev/null 2>&1; then
+    registration_complete=1
+  fi
+
+  if (( registration_complete == 1 )); then
+    [[ "$(stat -c %U:%G "${DOMOTZ_ACTIVATION_CONFIG}" 2>/dev/null || true)" == "root:root" ]] || return 1
+    [[ "$(stat -c %a "${DOMOTZ_ACTIVATION_CONFIG}" 2>/dev/null || true)" == "600" ]] || return 1
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); raise SystemExit(0 if d.get("registration_complete") is True and d.get("activation_key","") in ("",None) else 1)' \
+      "${DOMOTZ_ACTIVATION_CONFIG}" >/dev/null 2>&1 || return 1
+    [[ ! -e "${DOMOTZ_PROVISIONING_DEFAULTS}" ]] || return 1
+    echo "INFO - Domotz provisioning lifecycle state: REGISTERED_SANITIZED"
+    return 0
+  fi
+
+  if [[ -e "${DOMOTZ_PROVISIONING_DEFAULTS}" ]]; then
+    [[ -s "${DOMOTZ_PROVISIONING_DEFAULTS}" ]] || return 1
+    [[ "$(stat -c %U:%G "${DOMOTZ_PROVISIONING_DEFAULTS}" 2>/dev/null || true)" == "root:root" ]] || return 1
+    [[ "$(stat -c %a "${DOMOTZ_PROVISIONING_DEFAULTS}" 2>/dev/null || true)" == "600" ]] || return 1
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); raise SystemExit(0 if str(d.get("activation_key","")).strip() else 1)' \
+      "${DOMOTZ_PROVISIONING_DEFAULTS}" >/dev/null 2>&1 || return 1
+    echo "INFO - Domotz provisioning lifecycle state: PRE_REGISTRATION_STAGED"
+    return 0
+  fi
+
+  # A build without an embedded/staged deployment key is supported; Engineering
+  # will supply the credential later during deployment preparation. Absence is
+  # therefore valid only when this source instance itself has no embedded key.
+  if [[ -z "${DOMOTZ_COLLECTOR_ACTIVATION_KEY}" ]]; then
+    echo "INFO - Domotz provisioning lifecycle state: PRE_REGISTRATION_ENGINEERING_INPUT_REQUIRED"
+    return 0
+  fi
+
+  echo "ERROR - Domotz provisioning lifecycle is inconsistent: registration is incomplete, an embedded deployment key exists, but the root-only provisioning defaults file is absent."
+  return 1
+}
+
 final_summary_check() {
   step_message 18 "Run mandatory pre-reboot validation"
 
@@ -5452,9 +5498,9 @@ check_final_requirement "Solutionz security validator installed" test -x "${SECU
   check_final_requirement "Persistent IPv4 forwarding disable policy installed" grep -Eq '^net\.ipv4\.ip_forward=0$' "${IP_FORWARD_SYSCTL_FILE}" || failures=$((failures + 1))
   check_final_requirement "Current IPv4 forwarding is disabled" bash -c '[[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "0" ]]' || failures=$((failures + 1))
   check_final_requirement "Installed Setup copy does not retain embedded Domotz activation key" grep -q '^DOMOTZ_COLLECTOR_ACTIVATION_KEY_DEFAULT=""$' "${INSTALLED_SCRIPT_COPY}" || failures=$((failures + 1))
-  if [[ -n "${DOMOTZ_COLLECTOR_ACTIVATION_KEY}" ]]; then
-    check_final_requirement "Domotz provisioning defaults staged root-only" bash -c 'f="$1"; [[ -s "$f" && "$(stat -c %U:%G "$f")" == root:root && "$(stat -c %a "$f")" == 600 ]]' _ "${DOMOTZ_PROVISIONING_DEFAULTS}" || failures=$((failures + 1))
-  fi
+
+  check_final_requirement "Domotz provisioning credential lifecycle is valid" \
+    validate_domotz_provisioning_lifecycle || failures=$((failures + 1))
   check_final_requirement "Integrated Domotz activation helper installed" test -x "${DOMOTZ_ACTIVATION_HELPER}" || failures=$((failures + 1))
   check_final_requirement "Domotz activation service unit installed" test -s "${DOMOTZ_ACTIVATION_SERVICE}" || failures=$((failures + 1))
   check_final_requirement "Domotz activation timer unit installed" test -s "${DOMOTZ_ACTIVATION_TIMER}" || failures=$((failures + 1))

@@ -17,6 +17,7 @@ set -Eeuo pipefail
 # Engineering-key protected credential provisioning update: 2026-11-05
 # Production engineering-key preflight/fingerprint validation update: 2026-11-05
 # Embedded Domotz deployment credential update: 2026-11-06
+# Network transaction/locking + offline USB-C staging hardening update: 2026-11-11
 #
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
@@ -38,12 +39,12 @@ set -Eeuo pipefail
 #     accounts on interactive SSH, local console, or USB-C COM login. Authenticated
 #     engineering logins also land on the same menu in ENGINEERING mode, where an
 #     engineering shell is available only after engineering authentication.
-#   - The default engineering login is solz_eng. Setup creates/configures the
-#     account but never embeds a password. A Solutionz engineering SSH public key
-#     is installed for first access. After Phase 2 validates successfully, an
-#     engineer authenticates as solz_eng with the matching private key, enters the
-#     same Solutionz menu in ENGINEERING mode, and selects option 9 to create the
-#     local solz_eng password. Technicians cannot perform this first-time setup.
+#   - The default engineering login is solz_eng. Fresh/unprovisioned appliances
+#     receive the approved Solutionz default engineering password as a one-way
+#     SHA-512 password hash; the plaintext password is never stored in Setup.
+#     The Solutionz engineering SSH public key remains installed as the preferred
+#     remote-access credential. If Engineering changes the local password later,
+#     rerunning Setup preserves the changed password instead of resetting it.
 #   - Only the public SSH key is stored in Setup/on the appliance. The matching
 #     private key remains with Solutionz Engineering and is never copied to GitHub
 #     or to a V1210 appliance.
@@ -143,6 +144,9 @@ NETWORK_PROFILE_FILE="${NETWORK_PROFILE_DIR}/network-profile.json"
 NETWORK_PROFILE_TOOL="/usr/local/sbin/solutionz-rmm-network-profile"
 NETWORK_PROFILE_RESULT_FILE="${STATE_DIR}/network-profile-${REVISION}.result"
 NETWORK_PROFILE_SOURCE=""
+NETWORK_CONFIG_LOCK_FILE="/run/lock/solutionz-rmm-network-config.lock"
+NETWORK_TRANSACTION_ROOT="${STATE_DIR}/network-transactions"
+NETWORK_TRANSACTION_CURRENT=""
 
 PRIMARY_IFACE="eth0"
 SECONDARY_IFACE="eth1"
@@ -181,6 +185,10 @@ ENGINEERING_USER="${SOLUTIONZ_RMM_ENGINEERING_USER:-solz_eng}"
 # An environment override is retained for controlled testing/recovery builds.
 ENGINEERING_SSH_PUBLIC_KEY_DEFAULT="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID+1eabf+qtPdaR33oTrQPTl1GV3Ru/1xsFklfa1Sbfv Solutionz RMM Engineering"
 ENGINEERING_SSH_PUBLIC_KEY="${SOLUTIONZ_RMM_ENGINEERING_SSH_PUBLIC_KEY:-${ENGINEERING_SSH_PUBLIC_KEY_DEFAULT}}"
+# Default engineering password is stored only as a one-way SHA-512 crypt hash.
+# Override only with another precomputed crypt hash, never with plaintext.
+ENGINEERING_DEFAULT_PASSWORD_HASH_DEFAULT='$6$ZW5peV.ARuXyhI5t$lys38PO0hLihNoI3YyDr51dtwP39qNEXIsUzJqRXp6u91B8/vtDhJVWbI/xpAVjczsAfB7NReXUZ2D8s4KDll.'
+ENGINEERING_DEFAULT_PASSWORD_HASH="${SOLUTIONZ_RMM_ENGINEERING_PASSWORD_HASH:-${ENGINEERING_DEFAULT_PASSWORD_HASH_DEFAULT}}"
 ENGINEERING_SSH_FINGERPRINT_FILE="${STATE_DIR}/engineering-ssh-key-${REVISION}.fingerprint"
 ENGINEERING_PASSWORD_MARKER="${STATE_DIR}/engineering-password-provisioned"
 ENGINEERING_PASSWORD_TOOL="/usr/local/sbin/solutionz-rmm-engineering-password-setup"
@@ -270,6 +278,7 @@ REQUIRED_PACKAGES=(
   auditd
   apparmor
   unattended-upgrades
+  util-linux
 )
 
 # Solutionz RMM traffic model:
@@ -680,12 +689,12 @@ Technician and engineering access:
   configuration menu on interactive SSH, local console, or USB-C COM login.
   Members of solutionz-rmm-engineering are exempt and retain a normal shell.
   The default engineering account is created with a Bash shell and sudo access.
-  Setup intentionally does not embed the engineering password.
-  The engineering account is initially reachable only with the configured
-  Solutionz engineering SSH key. After reboot and successful Phase 2 validation,
-  the first authenticated ${ENGINEERING_USER} interactive login is forced to
-  create its password before the engineering shell opens. Technician accounts
-  cannot perform or bypass this engineering credential step.
+  Fresh/unprovisioned engineering accounts receive the approved default local
+  password from a one-way SHA-512 hash stored in Setup; the plaintext password is
+  not embedded or logged. The Solutionz engineering SSH key remains installed as
+  the preferred remote-access credential. A password changed later by Engineering
+  is preserved across future Setup reruns. Technician accounts cannot change or
+  provision the engineering credential.
   USB-C COM remains available at 115200 baud, 8 data bits, no parity, 1 stop bit.
 
 Domotz note:
@@ -1066,6 +1075,7 @@ verify_required_packages() {
   command -v ping >/dev/null 2>&1 || error_exit "ping command not found."
   command -v ufw >/dev/null 2>&1 || error_exit "ufw command not found."
   command -v python3 >/dev/null 2>&1 || error_exit "python3 command not found."
+  command -v flock >/dev/null 2>&1 || error_exit "flock command not found (util-linux)."
 }
 
 verify_ssh_service() {
@@ -1549,10 +1559,10 @@ configure_security_hardening() {
     progress_message "Removed unrestricted sudo membership from technician account ${TECHNICIAN_USER}."
   fi
 
-  # First engineering access is authenticated with a Solutionz-held SSH private
-  # key. Only the public key is installed on the appliance and may safely reside
-  # in this Setup source. This creates the trusted distinction between an
-  # engineer and a technician before the engineering password exists.
+  # Engineering access retains the Solutionz-held SSH private-key path. Only the
+  # public key is installed on the appliance. A default local engineering password
+  # is also provisioned on fresh/unprovisioned builds from a one-way hash so USB-C
+  # and approved password-authenticated access have a known recovery credential.
   local engineering_home engineering_key_to_install engineering_password_state
   engineering_home="$(getent passwd "${ENGINEERING_USER}" | awk -F: '{print $6}')"
   [[ -n "${engineering_home}" ]] || error_exit "Unable to determine home directory for ${ENGINEERING_USER}."
@@ -1577,26 +1587,32 @@ configure_security_hardening() {
   chown root:root "${ENGINEERING_SSH_FINGERPRINT_FILE}"
   progress_message "Engineering SSH public-key access configured for ${ENGINEERING_USER}; fingerprint ${engineering_key_fingerprint}."
 
-  # Existing explicitly provisioned passwords are preserved. A new/unprovisioned
-  # engineering account receives a high-entropy discarded password hash so the
-  # account is not OS-locked (and can authenticate by public key), while password
-  # authentication remains computationally unusable until the engineer replaces
-  # it after Phase 2. The random secret is never logged or retained.
+  # Preserve any password that Engineering has already provisioned. Fresh or
+  # unprovisioned accounts receive the approved default engineering password via
+  # its one-way SHA-512 crypt hash. Setup never needs the plaintext value.
   engineering_password_state="$(passwd -S "${ENGINEERING_USER}" 2>/dev/null | awk '{print $2}' || true)"
   if [[ -s "${ENGINEERING_PASSWORD_MARKER}" && "${engineering_password_state}" == "P" ]]; then
     progress_message "Engineering password was previously provisioned; Setup preserved it unchanged."
   else
-    local _eng_bootstrap_secret _eng_bootstrap_hash
-    _eng_bootstrap_secret="$(openssl rand -base64 48 | tr -d '\n')"
-    _eng_bootstrap_hash="$(printf '%s' "${_eng_bootstrap_secret}" | openssl passwd -6 -stdin)"
-    usermod -p "${_eng_bootstrap_hash}" "${ENGINEERING_USER}" || \
-      error_exit "Unable to establish key-only bootstrap state for ${ENGINEERING_USER}."
-    unset _eng_bootstrap_secret _eng_bootstrap_hash
-    rm -f "${ENGINEERING_PASSWORD_MARKER}"
-    info_message "Engineering password is pending. After Phase 2, the first SSH-key-authenticated ${ENGINEERING_USER} interactive login will be forced to create it."
+    [[ -n "${ENGINEERING_DEFAULT_PASSWORD_HASH}" ]] || \
+      error_exit "Default engineering password hash is empty."
+    [[ "${ENGINEERING_DEFAULT_PASSWORD_HASH}" == '$6$'* ]] || \
+      error_exit "Default engineering password hash must be a SHA-512 crypt hash beginning with \$6\$."
+    usermod -p "${ENGINEERING_DEFAULT_PASSWORD_HASH}" "${ENGINEERING_USER}" || \
+      error_exit "Unable to provision the default engineering password for ${ENGINEERING_USER}."
+    install -d -m 750 "$(dirname "${ENGINEERING_PASSWORD_MARKER}")"
+    {
+      echo "engineering_login=${ENGINEERING_USER}"
+      echo "status=configured"
+      echo "timestamp_utc=$(date -u +%FT%TZ)"
+      echo "source=default_engineering_password_hash"
+    } > "${ENGINEERING_PASSWORD_MARKER}"
+    chmod 640 "${ENGINEERING_PASSWORD_MARKER}"
+    chown root:root "${ENGINEERING_PASSWORD_MARKER}"
+    progress_message "Default engineering password provisioned for ${ENGINEERING_USER}; plaintext was not stored or logged."
   fi
 
-  progress_message "Engineering login ${ENGINEERING_USER} assigned to ${ENGINEERING_GROUP} with sudo and unrestricted Bash shell access after credential provisioning."
+  progress_message "Engineering login ${ENGINEERING_USER} assigned to ${ENGINEERING_GROUP} with sudo and unrestricted Bash shell access."
 
   cat > "${SECURITY_SYSCTL_FILE}" <<'EOF'
 # Solutionz RMM host-network hardening. Do not enable IP forwarding on the dual-homed collector.
@@ -2149,6 +2165,7 @@ RESULT="/var/lib/rswsolutionz-rmm/network-validation-V06.100626N.result"
 WAN="eth0"
 LAN="eth1"
 WAIT_SECONDS="${SOLUTIONZ_NETWORK_VALIDATION_WAIT_SECONDS:-30}"
+OFFLINE_STAGING="${SOLUTIONZ_RMM_OFFLINE_STAGING:-0}"
 
 CONFIG_FAILS=()
 CONNECT_FAILS=()
@@ -2264,6 +2281,7 @@ if command -v networkctl >/dev/null 2>&1; then
 fi
 
 ready_now() {
+  [[ "$OFFLINE_STAGING" == "1" ]] && return 0
   carrier "$WAN" || return 1
   [[ -n "$(ip4 "$WAN")" ]] || return 1
   mapfile -t defaults < <(ip -4 route show default 2>/dev/null)
@@ -2300,13 +2318,23 @@ done
 
 ip link show "$WAN" >/dev/null 2>&1 && ok "WAN eth0 exists." || cf "WAN eth0 missing."
 ip link show "$LAN" >/dev/null 2>&1 && ok "LAN eth1 exists." || cf "LAN eth1 missing."
-carrier "$WAN" && ok "WAN eth0 carrier UP." || cf "WAN eth0 carrier DOWN."
+if carrier "$WAN"; then
+  ok "WAN eth0 carrier UP."
+elif [[ "$OFFLINE_STAGING" == "1" ]]; then
+  info "WAN eth0 carrier DOWN; live-link validation deferred for USB-C offline staging."
+else
+  cf "WAN eth0 carrier DOWN."
+fi
 if carrier "$LAN"; then
   LAN_STATUS="CONNECTED"
   ok "LAN eth1 carrier UP."
 elif (( LAN_REQUIRED )); then
   LAN_STATUS="REQUIRED_NOT_CONNECTED"
-  cf "LAN eth1 is required by the configured static LAN/VLAN profile but has no carrier."
+  if [[ "$OFFLINE_STAGING" == "1" ]]; then
+    info "LAN eth1 is required by the configured static LAN/VLAN profile but has no carrier; live-link validation deferred for USB-C offline staging."
+  else
+    cf "LAN eth1 is required by the configured static LAN/VLAN profile but has no carrier."
+  fi
 else
   LAN_STATUS="OPTIONAL_NOT_CONNECTED"
   info "LAN eth1 is not connected. eth1 is optional for this profile; LAN validation is skipped until a cable is connected."
@@ -2315,22 +2343,32 @@ fi
 wan_addr="$(ip4 "$WAN")"
 if [[ -n "$wan_addr" ]]; then
   ok "WAN eth0 IPv4 ${wan_addr}."
+elif [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$WAN"; then
+  info "WAN eth0 has no live IPv4 address because carrier is down; live address validation deferred for USB-C offline staging."
 else
   cf "WAN eth0 has no IPv4 address."
 fi
 if [[ "$WAN_MODE" == "static" && -n "$WAN_EXPECTED" && "$wan_addr" != "$WAN_EXPECTED" ]]; then
-  cf "WAN eth0 IPv4 ${wan_addr:-none}; expected ${WAN_EXPECTED}."
+  if [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$WAN"; then
+    info "WAN eth0 live IPv4 ${wan_addr:-none}; expected ${WAN_EXPECTED}. Comparison deferred until carrier is present."
+  else
+    cf "WAN eth0 IPv4 ${wan_addr:-none}; expected ${WAN_EXPECTED}."
+  fi
 fi
 
 mapfile -t DEFAULTS < <(ip -4 route show default 2>/dev/null)
 if [[ ${#DEFAULTS[@]} -eq 1 ]]; then
   ok "Exactly one IPv4 default route is installed."
+elif [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$WAN" && [[ ${#DEFAULTS[@]} -eq 0 ]]; then
+  info "No IPv4 default route is currently installed because WAN carrier is down; route validation deferred for USB-C offline staging."
 else
   cf "Expected exactly one IPv4 default route; found ${#DEFAULTS[@]}."
 fi
 
 if [[ "$(default_iface)" == "$WAN" ]]; then
   ok "Default route uses WAN eth0."
+elif [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$WAN" && [[ -z "$(default_iface)" ]]; then
+  info "No active default-route interface while WAN carrier is down; ownership validation deferred for USB-C offline staging."
 else
   cf "Default route does not use WAN eth0."
 fi
@@ -2350,9 +2388,13 @@ fi
 if (( PROFILE_VALID )); then
   if [[ "$WAN_MODE" == "static" && -n "$WAN_GATEWAY_EXPECTED" ]]; then
     actual_gateway="$(default_gateway "$WAN")"
-    [[ "$actual_gateway" == "$WAN_GATEWAY_EXPECTED" ]] && \
-      ok "WAN gateway ${actual_gateway} matches profile." || \
+    if [[ "$actual_gateway" == "$WAN_GATEWAY_EXPECTED" ]]; then
+      ok "WAN gateway ${actual_gateway} matches profile."
+    elif [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$WAN"; then
+      info "WAN gateway ${actual_gateway:-none}; expected ${WAN_GATEWAY_EXPECTED}. Live gateway validation deferred until carrier is present."
+    else
       cf "WAN gateway ${actual_gateway:-none}; expected ${WAN_GATEWAY_EXPECTED}."
+    fi
   fi
 
   if [[ "$LAN_MODE" == "none" ]]; then
@@ -2369,7 +2411,11 @@ if (( PROFILE_VALID )); then
         cf "LAN eth1 IPv4 ${lan_addr:-none}; expected ${LAN_EXPECTED}."
       fi
     elif (( LAN_REQUIRED )); then
-      cf "LAN eth1 has no IPv4 address because the required LAN interface is not connected."
+      if [[ "$OFFLINE_STAGING" == "1" ]]; then
+        info "LAN eth1 has no live IPv4 address because required LAN carrier is down; live address validation deferred for USB-C offline staging."
+      else
+        cf "LAN eth1 has no IPv4 address because the required LAN interface is not connected."
+      fi
     else
       info "LAN eth1 has no IPv4 address because the optional LAN interface is not connected."
     fi
@@ -2384,9 +2430,19 @@ if (( PROFILE_VALID )); then
       cf "${vname} missing or has the wrong 802.1Q VLAN ID."
     fi
     vaddr="$(ip4 "$vname")"
-    [[ -n "$vaddr" ]] && ok "${vname} IPv4 ${vaddr}." || cf "${vname} has no IPv4 address."
+    if [[ -n "$vaddr" ]]; then
+      ok "${vname} IPv4 ${vaddr}."
+    elif [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$LAN"; then
+      info "${vname} has no live IPv4 address while eth1 carrier is down; live address validation deferred for USB-C offline staging."
+    else
+      cf "${vname} has no IPv4 address."
+    fi
     if [[ "$vmode" == "static" && -n "$vexpected" && "$vaddr" != "$vexpected" ]]; then
-      cf "${vname} IPv4 ${vaddr:-none}; expected ${vexpected}."
+      if [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$LAN"; then
+        info "${vname} live IPv4 ${vaddr:-none}; expected ${vexpected}. Comparison deferred until eth1 carrier is present."
+      else
+        cf "${vname} IPv4 ${vaddr:-none}; expected ${vexpected}."
+      fi
     fi
   done < <(profile_vlans)
 fi
@@ -2432,6 +2488,7 @@ echo "wan_interface=${WAN}"
   echo "lan_interface=${LAN}"
   echo "lan_required=${LAN_REQUIRED}"
   echo "lan_status=${LAN_STATUS}"
+  echo "offline_usb_staging=${OFFLINE_STAGING}"
   echo "lan_carrier=$(carrier "$LAN" && echo UP || echo DOWN)"
   echo "lan_ipv4=$(ip4 "$LAN")"
   echo "ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
@@ -2459,11 +2516,18 @@ stage_production_network_profile() {
   install -d -m 750 "${NETWORK_PROFILE_DIR}"
   if [[ -n "${NETWORK_PROFILE_SOURCE}" ]]; then
     [[ -r "${NETWORK_PROFILE_SOURCE}" ]] || error_exit "Network profile is not readable: ${NETWORK_PROFILE_SOURCE}"
-    cp -f "${NETWORK_PROFILE_SOURCE}" "${NETWORK_PROFILE_FILE}"; chmod 600 "${NETWORK_PROFILE_FILE}"
+    cp -f "${NETWORK_PROFILE_SOURCE}" "${NETWORK_PROFILE_FILE}"
+    chmod 600 "${NETWORK_PROFILE_FILE}"
     progress_message "Using supplied dual-homed WAN/LAN network profile: ${NETWORK_PROFILE_SOURCE}"
+  elif [[ -s "${NETWORK_PROFILE_FILE}" ]]; then
+    if "${NETWORK_PROFILE_TOOL}" validate "${NETWORK_PROFILE_FILE}" >/dev/null 2>&1; then
+      progress_message "Existing valid customer network profile detected; preserving ${NETWORK_PROFILE_FILE}."
+    else
+      error_exit "Existing network profile is present but invalid. Refusing to replace it with the default profile. Supply --network-profile <json> or repair ${NETWORK_PROFILE_FILE}."
+    fi
   else
     write_default_network_profile
-    progress_message "No network profile supplied; using default WAN eth0 DHCP + LAN eth1 DHCP profile."
+    progress_message "No existing network profile found and none supplied; creating default WAN eth0 DHCP + LAN eth1 DHCP profile."
   fi
   "${NETWORK_PROFILE_TOOL}" render "${NETWORK_PROFILE_FILE}" "${NETPLAN_FILE}" "${NETWORK_PROFILE_RESULT_FILE}" || error_exit "WAN/LAN/VLAN profile rendering failed. Review ${NETWORK_PROFILE_RESULT_FILE}."
   chmod 600 "${NETPLAN_FILE}"
@@ -2479,10 +2543,42 @@ remove_stale_cloud_init_netplans() {
   shopt -u nullglob
 }
 
+create_setup_network_transaction() {
+  install -d -m 750 "${NETWORK_TRANSACTION_ROOT}"
+  local tx id
+  tx="$(mktemp -d "${NETWORK_TRANSACTION_ROOT}/$(date -u +%Y%m%dT%H%M%SZ)-setup-XXXXXX")" || error_exit "Unable to create network configuration transaction backup."
+  chmod 750 "${tx}"
+  id="$(basename "${tx}")"
+  {
+    echo "transaction_id=${id}"
+    echo "created_utc=$(date -u +%FT%TZ)"
+    echo "source=setup"
+    if [[ -f "${NETPLAN_FILE}" ]]; then
+      echo "netplan_present=1"
+      echo "netplan_sha256=$(sha256sum "${NETPLAN_FILE}" | awk '{print $1}')"
+    else
+      echo "netplan_present=0"
+    fi
+    if [[ -f "${NETWORK_PROFILE_FILE}" ]]; then
+      echo "profile_present=1"
+      echo "profile_sha256=$(sha256sum "${NETWORK_PROFILE_FILE}" | awk '{print $1}')"
+    else
+      echo "profile_present=0"
+    fi
+  } > "${tx}/manifest"
+  chmod 640 "${tx}/manifest"
+  [[ -f "${NETPLAN_FILE}" ]] && cp -a "${NETPLAN_FILE}" "${tx}/netplan.yaml"
+  [[ -f "${NETWORK_PROFILE_FILE}" ]] && cp -a "${NETWORK_PROFILE_FILE}" "${tx}/network-profile.json"
+  NETWORK_TRANSACTION_CURRENT="${tx}"
+  progress_message "Captured exact pre-change network transaction: ${id}"
+}
+
 stage_network_config() {
   step_message 10 "Stage dual-homed WAN eth0 / LAN eth1 networking"
-  [[ -f "${NETPLAN_FILE}" ]] && cp -a "${NETPLAN_FILE}" "${NETPLAN_FILE}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
-  [[ -f "${NETWORK_PROFILE_FILE}" ]] && cp -a "${NETWORK_PROFILE_FILE}" "${NETWORK_PROFILE_FILE}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  install -d -m 755 "$(dirname "${NETWORK_CONFIG_LOCK_FILE}")"
+  exec 8>"${NETWORK_CONFIG_LOCK_FILE}"
+  flock -n 8 || error_exit "Another USB-C/SSH/Setup session is modifying network configuration. Retry after that session completes."
+  create_setup_network_transaction
   stage_production_network_profile
   remove_stale_cloud_init_netplans
   mkdir -p /etc/cloud/cloud.cfg.d
@@ -2496,6 +2592,8 @@ EOF
   chmod 644 "${IP_FORWARD_SYSCTL_FILE}"; sysctl -w net.ipv4.ip_forward=0 >/dev/null
   netplan generate
   progress_message "Netplan validated: eth0 WAN owns the only default route; eth1/VLANs are AV LAN paths with no default route; IPv4 forwarding is disabled."
+  flock -u 8 || true
+  exec 8>&-
 }
 
 repair_resolv_conf() {
@@ -2660,6 +2758,9 @@ REGISTER_NEW_DOMOTZ_DIRECT=0
 PRODUCTION_VALIDATION_RESULT="NOT_RUN"
 PRE_NETPLAN_SHA256=""
 PRE_PROFILE_SHA256=""
+NETWORK_LOCK="/run/lock/solutionz-rmm-network-config.lock"
+TRANSACTION_ROOT="/var/lib/rswsolutionz-rmm/network-transactions"
+CURRENT_TRANSACTION=""
 
 case "${1:-}" in
   --restricted-login|--serial-auto)
@@ -2693,12 +2794,90 @@ esac
 
 
 sha_file() { [[ -f "$1" ]] && sha256sum "$1" | awk '{print $1}' || true; }
-bak() { [[ -f "$1" ]] && cp -a "$1" "$1.networkcfg.bak.$(date -u +%Y%m%dT%H%M%SZ)"; }
-latest() { ls -1t "$1".networkcfg.bak.* 2>/dev/null | head -n1 || true; }
-backup() {
+
+with_network_lock() {
+  local label="$1"
+  shift
+  install -d -m 755 "$(dirname "$NETWORK_LOCK")"
+  exec 9>"$NETWORK_LOCK"
+  if ! flock -n 9; then
+    echo
+    echo "NETWORK CONFIGURATION BUSY"
+    echo "Another USB-C, SSH, or Setup session currently owns the network configuration lock."
+    echo "No Netplan/profile files were changed by this session. Retry after the other session completes."
+    exec 9>&-
+    return 75
+  fi
+  local rc
+  if "$@"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  flock -u 9 || true
+  exec 9>&-
+  return "$rc"
+}
+
+create_transaction() {
+  local source="${1:-interactive}" tx id
+  install -d -m 750 "$TRANSACTION_ROOT"
+  tx="$(mktemp -d "$TRANSACTION_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-${source}-XXXXXX")" || return 1
+  chmod 750 "$tx"
+  id="$(basename "$tx")"
   PRE_NETPLAN_SHA256="$(sha_file "$NETPLAN")"
   PRE_PROFILE_SHA256="$(sha_file "$PROFILE")"
-  bak "$NETPLAN"; bak "$PROFILE"
+  {
+    echo "transaction_id=$id"
+    echo "created_utc=$(date -u +%FT%TZ)"
+    echo "source=$source"
+    echo "user=${SUDO_USER:-${USER:-unknown}}"
+    echo "tty=$(tty 2>/dev/null || echo none)"
+    echo "netplan_present=$([[ -f "$NETPLAN" ]] && echo 1 || echo 0)"
+    echo "profile_present=$([[ -f "$PROFILE" ]] && echo 1 || echo 0)"
+    echo "netplan_sha256=$PRE_NETPLAN_SHA256"
+    echo "profile_sha256=$PRE_PROFILE_SHA256"
+  } > "$tx/manifest"
+  chmod 640 "$tx/manifest"
+  [[ -f "$NETPLAN" ]] && cp -a "$NETPLAN" "$tx/netplan.yaml"
+  [[ -f "$PROFILE" ]] && cp -a "$PROFILE" "$tx/network-profile.json"
+  CURRENT_TRANSACTION="$tx"
+  echo "Network transaction captured: $id"
+}
+
+latest_transaction() {
+  find "$TRANSACTION_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null     | sort -nr | awk 'NR==1 {$1=""; sub(/^ /,""); print; exit}'
+}
+
+restore_transaction() {
+  local tx="$1" np pf
+  [[ -d "$tx" && -s "$tx/manifest" ]] || { echo "Transaction backup is missing or invalid: $tx"; return 1; }
+  np="$(awk -F= '$1=="netplan_present" {print $2}' "$tx/manifest" | tail -n1)"
+  pf="$(awk -F= '$1=="profile_present" {print $2}' "$tx/manifest" | tail -n1)"
+  if [[ "$np" == "1" ]]; then
+    [[ -f "$tx/netplan.yaml" ]] || { echo "Transaction Netplan snapshot missing."; return 1; }
+    cp -a "$tx/netplan.yaml" "$NETPLAN"
+  else
+    rm -f "$NETPLAN"
+  fi
+  if [[ "$pf" == "1" ]]; then
+    [[ -f "$tx/network-profile.json" ]] || { echo "Transaction profile snapshot missing."; return 1; }
+    cp -a "$tx/network-profile.json" "$PROFILE"
+  else
+    rm -f "$PROFILE"
+  fi
+  return 0
+}
+
+backup() {
+  create_transaction interactive
+}
+
+usb_c_offline_staging() {
+  local t
+  t="$(tty 2>/dev/null || true)"
+  [[ -z "${SSH_CONNECTION:-}" && -z "${SSH_CLIENT:-}" && "$t" == "/dev/ttyS0" ]] || return 1
+  [[ "$(cat /sys/class/net/eth0/carrier 2>/dev/null || echo 0)" != "1" || "$(cat /sys/class/net/eth1/carrier 2>/dev/null || echo 0)" != "1" ]]
 }
 prechange_integrity_verify() {
   if [[ ! -x "$INTEGRITY" || ! -s "$SECURITY_BASELINE" ]]; then
@@ -2820,6 +2999,7 @@ change() {
     echo "current_netplan_sha256=$(sha_file "$NETPLAN")"
     echo "previous_profile_sha256=$PRE_PROFILE_SHA256"
     echo "current_profile_sha256=$(sha_file "$PROFILE")"
+    echo "network_transaction=${CURRENT_TRANSACTION:-none}"
     echo "network_validation_result=$RESULT"
     echo "production_validation_result=$PRODUCTION_VALIDATION_RESULT"
     echo "production_validation_file=$POST_RESULT"
@@ -2831,19 +3011,22 @@ change() {
 }
 
 restore_prev() {
-  local n p
-  n="$(latest "$NETPLAN")"
-  p="$(latest "$PROFILE")"
-  [[ -n "$n" ]] && cp -a "$n" "$NETPLAN"
-  [[ -n "$p" ]] && cp -a "$p" "$PROFILE"
+  [[ -n "$CURRENT_TRANSACTION" ]] || { echo "No active network transaction is available for rollback."; return 1; }
+  restore_transaction "$CURRENT_TRANSACTION" || return 1
   netplan generate >/dev/null 2>&1 && netplan apply >/dev/null 2>&1
 }
 
 rollback_and_validate() {
   restore_prev || return 1
   set +e
-  "$VALIDATOR" >/dev/null 2>&1
-  local rc=$?
+  local rc
+  if usb_c_offline_staging; then
+    SOLUTIONZ_RMM_OFFLINE_STAGING=1 "$VALIDATOR" >/dev/null 2>&1
+    rc=$?
+  else
+    "$VALIDATOR" >/dev/null 2>&1
+    rc=$?
+  fi
   set -e
   [[ $rc -ne 10 ]]
 }
@@ -2892,7 +3075,7 @@ run_production_validation() {
 }
 
 apply() {
-  local type="$1" rc
+  local type="$1" rc offline_apply=0
   echo
   echo "Proposed Solutionz network profile:"
   cat "$PROFILE"
@@ -2928,7 +3111,14 @@ apply() {
   echo
   echo "Running automatic post-change WAN/LAN/VLAN validation..."
   set +e
-  "$VALIDATOR"
+  if usb_c_offline_staging; then
+    offline_apply=1
+    echo "OFFLINE USB-C STAGING MODE: one or more Ethernet interfaces have no carrier."
+    echo "Carrier/DHCP/live-route checks for disconnected links are deferred; profile syntax, Netplan generation, route isolation, VLAN structure, and security controls still validate."
+    SOLUTIONZ_RMM_OFFLINE_STAGING=1 "$VALIDATOR"
+  else
+    "$VALIDATOR"
+  fi
   rc=$?
   set -e
 
@@ -2944,6 +3134,19 @@ apply() {
       echo "ROLLBACK FAILED OR COULD NOT BE REVALIDATED. Use USB-C COM recovery."
     fi
     return 1
+  fi
+
+  if (( offline_apply == 1 )); then
+    echo
+    echo "OFFLINE USB-C NETWORK STAGING: ACCEPTED"
+    echo "The persistent Netplan/profile transaction is retained. Carrier, DHCP lease, live gateway, and cloud reachability checks will be completed when Ethernet connectivity is present."
+    if ! refresh_integrity_baseline; then
+      change FAIL "$type" OFFLINE_STAGING_SECURITY_BASELINE_REFRESH_FAILED_CONFIGURATION_RETAINED
+      echo "SECURITY BASELINE REFRESH: FAIL. Network configuration remains applied for recovery."
+      return 1
+    fi
+    change PASS "$type" OFFLINE_USB_STAGED_LIVE_VALIDATION_DEFERRED
+    return 0
   fi
 
   if [[ $rc -eq 20 ]]; then
@@ -3009,7 +3212,7 @@ MODIFYPY
   return 0
 }
 
-wan() {
+wan_locked() {
   guard_change wan || return 1
   local m a g d
   read -r -p "WAN mode [dhcp/static]: " m
@@ -3034,7 +3237,7 @@ wan() {
   apply wan
 }
 
-lan() {
+lan_locked() {
   guard_change lan || return 1
   local m a
   read -r -p "LAN native mode [dhcp/static/none]: " m
@@ -3057,7 +3260,7 @@ lan() {
   apply lan
 }
 
-wizard() {
+wizard_locked() {
   guard_change all || return 1
   local t
   t="$(mktemp)"
@@ -3065,12 +3268,17 @@ wizard() {
   rm -f "$t"
 }
 
-saved() {
+saved_locked() {
   guard_change all || return 1
   local p
   read -r -p "JSON profile path: " p
   stage "$p" && apply saved_profile
 }
+
+wan() { with_network_lock wan wan_locked || true; }
+lan() { with_network_lock lan lan_locked || true; }
+wizard() { with_network_lock wizard wizard_locked || true; }
+saved() { with_network_lock saved-profile saved_locked || true; }
 
 profile_iface_info() {
   local iface="$1"
@@ -3236,8 +3444,15 @@ show() {
 
 validate() {
   set +e
-  "$VALIDATOR"
-  local rc=$?
+  local rc
+  if usb_c_offline_staging; then
+    echo "OFFLINE USB-C STAGING MODE: live-link validation is deferred for disconnected Ethernet interfaces."
+    SOLUTIONZ_RMM_OFFLINE_STAGING=1 "$VALIDATOR"
+    rc=$?
+  else
+    "$VALIDATOR"
+    rc=$?
+  fi
   set -e
   cat "$RESULT" 2>/dev/null || true
   return $rc
@@ -3249,23 +3464,33 @@ validate_full() {
   [[ -s "$SECURITY_RESULT" ]] && { echo; cat "$SECURITY_RESULT"; }
 }
 
-restore() {
+restore_locked() {
   guard_change all || return 1
   prechange_integrity_verify || return 1
-  local n p a
-  n="$(latest "$NETPLAN")"
-  p="$(latest "$PROFILE")"
-  echo "Netplan: ${n:-none}"
-  echo "Profile: ${p:-none}"
-  prompt_yes_no a "Restore the previous network configuration?"
+  local tx a
+  tx="$(latest_transaction)"
+  [[ -n "$tx" ]] || { echo "No prior network transaction is available to restore."; return 0; }
+  echo "Previous network transaction: $(basename "$tx")"
+  cat "$tx/manifest"
+  prompt_yes_no a "Restore this exact network transaction?"
   [[ "$a" == "YES" ]] || { echo "Restore cancelled."; return 0; }
-  [[ -n "$n" ]] && cp -a "$n" "$NETPLAN"
-  [[ -n "$p" ]] && cp -a "$p" "$PROFILE"
-  netplan generate && netplan apply
+  # Preserve the current state as its own exact transaction before restoring.
+  create_transaction manual-restore-current || return 1
+  restore_transaction "$tx" || return 1
+  if ! netplan generate || ! netplan apply; then
+    echo "Restore transaction could not be applied; restoring the configuration that was active before the restore request."
+    restore_transaction "$CURRENT_TRANSACTION" || true
+    netplan generate >/dev/null 2>&1 && netplan apply >/dev/null 2>&1 || true
+    return 1
+  fi
   [[ -x "$LIVE" ]] && "$LIVE" || true
   validate || true
   refresh_integrity_baseline || true
   run_production_validation
+}
+
+restore() {
+  with_network_lock restore restore_locked || true
 }
 
 engineering_session_authenticated() {
@@ -3587,15 +3812,14 @@ Solutionz RMM Dual-Homed Network Configuration - Revision V06.100626N
 1) Configure WAN / eth0 (DHCP or static; default route/DNS)
 2) Configure LAN / eth1 native network (DHCP, static, or unnumbered trunk)
 3) Guided WAN + LAN + 802.1Q VLAN configuration (VLANs on eth1)
-4) Apply saved WAN/LAN/VLAN JSON profile
-5) Show live + persistent network status
-6) Refresh detected live network information
-7) Run automatic network + security validation
-8) Restore previous network configuration
-9) Engineering Login / Password Setup
-10) Log out
-11) Engineering Tools / Setup Script (engineering authentication required)
-12) Register NEW Domotz Collector Now (technician or engineering)
+4) Show live + persistent network status
+5) Refresh detected live network information
+6) Run automatic network + security validation
+7) Restore previous network configuration
+8) Engineering Login / Password Setup
+9) Engineering Tools / Setup Script (engineering authentication required)
+10) Register NEW Domotz Collector Now (technician or engineering)
+11) Log out
 
 eth0 = WAN/cloud | eth1 = AV/control LAN | VLANs on eth1 | forwarding disabled
 Address entry = IPv4 only in this revision | exactly 4 octets (0-255) | static CIDR /1-/30 | IPv6 rejected
@@ -3603,7 +3827,9 @@ Invalid address/gateway/DNS input is rejected before profile staging or netplan 
 Live detected state comes from the running Linux network stack, not Netplan.
 Netplan remains the persistent configuration mechanism across reboot.
 USB-C COM = independent recovery/configuration path
-Every applied network change is automatically rediscovered and validated; local configuration failures roll back.
+Every applied network change is automatically rediscovered and validated; local configuration failures roll back as one exact transaction.
+USB-C offline staging retains valid profiles when Ethernet carrier is absent; live-link checks are deferred until connectivity is present.
+Network configuration changes are serialized with a lock so USB-C, SSH, and Setup cannot modify Netplan/profile state simultaneously.
 MENU
   if [[ "${SESSION_MODE}" == "engineering" ]]; then
     echo "Session: ENGINEERING (${ENGINEERING_USER})"
@@ -3615,15 +3841,14 @@ MENU
     1) wan ;;
     2) lan ;;
     3) wizard ;;
-    4) saved ;;
-    5) show ;;
-    6) show_live ;;
-    7) validate_full || true ;;
-    8) restore ;;
-    9) engineering_access ;;
-    10) if (( AUTO )); then exit 90; else exit 0; fi ;;
-    11) engineering_tools_entry ;;
-    12) domotz_register_new_now || true ;;
+    4) show ;;
+    5) show_live ;;
+    6) validate_full || true ;;
+    7) restore ;;
+    8) engineering_access ;;
+    9) engineering_tools_entry ;;
+    10) domotz_register_new_now || true ;;
+    11) if (( AUTO )); then exit 90; else exit 0; fi ;;
     *) echo "Invalid selection." ;;
   esac
 done
@@ -4026,9 +4251,9 @@ if (( f == 0 )); then
     if [[ -s "$ENGPASS_MARKER" ]]; then
       echo "engineering_password_status=configured"
     else
-      echo "engineering_password_status=pending_engineering_menu_setup"
+      echo "engineering_password_status=not_configured"
     fi
-    echo "engineering_password_provisioning=authenticated_solz_eng_menu_setup_after_phase2"
+    echo "engineering_password_provisioning=default_hash_or_authenticated_engineering_change"
     echo "log=$LOG"
   } > "$STATE"
   chmod 640 "$STATE"
@@ -5050,6 +5275,8 @@ check_final_requirement "Solutionz security validator installed" test -x "${SECU
   check_final_requirement "Production network profile render result exists" test -s "${NETWORK_PROFILE_RESULT_FILE}" || failures=$((failures + 1))
   check_final_requirement "Production network profile render result is PASS" grep -q '^result=PASS$' "${NETWORK_PROFILE_RESULT_FILE}" || failures=$((failures + 1))
   check_final_requirement "Automatic dual-homed network validator installed" test -x "${NETWORK_VALIDATOR}" || failures=$((failures + 1))
+  check_final_requirement "Network configuration locking available" command -v flock || failures=$((failures + 1))
+  check_final_requirement "Network transaction root exists" test -d "${NETWORK_TRANSACTION_ROOT}" || failures=$((failures + 1))
   check_final_requirement "Persistent IPv4 forwarding disable policy installed" grep -Eq '^net\.ipv4\.ip_forward=0$' "${IP_FORWARD_SYSCTL_FILE}" || failures=$((failures + 1))
   check_final_requirement "Current IPv4 forwarding is disabled" bash -c '[[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "0" ]]' || failures=$((failures + 1))
   check_final_requirement "Installed Setup copy does not retain embedded Domotz activation key" grep -q '^DOMOTZ_COLLECTOR_ACTIVATION_KEY_DEFAULT=""$' "${INSTALLED_SCRIPT_COPY}" || failures=$((failures + 1))
@@ -5156,8 +5383,8 @@ main() {
     "domotz_activation_config=${DOMOTZ_ACTIVATION_CONFIG}" \
     "engineering_login=${ENGINEERING_USER}" \
     "engineering_ssh_key_fingerprint=$(awk -F= '$1=="fingerprint" {print $2}' "${ENGINEERING_SSH_FINGERPRINT_FILE}" 2>/dev/null | head -n1)" \
-    "engineering_password_status=pending_engineering_menu_setup" \
-    "engineering_password_provisioning=authenticated_solz_eng_menu_setup_after_phase2" \
+    "engineering_password_status=configured" \
+    "engineering_password_provisioning=default_hash_or_authenticated_engineering_change" \
     "setup_command=${SETUP_COMMAND}" \
     "log=${LOG_FILE}"
 
@@ -5169,12 +5396,11 @@ main() {
   progress_message "Default technician login: ${TECHNICIAN_USER} (restricted configuration menu)."
   progress_message "Default engineering login: ${ENGINEERING_USER} (engineering shell + sudo)."
   if [[ -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
-    progress_message "Engineering password status: configured; existing credential preserved by Setup."
+    progress_message "Engineering password status: configured; default provisioned on fresh builds or existing credential preserved on rerun."
   else
-    progress_message "Engineering password status: pending authenticated engineering menu provisioning."
-    info_message "Reboot normally. After Phase 2 passes, both technician and engineering interactive logins open the Solutionz RMM configuration menu. Engineering authenticates as ${ENGINEERING_USER} with the configured Solutionz private key, then selects option 9 to create the local engineering password."
+    warning_message "Engineering password marker is missing; review account provisioning before deployment."
   fi
-  progress_message "Network mode after reboot is generated from ${NETWORK_PROFILE_FILE}. Default profile: eth0 WAN DHCP + optional eth1 LAN DHCP with LAN routes/DNS suppressed."
+  progress_message "Network mode after reboot is generated from ${NETWORK_PROFILE_FILE}. Existing valid customer profiles are preserved on rerun; the default eth0 DHCP + optional eth1 DHCP profile is created only when no profile exists."
   progress_message "eth0 is WAN/cloud and owns the only default route. eth1 is optional AV/control LAN unless a static LAN or VLAN profile requires it; 802.1Q VLANs, when used, are linked to eth1."
   progress_message "Automatic network validation tool: ${NETWORK_VALIDATOR}"
   progress_message "Automatic security validation tool: ${SECURITY_VALIDATOR}"
@@ -5182,14 +5408,14 @@ main() {
   progress_message "State File: ${STATE_FILE}"
   progress_message "Log File: ${LOG_FILE}"
   warning_message "Manual reboot is required. Post-reboot validation will run automatically after restart."
-  info_message "After Phase 2 reaches phase2_system_validated, engineering logs in as ${ENGINEERING_USER} with the Solutionz engineering SSH private key. The same Solutionz RMM menu opens in engineering mode; option 9 performs the one-time local password setup."
+  info_message "After Phase 2 reaches phase2_system_validated, engineering may log in as ${ENGINEERING_USER} with the Solutionz engineering SSH private key; the approved default local password is already provisioned on fresh builds. Option 9 remains available for Engineering to change the password."
   info_message "Technician account ${TECHNICIAN_USER} cannot create or change the ${ENGINEERING_USER} password and remains restricted to the technician menu."
-  info_message "Deployment preparation is blocked until the engineering password has been provisioned; then run: sudo solutionz-rmm-setup --prepare-deployment"
+  info_message "Deployment preparation requires a configured engineering password marker; fresh builds receive the approved default automatically."
   info_message "That same Setup source securely stages and arms automatic Domotz registration for the next boot, then powers the appliance off by default."
   info_message "Interactive access: ${FIELD_TECH_GROUP} and ${ENGINEERING_GROUP} members both enter the Solutionz RMM configuration menu. Only an authenticated ${ENGINEERING_USER} session can create/change the engineering password or open the unrestricted engineering shell."
   info_message "USB-C COM recovery/configuration remains available at 115200 8N1."
   info_message "After every network change the script validates WAN eth0, LAN eth1/VLANs, default-route ownership, DNS/Domotz reachability, IPv4 forwarding, firewall/SSH hardening, audit state, and file integrity."
-  info_message "Automated VLAN deployment: use --network-profile <json> or network-menu option 3/4 onsite; VLANs are created on eth1."
+  info_message "Automated VLAN deployment: use --network-profile <json> or network-menu option 3 onsite; VLANs are created on eth1."
   info_message "Domotz is not revision-pinned; the installed revision is recorded in ${SNAP_BASELINE_FILE}."
 }
 

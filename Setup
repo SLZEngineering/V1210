@@ -4489,7 +4489,15 @@ install_domotz_activation() {
   if (( _domotz_registration_complete == 1 )); then
     rm -f "${DOMOTZ_PROVISIONING_DEFAULTS}"
     progress_message "Domotz registration is already complete; deployment credential was not restaged on this appliance."
-  elif [[ -n "${DOMOTZ_COLLECTOR_ACTIVATION_KEY}" ]]; then
+  else
+    # The imaging source MUST carry the approved Collector Activation Key so a
+    # fresh/unregistered appliance can be prepared without a technician typing or
+    # viewing the shared deployment credential. If that source credential is ever
+    # removed accidentally, fail the build here instead of silently degrading to a
+    # manual-key workflow.
+    [[ -n "${DOMOTZ_COLLECTOR_ACTIVATION_KEY}" ]] || \
+      error_exit "Domotz Collector Activation Key is missing from the Setup imaging source. Restore DOMOTZ_COLLECTOR_ACTIVATION_KEY_DEFAULT or provide the approved SOLUTIONZ_RMM_DOMOTZ_ACTIVATION_KEY override."
+
     umask 077
     printf '%s\n%s\n%s\n' \
       "${DOMOTZ_PUBLIC_ENDPOINT}" \
@@ -4500,8 +4508,6 @@ install_domotz_activation() {
     chown root:root "${DOMOTZ_PROVISIONING_DEFAULTS}"
     chmod 600 "${DOMOTZ_PROVISIONING_DEFAULTS}"
     progress_message "Domotz deployment credential staged securely (${DOMOTZ_COLLECTOR_ACTIVATION_KEY_NAME}); secret value not logged."
-  else
-    warning_message "No embedded Domotz Collector Activation Key is configured; engineering will be prompted during deployment preparation."
   fi
 
   cat > "${DOMOTZ_ACTIVATION_HELPER}" <<'PYACTIVATION'
@@ -4814,19 +4820,23 @@ def configure():
         print(f'Domotz API endpoint: {endpoint} (preconfigured)')
         print(f'Collector Activation Key: PRECONFIGURED ({key_name})')
     else:
-        # The endpoint is not a secret and must never disappear merely because
-        # the reusable activation credential was scrubbed after registration.
-        # Preserve the endpoint from an existing collector config when present;
-        # otherwise fall back to the Solutionz US Public API endpoint.
+        # The activation key is deliberately embedded only in the original Setup
+        # imaging source and staged into DEFAULTS as a root-only secret. The field
+        # workflow must never fall back to asking a technician to type that shared
+        # key. An incomplete existing protected config may be reused; a completed
+        # registration has intentionally scrubbed its key and requires a reimage/new
+        # approved provisioning source before another NEW Collector can be created.
         existing = read_config()
-        if existing and str(existing.get('endpoint', '')).strip():
-            endpoint = str(existing['endpoint']).strip()
-            print(f'Domotz API endpoint: {endpoint} (preserved from existing configuration)')
+        if existing and not existing.get('registration_complete') and str(existing.get('activation_key', '')).strip():
+            endpoint = str(existing.get('endpoint', '')).strip() or PUBLIC_API_ENDPOINT_DEFAULT
+            key = str(existing['activation_key']).strip()
+            key_name = str(existing.get('activation_key_name', '')).strip() or 'existing protected configuration'
+            print(f'Domotz API endpoint: {endpoint} (preserved from existing protected configuration)')
+            print(f'Collector Activation Key: PRECONFIGURED ({key_name})')
+        elif existing and existing.get('registration_complete'):
+            raise RuntimeError('This Collector is already registered and its activation key was intentionally scrubbed. Reimage or restore an approved unregistered provisioning source before creating a NEW Collector.')
         else:
-            endpoint = PUBLIC_API_ENDPOINT_DEFAULT
-            print(f'Domotz API endpoint: {endpoint} (Solutionz preconfigured default)')
-        key = getpass.getpass('Collector Activation Key: ').strip()
-        key_name = 'manually entered'
+            raise RuntimeError('Preconfigured Collector Activation Key is unavailable. Rerun the original Solutionz Setup imaging source so the root-only provisioning credential is restaged; technicians must not enter the shared activation key manually.')
     # Solutionz production policy: new collectors must discover attached
     # monitoring networks. Domotz documents deny_all_interfaces=true as a
     # deny-all scan policy, so never set it for standard RMM deployment.

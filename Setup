@@ -22,6 +22,7 @@ set -Eeuo pipefail
 # IPv4-only preflight / cloud TCP probe correction: 2026-11-12
 # Domotz API endpoint persistence / post-registration fallback update: 2026-11-12
 # Regression reconciliation / production-network safeguards restored: 2026-11-12
+# Engineering menu option 9/10 authentication-path fix: 2026-11-13
 #
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
@@ -4165,9 +4166,10 @@ SETUPMENU
 engineering_password_transition() {
   local direct_mode="$1"
   local invoking_user="${SUDO_USER:-}"
-  local direct_arg
+  local direct_arg="" eng_home transition_rc=0
 
   case "${direct_mode}" in
+    shell) ;;
     tools) direct_arg="--engineering-tools" ;;
     register) direct_arg="--register-new-domotz" ;;
     *) echo "ERROR: invalid engineering transition mode." >&2; return 2 ;;
@@ -4175,13 +4177,13 @@ engineering_password_transition() {
 
   if [[ ! -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
     echo "Engineering password has not been provisioned yet."
-    echo "Authenticate as ${ENGINEERING_USER} with the approved Solutionz engineering SSH private key first."
+    echo "Log in directly as ${ENGINEERING_USER} using the approved engineering credential."
     return 1
   fi
 
   if [[ -z "${invoking_user}" || "${invoking_user}" == "root" ]]; then
-    echo "ERROR: unable to identify a restricted invoking user for local engineering authentication." >&2
-    echo "Log in directly as ${ENGINEERING_USER} with the approved engineering credential." >&2
+    echo "ERROR: unable to identify the restricted technician invoking this transition." >&2
+    echo "Log in directly as ${ENGINEERING_USER} for unrestricted engineering shell access." >&2
     return 1
   fi
 
@@ -4190,33 +4192,66 @@ engineering_password_transition() {
     return 1
   fi
 
+  eng_home="$(getent passwd "${ENGINEERING_USER}" | awk -F: '{print $6}')"
+  [[ -n "${eng_home}" ]] || eng_home="/home/${ENGINEERING_USER}"
+
   echo
   echo "Authenticate as ${ENGINEERING_USER}."
   echo "The technician session will not inherit engineering privileges."
   echo
 
-  # Run su as the original technician rather than as root so PAM validates the
-  # local engineering password. Do NOT use `su -` here: a login shell would
-  # source /etc/profile.d/solutionz-rmm-access.sh again, recursively enter the
-  # managed RMM menu, and can terminate the parent technician login when that
-  # nested profile-managed menu exits. Use a non-login Bash command instead and
-  # bind it explicitly to the current terminal. When the engineering child menu
-  # returns, control resumes in this technician menu.
-  local transition_rc=0
+  # PAM authentication must occur as the original technician, not as root.
+  # Do not use `su -`: a login shell can source profile policy again. The shell
+  # transition uses an explicit --noprofile/--norc Bash session; the tools path
+  # uses solz_eng's NOPASSWD sudo permission only after PAM authentication.
   set +e
-  runuser -u "${invoking_user}" -- \
-    /bin/su "${ENGINEERING_USER}" -s /bin/bash -c \
-    "exec sudo -n ${LOCAL_CONFIG_TOOL} ${direct_arg}" \
-    </dev/tty >/dev/tty 2>&1
+  if [[ "${direct_mode}" == "shell" ]]; then
+    runuser -u "${invoking_user}" -- \
+      /bin/su -s /bin/bash "${ENGINEERING_USER}" -c \
+      "exec env HOME='${eng_home}' USER='${ENGINEERING_USER}' LOGNAME='${ENGINEERING_USER}' SHELL=/bin/bash PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -i" \
+      </dev/tty >/dev/tty 2>&1
+  else
+    runuser -u "${invoking_user}" -- \
+      /bin/su -s /bin/bash "${ENGINEERING_USER}" -c \
+      "exec sudo -n ${LOCAL_CONFIG_TOOL} ${direct_arg}" \
+      </dev/tty >/dev/tty 2>&1
+  fi
   transition_rc=$?
   set -e
 
+  echo
   if (( transition_rc != 0 )); then
-    echo
     echo "Engineering authentication/transition did not complete (exit ${transition_rc})."
-    echo "Returning to the technician RMM menu; the login session remains open."
+  else
+    echo "Engineering session ended normally."
   fi
+  echo "Returning to the technician RMM menu; the technician login remains open."
   return 0
+}
+
+open_engineering_shell() {
+  local eng_home
+  eng_home="$(getent passwd "${ENGINEERING_USER}" | awk -F: '{print $6}')"
+  [[ -n "${eng_home}" ]] || eng_home="/home/${ENGINEERING_USER}"
+  echo "Opening engineering shell. Type 'exit' to return to the RMM menu."
+  runuser -u "${ENGINEERING_USER}" -- env \
+    HOME="${eng_home}" USER="${ENGINEERING_USER}" LOGNAME="${ENGINEERING_USER}" \
+    SHELL=/bin/bash TERM="${TERM:-xterm}" \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    /bin/bash --noprofile --norc -i
+}
+
+engineering_shell_entry() {
+  if engineering_session_authenticated; then
+    open_engineering_shell || true
+    return 0
+  fi
+
+  echo
+  echo "============================================================"
+  echo "ENGINEERING SHELL AUTHENTICATION"
+  echo "============================================================"
+  engineering_password_transition shell
 }
 
 engineering_tools_entry() {
@@ -4326,7 +4361,7 @@ engineering_register_entry() {
 engineering_access() {
   echo
   echo "============================================================"
-  echo "ENGINEERING LOGIN / PASSWORD SETUP"
+  echo "ENGINEERING TOOLS / PASSWORD MANAGEMENT"
   echo "============================================================"
 
   if ! engineering_session_authenticated; then
@@ -4347,8 +4382,8 @@ engineering_access() {
         echo "  ssh -i <Solutionz-engineering-private-key> ${ENGINEERING_USER}@<RMM-IP>"
       fi
       echo
-      echo "That authenticated engineering login opens this same menu in engineering mode."
-      echo "Select option 9 again to create the local ${ENGINEERING_USER} password."
+      echo "That authenticated engineering login now opens a normal Bash shell."
+      echo "From the engineering shell, run: sudo ${LOCAL_CONFIG_TOOL} --engineering-tools"
     fi
     return 0
   fi
@@ -4392,10 +4427,7 @@ ENGMENU
     read -r -p "Engineering selection: " ec
     case "${ec}" in
       1)
-        local eng_home
-        eng_home="$(getent passwd "${ENGINEERING_USER}" | awk -F: '{print $6}')"
-        echo "Opening engineering shell. Type 'exit' to return to the RMM menu."
-        runuser -u "${ENGINEERING_USER}" -- env           HOME="${eng_home}" USER="${ENGINEERING_USER}" LOGNAME="${ENGINEERING_USER}"           SHELL=/bin/bash TERM="${TERM:-xterm}"           PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin           /bin/bash --noprofile --norc -i
+        open_engineering_shell || true
         ;;
       2)
         "${ENGINEERING_PASSWORD_TOOL}" --change || true
@@ -4459,8 +4491,8 @@ Solutionz RMM Dual-Homed Network Configuration - Revision V06.100626N
 6) Refresh detected live network information
 7) Run automatic network + security validation
 8) Restore previous network configuration
-9) Engineering Login / Password Setup
-10) Engineering Tools / Setup Script (engineering authentication required)
+9) Engineering Shell Login (authenticate as solz_eng)
+10) Engineering Tools / Setup Script (authenticate as solz_eng)
 11) Register NEW Domotz Collector Now (technician or engineering)
 12) Log out
 
@@ -4489,7 +4521,7 @@ MENU
     6) show_live ;;
     7) validate_full || true ;;
     8) restore ;;
-    9) engineering_access || true ;;
+    9) engineering_shell_entry || true ;;
     10) engineering_tools_entry || true ;;
     11) domotz_register_new_now || true ;;
     12) if (( AUTO )); then exit 90; else exit 0; fi ;;
@@ -5925,8 +5957,8 @@ final_summary_check() {
   check_final_requirement "Network menu provides authenticated engineering-tools transition" grep -q -- '--engineering-tools' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Network menu restores saved JSON profile as option 4" grep -q '^4) Apply saved WAN/LAN/VLAN JSON profile$' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Network menu exposes explicit unused LAN mode" grep -q 'dhcp/static/none/unused' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Network menu restores Engineering Login / Password Setup as option 9" grep -q '^9) Engineering Login / Password Setup$' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Network menu restores Engineering Tools / Setup Script as option 10" grep -q '^10) Engineering Tools / Setup Script (engineering authentication required)$' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Network menu provides Engineering Shell Login as option 9" grep -q '^9) Engineering Shell Login (authenticate as solz_eng)$' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Network menu provides Engineering Tools / Setup Script as option 10" grep -q '^10) Engineering Tools / Setup Script (authenticate as solz_eng)$' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Network menu logout remains option 12" grep -q '^12) Log out$' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Engineering password transition avoids recursive login-shell profile" bash -c "! grep -Eq '/bin/su[[:space:]]+-[[:space:]]+.*solz_eng|/bin/su[[:space:]]+-[[:space:]]+\"\$\{ENGINEERING_USER\}\"' '${LOCAL_CONFIG_TOOL}'" || failures=$((failures + 1))
   check_final_requirement "Network menu displays live eth0/eth1 IP and cabling banner" grep -q 'LIVE NIC / CABLING STATUS' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))

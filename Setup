@@ -38,16 +38,15 @@ set -Eeuo pipefail
 #   - Domotz is intentionally not revision-pinned. The installed Snap revision
 #     is recorded for audit, and updates are governed by operating policy.
 #   - The V1210 USB-C port labeled COM is a serial console, not USB Ethernet.
-#     This script exposes an authenticated login on ttyS0 and automatically
-#     launches the Solutionz local configuration menu for restricted technician
-#     accounts on interactive SSH, local console, or USB-C COM login. Authenticated
-#     engineering logins also land on the same menu in ENGINEERING mode, where an
-#     engineering shell is available only after engineering authentication.
+#     Restricted technician accounts automatically enter the Solutionz RMM menu
+#     on interactive SSH, local console, or USB-C COM login. The engineering
+#     account solz_eng is never forced into that menu: SSH, USB-C, and local
+#     console logins always receive a normal Bash shell.
 #   - The default engineering login is solz_eng. Fresh/unprovisioned appliances
 #     receive the approved Solutionz default engineering password as a one-way
 #     SHA-512 password hash; the plaintext password is never stored in Setup.
-#     Remote SSH for solz_eng is public-key only and is forced into the Engineering
-#     menu. The local password is retained for USB-C/local-console and sudo
+#     Remote SSH for solz_eng remains public-key only, but no SSH ForceCommand is
+#     applied. The local password is retained for USB-C/local-console and sudo
 #     authentication. If Engineering changes the local password later, rerunning
 #     Setup preserves the changed password instead of resetting it.
 #   - Only the public SSH key is stored in Setup/on the appliance. The matching
@@ -328,9 +327,9 @@ Options:
   --prepare-deployment          After Phase 2 passes, configure/arm Domotz
                                 activation for the next boot and power off.
   --activation-status           Show build state and Domotz activation status.
-  --repair-access-menu          Reinstall only the technician/engineering menu,
-                                access profile, and menu sudoers policy. This
-                                bypasses full build preflight for menu recovery.
+  --repair-access-menu          Reinstall the technician menu, direct-shell
+                                engineering access profile, SSH access policy,
+                                and related sudoers. Bypasses full build preflight.
   --no-poweroff                 With --prepare-deployment, arm for the next
                                 boot but leave the appliance powered on.
   -h, --help                    Show this help.
@@ -1502,12 +1501,13 @@ else
   fail "sshd configuration validation failed."
 fi
 
-# Engineering remote access is deliberately public-key only. The local password
-# exists for USB-C/local-console and sudo authentication, not for remote SSH.
+# Engineering remote access is deliberately public-key only, but solz_eng must
+# receive a normal shell rather than a ForceCommand-managed menu. The local
+# password exists for USB-C/local-console and sudo, not for remote SSH.
 ENG_SSH_EFFECTIVE="$(sshd -T -C user=${ENG_USER},host=localhost,addr=127.0.0.1 2>/dev/null || true)"
 grep -q '^passwordauthentication no$' <<<"$ENG_SSH_EFFECTIVE" && pass "$ENG_USER SSH password authentication disabled." || fail "$ENG_USER SSH password authentication is not disabled."
 grep -q '^authenticationmethods publickey$' <<<"$ENG_SSH_EFFECTIVE" && pass "$ENG_USER SSH requires public-key authentication." || fail "$ENG_USER SSH does not require public-key authentication."
-grep -q '^forcecommand sudo -n /usr/local/sbin/solutionz-rmm-local-config --engineering-login$' <<<"$ENG_SSH_EFFECTIVE" && pass "$ENG_USER SSH is forced to the Engineering menu." || fail "$ENG_USER SSH is not forced to the Engineering menu."
+grep -q '^forcecommand none$' <<<"$ENG_SSH_EFFECTIVE" && pass "$ENG_USER SSH receives a direct shell (no ForceCommand)." || fail "$ENG_USER SSH is still subject to a ForceCommand."
 
 getent group "$TECH_GROUP" >/dev/null 2>&1 && pass "Restricted field-tech group exists." || fail "Field-tech group missing."
 getent group "$ENG_GROUP" >/dev/null 2>&1 && pass "Engineering group exists." || fail "Engineering group missing."
@@ -1670,6 +1670,45 @@ chmod 640 "$RESULT"
 SECURITYVALIDATOR
   chmod 750 "${SECURITY_VALIDATOR}"
   chown root:root "${SECURITY_VALIDATOR}"
+}
+
+install_ssh_access_policy() {
+  install -d -m 755 /etc/ssh/sshd_config.d
+  cat > "${SSH_HARDENING_FILE}" <<'EOF'
+# Solutionz RMM SSH hardening. Domotz-sensitive global tunneling/authentication
+# controls are intentionally not changed until V1210/Domotz regression testing.
+PermitRootLogin no
+PubkeyAuthentication yes
+MaxAuthTries 3
+LoginGraceTime 30
+X11Forwarding no
+
+# Engineering SSH is key-only, but it is NOT forced into the RMM menu. A
+# successful solz_eng SSH login receives the account's normal /bin/bash shell.
+# The local engineering password remains usable for USB-C/local-console and sudo,
+# but it is never accepted for remote SSH authentication.
+Match User solz_eng
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    PubkeyAuthentication yes
+    DisableForwarding yes
+    X11Forwarding no
+    PermitTunnel no
+Match all
+
+# Dedicated field technicians remain forced into the controlled configuration
+# menu. Engineering is explicitly excluded so solz_eng always receives a shell.
+Match Group solutionz-rmm-tech,!solutionz-rmm-engineering
+    ForceCommand sudo -n /usr/local/sbin/solutionz-rmm-local-config --restricted-login
+    DisableForwarding yes
+    X11Forwarding no
+    PermitTunnel no
+Match all
+EOF
+  chmod 644 "${SSH_HARDENING_FILE}"
+  sshd -t || error_exit "SSH hardening configuration failed sshd syntax validation."
+  systemctl reload ssh || error_exit "Unable to reload SSH after hardening."
+  progress_message "SSH access policy installed: solz_eng receives a direct key-authenticated shell; field technicians remain forced into the RMM menu."
 }
 
 configure_security_hardening() {
@@ -1837,44 +1876,7 @@ EOF
   sysctl -w net.ipv4.conf.all.log_martians=1 >/dev/null || error_exit "Failed to enable runtime martian logging for all interfaces."
   sysctl -w net.ipv4.conf.default.log_martians=1 >/dev/null || error_exit "Failed to enable runtime default martian logging."
 
-  install -d -m 755 /etc/ssh/sshd_config.d
-  cat > "${SSH_HARDENING_FILE}" <<'EOF'
-# Solutionz RMM SSH hardening. Domotz-sensitive global tunneling/authentication
-# controls are intentionally not changed until V1210/Domotz regression testing.
-PermitRootLogin no
-PubkeyAuthentication yes
-MaxAuthTries 3
-LoginGraceTime 30
-X11Forwarding no
-
-# Engineering SSH is key-only. A successful key-authenticated solz_eng login is
-# forced into the Solutionz menu in ENGINEERING mode; unrestricted shell access
-# is available only from the authenticated Engineering Session inside that menu.
-# The local engineering password remains usable for USB-C/local-console and sudo,
-# but it is never accepted for remote SSH authentication.
-Match User solz_eng
-    AuthenticationMethods publickey
-    PasswordAuthentication no
-    PubkeyAuthentication yes
-    ForceCommand sudo -n /usr/local/sbin/solutionz-rmm-local-config --engineering-login
-    DisableForwarding yes
-    X11Forwarding no
-    PermitTunnel no
-Match all
-
-# Dedicated field technicians are forced into the controlled configuration menu
-# for SSH sessions. Engineering is explicitly excluded from the field-tech Match
-# because solz_eng has its own stronger key-only rule above.
-Match Group solutionz-rmm-tech,!solutionz-rmm-engineering
-    ForceCommand sudo -n /usr/local/sbin/solutionz-rmm-local-config --restricted-login
-    DisableForwarding yes
-    X11Forwarding no
-    PermitTunnel no
-Match all
-EOF
-  chmod 644 "${SSH_HARDENING_FILE}"
-  sshd -t || error_exit "SSH hardening configuration failed sshd syntax validation."
-  systemctl reload ssh || error_exit "Unable to reload SSH after hardening."
+  install_ssh_access_policy
 
   cat > "${SECURITY_APT_POLICY_FILE}" <<'EOF'
 // Solutionz RMM controlled security-update policy.
@@ -4317,16 +4319,26 @@ engineering_access() {
     return 0
   fi
 
-  if [[ "$(head -n1 "${INSTALL_STATE}" 2>/dev/null || true)" != "phase2_system_validated" ]]; then
-    echo "Engineering password setup is unavailable until Phase 2 reports phase2_system_validated."
-    return 1
-  fi
+  # Administrative recovery must never depend on Phase 1/Phase 2 validation.
+  # An authenticated solz_eng local/USB-C or key-authenticated SSH session must
+  # always be able to enter the Engineering Session and open the recovery shell.
+  # Only credential provisioning/deployment actions are validation-gated.
+  local current_phase
+  current_phase="$(head -n1 "${INSTALL_STATE}" 2>/dev/null || true)"
 
   if [[ ! -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
-    echo "First-time engineering setup detected."
-    echo "The current session is authenticated as ${ENGINEERING_USER}."
-    echo
-    "${ENGINEERING_PASSWORD_TOOL}" || return $?
+    if [[ "${current_phase}" == "phase2_system_validated" ]]; then
+      echo "First-time engineering setup detected."
+      echo "The current session is authenticated as ${ENGINEERING_USER}."
+      echo
+      if ! "${ENGINEERING_PASSWORD_TOOL}"; then
+        echo "WARNING: Engineering password setup did not complete; recovery shell access remains available."
+      fi
+    else
+      echo "WARNING: Engineering password provisioning is deferred until Phase 2 reports phase2_system_validated."
+      echo "Current installation state: ${current_phase:-missing}."
+      echo "Recovery shell access remains available to authenticated Engineering."
+    fi
   else
     echo "Engineering password is already provisioned."
   fi
@@ -4391,7 +4403,7 @@ if (( ENGINEERING_TOOLS_DIRECT == 1 )); then
     echo "ERROR: --engineering-tools requires an authenticated ${ENGINEERING_USER} session." >&2
     exit 81
   fi
-  engineering_access
+  engineering_access || true
   exit 0
 fi
 
@@ -4443,8 +4455,8 @@ MENU
     6) show_live ;;
     7) validate_full || true ;;
     8) restore ;;
-    9) engineering_access ;;
-    10) engineering_tools_entry ;;
+    9) engineering_access || true ;;
+    10) engineering_tools_entry || true ;;
     11) domotz_register_new_now || true ;;
     12) if (( AUTO )); then exit 90; else exit 0; fi ;;
     *) echo "Invalid selection." ;;
@@ -4542,9 +4554,9 @@ EOF
 
   cat > "${ACCESS_PROFILE_FILE}" <<EOF
 # Solutionz RMM interactive access policy. This file is sourced by login shells.
-# Engineering membership always wins. A technician who is not an engineer is
-# placed directly into the controlled RMM configuration menu and is logged out
-# when the menu exits. SSH is independently protected by sshd ForceCommand.
+# solz_eng is an administrative account and must ALWAYS receive its normal Bash
+# shell on SSH, USB-C, and local console login. Only restricted technician
+# accounts are automatically placed into the controlled RMM configuration menu.
 
 case "\$-" in
   *i*) ;;
@@ -4555,20 +4567,14 @@ if [ "\${SOLUTIONZ_RMM_MENU_ACTIVE:-0}" != "1" ]; then
   _solutionz_user="\$(id -un 2>/dev/null || true)"
   _solutionz_groups="\$(id -nG "\${_solutionz_user}" 2>/dev/null || true)"
 
-  if printf '%s\n' "\${_solutionz_groups}" | tr ' ' '\n' | grep -qx '${ENGINEERING_GROUP}'; then
-    export SOLUTIONZ_RMM_MENU_ACTIVE=1
-    echo
-    echo "Solutionz engineering session detected; launching RMM configuration menu."
-    if [ "\${EUID:-\$(id -u)}" -eq 0 ]; then
-      "${LOCAL_CONFIG_TOOL}" --engineering-login || true
-    else
-      sudo -n "${LOCAL_CONFIG_TOOL}" --engineering-login || {
-        echo "ERROR: Unable to launch the Solutionz engineering menu." >&2
-      }
-    fi
-    unset SOLUTIONZ_RMM_MENU_ACTIVE _solutionz_user _solutionz_groups
-    exit 0
-  elif printf '%s\n' "\${_solutionz_groups}" | tr ' ' '\n' | grep -qx '${FIELD_TECH_GROUP}'; then
+  # Engineering is never intercepted by the profile, even if a stale group
+  # membership is present. Direct solz_eng login always falls through to Bash.
+  if [ "\${_solutionz_user}" = '${ENGINEERING_USER}' ]; then
+    unset _solutionz_user _solutionz_groups
+    return 0 2>/dev/null || true
+  fi
+
+  if printf '%s\n' "\${_solutionz_groups}" | tr ' ' '\n' | grep -qx '${FIELD_TECH_GROUP}'; then
     export SOLUTIONZ_RMM_MENU_ACTIVE=1
     echo
     echo "Solutionz technician session detected; launching RMM configuration menu."
@@ -4587,7 +4593,7 @@ if [ "\${SOLUTIONZ_RMM_MENU_ACTIVE:-0}" != "1" ]; then
 fi
 EOF
   chmod 644 "${ACCESS_PROFILE_FILE}"
-  progress_message "Interactive access policy installed: technician and engineering interactive logins both enter the Solutionz RMM menu; authenticated solz_eng sessions receive engineering-mode password setup and shell options."
+  progress_message "Interactive access policy installed: solz_eng always receives a direct Bash shell; technician accounts remain restricted to the Solutionz RMM menu."
 }
 
 update_banner() {
@@ -4786,7 +4792,7 @@ systemctl is-active --quiet systemd-timesyncd.service && pass "systemd-timesyncd
 waitntp && pass "NTP synchronized." || fail "NTP synchronization failed."
 [[ -c /dev/ttyS0 ]] && pass "ttyS0 present." || fail "ttyS0 missing."
 check "Serial service active" systemctl is-active --quiet "$SER"
-[[ -x "$CFG" && -s "$AP" ]] && grep -q 'solutionz-rmm-tech' "$AP" && grep -q 'solutionz-rmm-engineering' "$AP" && grep -q -- '--restricted-login' "$AP" && grep -q -- '--engineering-login' "$AP" && grep -q -- '--engineering-tools' "$CFG" && pass "Unified technician/engineering interactive menu policy installed, including engineering-tools transition." || fail "Unified interactive menu policy missing or engineering-tools transition unavailable."
+[[ -x "$CFG" && -s "$AP" ]] && grep -q 'solutionz-rmm-tech' "$AP" && grep -q 'solz_eng' "$AP" && grep -q -- '--restricted-login' "$AP" && ! grep -q -- '--engineering-login' "$AP" && grep -q -- '--engineering-tools' "$CFG" && pass "Technician menu policy installed and solz_eng profile interception disabled." || fail "Interactive access policy invalid: technicians must enter the menu and solz_eng must bypass it."
 [[ -s "$SSHCFG" ]] && grep -q '^Match Group solutionz-rmm-tech,!solutionz-rmm-engineering$' "$SSHCFG" && grep -q -- '--restricted-login' "$SSHCFG" && pass "SSH technician menu policy with engineering exception installed." || fail "SSH technician menu policy missing/invalid."
 if id "$TECH_USER" >/dev/null 2>&1; then
   id -nG "$TECH_USER" | tr ' ' '\n' | grep -qx "$TECH_GROUP" && pass "$TECH_USER field-tech membership present." || fail "$TECH_USER field-tech membership missing."
@@ -5879,10 +5885,279 @@ final_summary_check() {
   check_final_requirement "Live network discovery utility installed" test -x "${LIVE_DISCOVERY_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Technician interactive-login access profile installed" test -s "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Technician access profile checks field-tech group" grep -q "${FIELD_TECH_GROUP}" "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Interactive access profile recognizes engineering group" grep -q "${ENGINEERING_GROUP}" "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Interactive access profile explicitly bypasses solz_eng" grep -q "_solutionz_user.*${ENGINEERING_USER}" "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Technician access profile launches restricted-login mode" grep -q -- '--restricted-login' "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Engineering access profile launches engineering-login mode" grep -q -- '--engineering-login' "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Engineering access profile does not auto-launch engineering-login mode" bash -c "! grep -q -- '--engineering-login' '${ACCESS_PROFILE_FILE}'" || failures=$((failures + 1))
   check_final_requirement "Network menu provides authenticated engineering-tools transition" grep -q -- '--engineering-tools' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Network menu restores saved JSON profile as option 4" grep -q '^4) Apply saved WAN/LAN/VLAN JSON profile$' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Network menu exposes explicit unused LAN mode" grep -q 'dhcp/static/none/unused' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Network menu restores Engineering Login / Password Setup as option 9" grep -q '^9) Engineering
+  check_final_requirement "Network menu restores Engineering Login / Password Setup as option 9" grep -q '^9) Engineering Login / Password Setup$' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Network menu restores Engineering Tools / Setup Script as option 10" grep -q '^10) Engineering Tools / Setup Script (engineering authentication required)$' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Network menu logout remains option 12" grep -q '^12) Log out$' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Engineering password transition avoids recursive login-shell profile" bash -c "! grep -Eq '/bin/su[[:space:]]+-[[:space:]]+.*solz_eng|/bin/su[[:space:]]+-[[:space:]]+\"\$\{ENGINEERING_USER\}\"' '${LOCAL_CONFIG_TOOL}'" || failures=$((failures + 1))
+  check_final_requirement "Network menu displays live eth0/eth1 IP and cabling banner" grep -q 'LIVE NIC / CABLING STATUS' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Solutionz registration policy forces network scanning enabled" grep -q 'deny = False' "${DOMOTZ_ACTIVATION_HELPER}" || failures=$((failures + 1))
+  check_final_requirement "Network menu provides technician-accessible NEW Domotz registration" grep -q 'Register NEW Domotz Collector Now (technician or engineering)' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Network menu provides engineering-only NEW Domotz registration" grep -q -- '--register-new-domotz' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "SSH field-tech policy excludes engineering group" grep -q '^Match Group solutionz-rmm-tech,!solutionz-rmm-engineering$' "${SSH_HARDENING_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Local config sudoers policy installed" test -s "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Local config sudoers policy valid" visudo -cf "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Engineering password provisioning helper installed" test -x "${ENGINEERING_PASSWORD_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Engineering password provisioning sudoers policy valid" visudo -cf "${ENGINEERING_PASSWORD_SUDOERS_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Protectli V1210 hardware" bash -c 'vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null); model=$(cat /sys/class/dmi/id/product_name 2>/dev/null); [[ "${vendor,,}" == *protectli* && "$model" == "V1210" ]]' || failures=$((failures + 1))
+  check_final_requirement "SSH active" systemctl is-active --quiet ssh || failures=$((failures + 1))
+  check_final_requirement "UFW active" bash -c "ufw status | grep -q 'Status: active'" || failures=$((failures + 1))
+  check_final_requirement "UFW globally permits TCP 22" bash -c "ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW'" || failures=$((failures + 1))
+  check_final_requirement "UFW globally permits TCP 3000" bash -c "ufw status | grep -Eq '^3000/tcp[[:space:]]+ALLOW'" || failures=$((failures + 1))
+  check_final_requirement "UFW denies routed/forwarded traffic by default" grep -Eq '^DEFAULT_FORWARD_POLICY="?DROP"?$' /etc/default/ufw || failures=$((failures + 1))
+  check_final_requirement "UFW persists martian logging for all interfaces" grep -Eq '^[[:space:]]*net[./]ipv4[./]conf[./]all[./]log_martians[[:space:]]*=[[:space:]]*1[[:space:]]*$' "${UFW_SYSCTL_FILE}" || failures=$((failures + 1))
+  check_final_requirement "UFW persists default martian logging" grep -Eq '^[[:space:]]*net[./]ipv4[./]conf[./]default[./]log_martians[[:space:]]*=[[:space:]]*1[[:space:]]*$' "${UFW_SYSCTL_FILE}" || failures=$((failures + 1))
+  check_final_requirement "SSH hardening policy installed" test -s "${SSH_HARDENING_FILE}" || failures=$((failures + 1))
+  check_final_requirement "SSH configuration valid" sshd -t || failures=$((failures + 1))
+  check_final_requirement "SSH root login disabled" bash -c "sshd -T | grep -q '^permitrootlogin no$'" || failures=$((failures + 1))
+  check_final_requirement "Restricted field-tech group exists" getent group "${FIELD_TECH_GROUP}" || failures=$((failures + 1))
+  check_final_requirement "Engineering group exists" getent group "${ENGINEERING_GROUP}" || failures=$((failures + 1))
+  check_final_requirement "Default engineering account exists" id "${ENGINEERING_USER}" || failures=$((failures + 1))
+  if id "${ENGINEERING_USER}" >/dev/null 2>&1; then
+    check_final_requirement "Default engineering account is in engineering group" bash -c "id -nG '${ENGINEERING_USER}' | tr ' ' '\\n' | grep -qx '${ENGINEERING_GROUP}'" || failures=$((failures + 1))
+    check_final_requirement "Default engineering account has sudo membership" bash -c "id -nG '${ENGINEERING_USER}' | tr ' ' '\\n' | grep -qx sudo" || failures=$((failures + 1))
+    check_final_requirement "Default engineering account is not in field-tech group" bash -c "! id -nG '${ENGINEERING_USER}' | tr ' ' '\\n' | grep -qx '${FIELD_TECH_GROUP}'" || failures=$((failures + 1))
+    check_final_requirement "Default engineering account uses Bash shell" bash -c '[[ "$(getent passwd "$1" | cut -d: -f7)" == /bin/bash ]]' _ "${ENGINEERING_USER}" || failures=$((failures + 1))
+    check_final_requirement "Default engineering account has authorized SSH key" bash -c 'home="$(getent passwd "$1" | cut -d: -f6)"; [[ -n "$home" && -s "$home/.ssh/authorized_keys" ]]' _ "${ENGINEERING_USER}" || failures=$((failures + 1))
+    check_final_requirement "Engineering SSH key fingerprint record present" test -s "${ENGINEERING_SSH_FINGERPRINT_FILE}" || failures=$((failures + 1))
+    check_final_requirement "Engineering SSH public-key authentication enabled" bash -c "sshd -T | grep -q '^pubkeyauthentication yes$'" || failures=$((failures + 1))
+    check_final_requirement "Engineering SSH is public-key only" bash -c "e=\$(sshd -T -C user='${ENGINEERING_USER}',host=localhost,addr=127.0.0.1); grep -q '^passwordauthentication no$' <<<\"\$e\" && grep -q '^authenticationmethods publickey$' <<<\"\$e\"" || failures=$((failures + 1))
+    check_final_requirement "Engineering SSH receives direct shell" bash -c "sshd -T -C user='${ENGINEERING_USER}',host=localhost,addr=127.0.0.1 | grep -q '^forcecommand none$'" || failures=$((failures + 1))
+    check_final_requirement "Engineering local password marker exists" test -s "${ENGINEERING_PASSWORD_MARKER}" || failures=$((failures + 1))
+    check_final_requirement "Engineering local password is configured" bash -c "[[ \$(passwd -S '${ENGINEERING_USER}' 2>/dev/null | awk '{print \$2}') == P ]]" || failures=$((failures + 1))
+  fi
+  if id "${TECHNICIAN_USER}" >/dev/null 2>&1; then
+    check_final_requirement "Default technician account is in field-tech group" bash -c "id -nG '${TECHNICIAN_USER}' | tr ' ' '\\n' | grep -qx '${FIELD_TECH_GROUP}'" || failures=$((failures + 1))
+    check_final_requirement "Default technician account does not have engineering shell bypass" bash -c "! id -nG '${TECHNICIAN_USER}' | tr ' ' '\\n' | grep -qx '${ENGINEERING_GROUP}'" || failures=$((failures + 1))
+    check_final_requirement "Default technician account has no unrestricted sudo membership" bash -c "! id -nG '${TECHNICIAN_USER}' | tr ' ' '\\n' | grep -qx sudo" || failures=$((failures + 1))
+  else
+    warning_message "Default technician account ${TECHNICIAN_USER} does not exist; group-based policy remains installed for later technician accounts."
+  fi
+  check_final_requirement "Field network menu has no unrestricted Linux shell option" bash -c "! grep -q 'Open Linux shell' '${LOCAL_CONFIG_TOOL}'" || failures=$((failures + 1))
+  check_final_requirement "auditd active" systemctl is-active --quiet auditd || failures=$((failures + 1))
+  check_final_requirement "Solutionz audit rules installed" test -s "${AUDIT_RULES_FILE}" || failures=$((failures + 1))
+  check_final_requirement "AppArmor active" systemctl is-active --quiet apparmor || failures=$((failures + 1))
+  check_final_requirement "Controlled security-update policy installed" test -s "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Automatic security reboot disabled" grep -q 'Automatic-Reboot "false"' "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Unattended package installation disabled" grep -q 'APT::Periodic::Unattended-Upgrade "0"' "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Security integrity baseline exists" test -s "${SECURITY_BASELINE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Security integrity baseline validates" "${INTEGRITY_TOOL}" --verify || failures=$((failures + 1))
+check_final_requirement "Solutionz security validator installed" test -x "${SECURITY_VALIDATOR}" || failures=$((failures + 1))
+  check_final_requirement "Solutionz security validation passes" "${SECURITY_VALIDATOR}" || failures=$((failures + 1))
+  check_final_requirement "DNS resolves api.snapcraft.io to IPv4" dns_resolves_ipv4 api.snapcraft.io || failures=$((failures + 1))
+  check_final_requirement "DNS resolves archive.ubuntu.com to IPv4" dns_resolves_ipv4 archive.ubuntu.com || failures=$((failures + 1))
+  check_final_requirement "systemd-timesyncd enabled" systemctl is-enabled --quiet systemd-timesyncd.service || failures=$((failures + 1))
+  check_final_requirement "systemd-timesyncd active" systemctl is-active --quiet systemd-timesyncd.service || failures=$((failures + 1))
+  echo "INFO - Waiting up to 180 seconds for NTP synchronization before Phase 1 completion."
+  if ! check_final_requirement "NTP synchronization active" wait_for_ntp_sync 36 5; then
+    failures=$((failures + 1))
+    report_ntp_diagnostics
+  fi
+  check_final_requirement "Initial OS runtime baseline record exists" test -s "${OS_BASELINE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer system baseline record exists" test -s "${MANUFACTURER_BASELINE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer package inventory exists" test -s "${MANUFACTURER_PACKAGE_BASELINE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer required-package validation exists" test -s "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer baseline checksum record exists" test -s "${MANUFACTURER_BASELINE_SHA256_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer baseline integrity is valid" \
+    sha256sum -c "${MANUFACTURER_BASELINE_SHA256_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer package validation has a recognized result" \
+    grep -Eq '^manufacturer_package_validation=(PASS|DEVIATION)$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" || failures=$((failures + 1))
+  if grep -q '^manufacturer_package_validation=DEVIATION$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" 2>/dev/null; then
+    warning_message "Manufacturer package baseline contained a recorded deviation. Final required-package state is validated separately and must pass."
+  fi
+  check_final_requirement "Final required-package baseline record exists" test -s "${BASELINE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Network requirements record exists" test -s "${NETWORK_REQUIREMENTS_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Netplan generates successfully" netplan generate || failures=$((failures + 1))
+  check_final_requirement "Automatic Netplan/VLAN profile helper installed" test -x "${NETWORK_PROFILE_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Production network profile installed" test -s "${NETWORK_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Production network profile validates" "${NETWORK_PROFILE_TOOL}" validate "${NETWORK_PROFILE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Production network profile render result exists" test -s "${NETWORK_PROFILE_RESULT_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Production network profile render result is PASS" grep -q '^result=PASS$' "${NETWORK_PROFILE_RESULT_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Setup candidate-first transaction captured" test -d "${SETUP_NETWORK_TRANSACTION}" || failures=$((failures + 1))
+  check_final_requirement "Setup network transaction integrity valid" verify_setup_network_transaction "${SETUP_NETWORK_TRANSACTION}" || failures=$((failures + 1))
+  check_final_requirement "Automatic dual-homed network validator installed" test -x "${NETWORK_VALIDATOR}" || failures=$((failures + 1))
+  check_final_requirement "Network configuration locking available" command -v flock || failures=$((failures + 1))
+  check_final_requirement "Network transaction root exists" test -d "${NETWORK_TRANSACTION_ROOT}" || failures=$((failures + 1))
+  check_final_requirement "Engineering/factory network transaction namespace exists" test -d "${NETWORK_TRANSACTION_ENGINEERING_DIR}" || failures=$((failures + 1))
+  check_final_requirement "Field network transaction namespace exists" test -d "${NETWORK_TRANSACTION_FIELD_DIR}" || failures=$((failures + 1))
+  check_final_requirement "Field Restore is isolated to field transaction namespace" grep -q 'TRANSACTION_ROOT="/var/lib/rswsolutionz-rmm/network-transactions/field"' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Network validator supports explicit unused LAN mode" grep -q 'LAN_MODE.*unused' "${NETWORK_VALIDATOR}" || failures=$((failures + 1))
+  check_final_requirement "Network validator exposes distinct PENDING exit status" grep -q 'exit 30' "${NETWORK_VALIDATOR}" || failures=$((failures + 1))
+  check_final_requirement "Persistent IPv4 forwarding disable policy installed" grep -Eq '^net\.ipv4\.ip_forward=0$' "${IP_FORWARD_SYSCTL_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Current IPv4 forwarding is disabled" bash -c '[[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "0" ]]' || failures=$((failures + 1))
+  check_final_requirement "Installed Setup copy does not retain embedded Domotz activation key" grep -q '^DOMOTZ_COLLECTOR_ACTIVATION_KEY_DEFAULT=""$' "${INSTALLED_SCRIPT_COPY}" || failures=$((failures + 1))
+
+  check_final_requirement "Domotz provisioning credential lifecycle is valid" \
+    validate_domotz_provisioning_lifecycle || failures=$((failures + 1))
+  check_final_requirement "Integrated Domotz activation helper installed" test -x "${DOMOTZ_ACTIVATION_HELPER}" || failures=$((failures + 1))
+  check_final_requirement "Domotz activation service unit installed" test -s "${DOMOTZ_ACTIVATION_SERVICE}" || failures=$((failures + 1))
+  check_final_requirement "Domotz activation timer unit installed" test -s "${DOMOTZ_ACTIVATION_TIMER}" || failures=$((failures + 1))
+  check_final_requirement "Domotz activation helper syntax valid" python3 -m py_compile "${DOMOTZ_ACTIVATION_HELPER}" || failures=$((failures + 1))
+  check_final_requirement "Domotz activation systemd units valid" systemd-analyze verify "${DOMOTZ_ACTIVATION_SERVICE}" "${DOMOTZ_ACTIVATION_TIMER}" || failures=$((failures + 1))
+  check_final_requirement "Unified setup command installed" test -x "${SETUP_COMMAND}" || failures=$((failures + 1))
+  check_final_requirement "Domotz installed" snap list "${DOMOTZ_SNAP_NAME}" || failures=$((failures + 1))
+  check_final_requirement "Post-reboot production validator installed" test -x "${POSTREBOOT_VALIDATOR}" || failures=$((failures + 1))
+
+  local permission
+  for permission in "${REQUIRED_DOMOTZ_PERMISSIONS[@]}"; do
+    if snap connections "${DOMOTZ_SNAP_NAME}" | awk -v p="${permission}" '
+      $1 == p && $3 != "-" {found=1}
+      END {exit found ? 0 : 1}
+    '; then
+      printf '%sPASS - Domotz permission %s connected%s\n' "${COLOR_GREEN}" "${permission}" "${COLOR_RESET}"
+    else
+      printf '%sFAIL - Domotz permission %s not connected%s\n' "${COLOR_RED}" "${permission}" "${COLOR_RESET}"
+      PRE_REBOOT_FAILED_CHECKS+=("Domotz permission ${permission} not connected")
+      failures=$((failures + 1))
+    fi
+  done
+
+  progress_message "Domotz is intentionally not revision-pinned; installed revision is recorded for audit."
+
+  echo "------------------------------------------------------------"
+  echo "Pre-reboot mandatory failures: ${failures}"
+  echo "Validation result: ${PREREBOOT_RESULT_FILE}"
+  echo "============================================================"
+
+  write_prereboot_result "${failures}"
+  (( failures == 0 ))
+}
+
+repair_access_menu_action() {
+  info_message "Repairing Solutionz interactive access policy only."
+  info_message "Full appliance preflight, package installation, Snap/Domotz refresh, and network staging are intentionally skipped in this recovery mode."
+
+  install_local_serial_config_tool
+  install_ssh_access_policy
+
+  if [[ -x "${INTEGRITY_TOOL}" ]]; then
+    if "${INTEGRITY_TOOL}" --refresh; then
+      progress_message "Security integrity baseline refreshed after access-menu repair."
+    else
+      warning_message "Access menu was repaired, but the security integrity baseline could not be refreshed automatically."
+    fi
+  else
+    warning_message "Integrity helper is not installed yet; access-menu repair completed without baseline refresh."
+  fi
+
+  progress_message "Access repair complete. solz_eng now receives a direct Bash shell on SSH, USB-C, and local console login; technician accounts remain restricted to the RMM menu."
+}
+
+main() {
+  parse_args "$@"
+  require_root
+  init_logging
+
+  case "${RUN_MODE}" in
+    activation_status)
+      activation_status
+      return 0
+      ;;
+    prepare_deployment)
+      prepare_deployment
+      return 0
+      ;;
+    repair_access_menu)
+      repair_access_menu_action
+      return 0
+      ;;
+  esac
+
+  printf '\n%sSolutionz RMM Agent Installation%s\n' "${COLOR_CYAN}" "${COLOR_RESET}"
+  info_message "Revision ${REVISION} | Release ${RELEASE_DATE}"
+  info_message "Command output is displayed on the console and recorded in ${LOG_FILE}."
+
+  prompt_confirmation
+
+  detect_setup_context
+  backup_previous_state
+  write_state "phase1_in_progress" \
+    "setup_context=${SETUP_CONTEXT}" \
+    "preexisting_solutionz_install=${PREEXISTING_SOLUTIONZ_INSTALL}"
+  record_network_requirements
+
+  preflight_checks
+  capture_manufacturer_baseline
+  install_required_packages
+  verify_required_packages
+  verify_ssh_service
+  configure_time_sync
+  configure_tun
+  ensure_snapd
+  install_domotz
+  configure_domotz_permissions
+  configure_ufw
+  configure_security_hardening
+  stage_network_config
+  repair_resolv_conf
+  normalize_host_entries
+  configure_grub_and_serial
+  install_local_serial_config_tool
+  update_banner
+  install_postreboot_validation
+  install_domotz_activation
+
+  if ! final_summary_check; then
+    error_exit "Mandatory pre-reboot validation failed. Review ${PREREBOOT_RESULT_FILE} for failed check names."
+  fi
+
+  write_state "phase1_complete" \
+    "setup_context=${SETUP_CONTEXT}" \
+    "preexisting_solutionz_install=${PREEXISTING_SOLUTIONZ_INSTALL}" \
+    "reboot_required=1" \
+    "prereboot_result=${PREREBOOT_RESULT_FILE}" \
+    "postreboot_validator=${POSTREBOOT_VALIDATOR}" \
+    "postreboot_result=${POSTREBOOT_RESULT_FILE}" \
+    "network_profile=${NETWORK_PROFILE_FILE}" \
+    "network_profile_result=${NETWORK_PROFILE_RESULT_FILE}" \
+    "network_validation_result=${NETWORK_VALIDATION_RESULT_FILE}" \
+    "network_live_discovery_result=${LIVE_DISCOVERY_RESULT_FILE}" \
+    "security_validation_result=${SECURITY_VALIDATION_RESULT_FILE}" \
+    "security_baseline=${SECURITY_BASELINE_FILE}" \
+    "domotz_activation_helper=${DOMOTZ_ACTIVATION_HELPER}" \
+    "domotz_activation_config=${DOMOTZ_ACTIVATION_CONFIG}" \
+    "engineering_login=${ENGINEERING_USER}" \
+    "engineering_ssh_key_fingerprint=$(awk -F= '$1=="fingerprint" {print $2}' "${ENGINEERING_SSH_FINGERPRINT_FILE}" 2>/dev/null | head -n1)" \
+    "engineering_password_status=configured" \
+    "engineering_password_provisioning=default_hash_or_authenticated_engineering_change" \
+    "setup_command=${SETUP_COMMAND}" \
+    "log=${LOG_FILE}"
+
+  completion_message
+  progress_message "Phase 1 completed successfully."
+  progress_message "Completion Time: $(date -u +%FT%TZ)"
+  progress_message "Hostname: $(hostname)"
+  progress_message "Script Revision: ${REVISION}"
+  progress_message "Setup Context: ${SETUP_CONTEXT}"
+  progress_message "Default technician login: ${TECHNICIAN_USER} (restricted configuration menu)."
+  progress_message "Default engineering login: ${ENGINEERING_USER} (engineering shell + sudo)."
+  if [[ -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
+    progress_message "Engineering password status: configured; default provisioned on fresh builds or existing credential preserved on rerun."
+  else
+    warning_message "Engineering password marker is missing; review account provisioning before deployment."
+  fi
+  progress_message "Network mode after reboot is generated from ${NETWORK_PROFILE_FILE}. Existing valid customer profiles are preserved on rerun; the default eth0 DHCP + optional eth1 DHCP profile is created only when no profile exists."
+  progress_message "eth0 is WAN/cloud and owns the only default route. eth1 may be optional DHCP, explicit unused, static LAN, or an unnumbered VLAN trunk; static/none/VLAN profiles require eth1 while unused mode does not. 802.1Q VLANs, when used, are linked to eth1."
+  progress_message "Automatic network validation tool: ${NETWORK_VALIDATOR}"
+  progress_message "Automatic security validation tool: ${SECURITY_VALIDATOR}"
+  progress_message "Security integrity baseline: ${SECURITY_BASELINE_FILE}"
+  progress_message "State File: ${STATE_FILE}"
+  progress_message "Log File: ${LOG_FILE}"
+  warning_message "Manual reboot is required. Post-reboot validation will run automatically after restart."
+  info_message "Engineering login ${ENGINEERING_USER} always receives a normal Bash shell. Remote SSH remains public-key only; USB-C/local-console uses the configured local engineering password. The RMM menu can still be launched manually when needed."
+  info_message "Technician account ${TECHNICIAN_USER} cannot create or change the ${ENGINEERING_USER} password and remains restricted to the technician menu."
+  info_message "Deployment preparation requires a configured engineering password marker; fresh builds receive the approved default automatically."
+  info_message "That same Setup source securely stages and arms automatic Domotz registration for the next boot, then powers the appliance off by default."
+  info_message "Interactive access: ${TECHNICIAN_USER}/${FIELD_TECH_GROUP} remain menu-restricted. ${ENGINEERING_USER} is never auto-intercepted and always receives its unrestricted Bash shell."
+  info_message "USB-C COM recovery/configuration remains available at 115200 8N1."
+  info_message "After every network change the script validates WAN eth0, LAN eth1/VLANs, default-route ownership, DNS/Domotz reachability, IPv4 forwarding, firewall/SSH hardening, audit state, and file integrity."
+  info_message "Automated VLAN deployment: use --network-profile <json> or network-menu option 3 onsite; VLANs are created on eth1."
+  info_message "Domotz is not revision-pinned; the installed revision is recorded in ${SNAP_BASELINE_FILE}."
+}
+
+main "$@"

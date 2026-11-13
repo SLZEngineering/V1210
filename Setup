@@ -19,7 +19,9 @@ set -Eeuo pipefail
 # Embedded Domotz deployment credential update: 2026-11-06
 # Network transaction/locking + offline USB-C staging hardening update: 2026-11-11
 # Offline preload PENDING / explicit restore reporting / OVS removal update: 2026-11-11
+# IPv4-only preflight / cloud TCP probe correction: 2026-11-12
 # Domotz API endpoint persistence / post-registration fallback update: 2026-11-12
+# Regression reconciliation / production-network safeguards restored: 2026-11-12
 #
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
@@ -44,9 +46,10 @@ set -Eeuo pipefail
 #   - The default engineering login is solz_eng. Fresh/unprovisioned appliances
 #     receive the approved Solutionz default engineering password as a one-way
 #     SHA-512 password hash; the plaintext password is never stored in Setup.
-#     The Solutionz engineering SSH public key remains installed as the preferred
-#     remote-access credential. If Engineering changes the local password later,
-#     rerunning Setup preserves the changed password instead of resetting it.
+#     Remote SSH for solz_eng is public-key only and is forced into the Engineering
+#     menu. The local password is retained for USB-C/local-console and sudo
+#     authentication. If Engineering changes the local password later, rerunning
+#     Setup preserves the changed password instead of resetting it.
 #   - Only the public SSH key is stored in Setup/on the appliance. The matching
 #     private key remains with Solutionz Engineering and is never copied to GitHub
 #     or to a V1210 appliance.
@@ -146,9 +149,22 @@ NETWORK_PROFILE_FILE="${NETWORK_PROFILE_DIR}/network-profile.json"
 NETWORK_PROFILE_TOOL="/usr/local/sbin/solutionz-rmm-network-profile"
 NETWORK_PROFILE_RESULT_FILE="${STATE_DIR}/network-profile-${REVISION}.result"
 NETWORK_PROFILE_SOURCE=""
-NETWORK_CONFIG_LOCK_FILE="/run/lock/solutionz-rmm-network-config.lock"
+# Setup/engineering and field changes use separate transaction namespaces so
+# technician Restore can never expose or consume factory/refurbishment history.
 NETWORK_TRANSACTION_ROOT="${STATE_DIR}/network-transactions"
-NETWORK_TRANSACTION_CURRENT=""
+NETWORK_TRANSACTION_ENGINEERING_DIR="${NETWORK_TRANSACTION_ROOT}/engineering"
+NETWORK_TRANSACTION_FIELD_DIR="${NETWORK_TRANSACTION_ROOT}/field"
+NETPLAN_ARCHIVE_DIR="${STATE_DIR}/netplan-archives"
+# One shared lock serializes Setup, USB-C and SSH network changes.
+NETWORK_CONFIG_LOCK_FILE="/run/lock/solutionz-rmm-network.lock"
+SETUP_CONTEXT="factory_new"
+PREEXISTING_SOLUTIONZ_INSTALL=0
+SETUP_NETWORK_TRANSACTION=""
+SETUP_NETPLAN_ARCHIVE=""
+CANDIDATE_DIR=""
+CANDIDATE_PROFILE=""
+CANDIDATE_NETPLAN=""
+CANDIDATE_RESULT=""
 
 PRIMARY_IFACE="eth0"
 SECONDARY_IFACE="eth1"
@@ -312,6 +328,9 @@ Options:
   --prepare-deployment          After Phase 2 passes, configure/arm Domotz
                                 activation for the next boot and power off.
   --activation-status           Show build state and Domotz activation status.
+  --repair-access-menu          Reinstall only the technician/engineering menu,
+                                access profile, and menu sudoers policy. This
+                                bypasses full build preflight for menu recovery.
   --no-poweroff                 With --prepare-deployment, arm for the next
                                 boot but leave the appliance powered on.
   -h, --help                    Show this help.
@@ -349,6 +368,9 @@ parse_args() {
         ;;
       --activation-status)
         RUN_MODE="activation_status"
+        ;;
+      --repair-access-menu)
+        RUN_MODE="repair_access_menu"
         ;;
       --no-poweroff)
         NO_POWEROFF=1
@@ -438,6 +460,29 @@ backup_previous_state() {
   fi
 }
 
+# Detect whether this is a new factory/mass-production build or an existing
+# Solutionz appliance being rebuilt/refurbished. The same build is supported for
+# both paths, but the context is retained in transaction/audit records.
+detect_setup_context() {
+  local detected=0
+  [[ -s "${STATE_FILE}" ]] && detected=1
+  [[ -s "${NETWORK_PROFILE_FILE}" ]] && detected=1
+  [[ -x "${LOCAL_CONFIG_TOOL}" ]] && detected=1
+  [[ -s "${ACCESS_PROFILE_FILE}" || -s "${LEGACY_SERIAL_PROFILE_FILE}" ]] && detected=1
+  if compgen -G '/usr/local/share/solutionz-rmm/*' >/dev/null 2>&1; then
+    detected=1
+  fi
+
+  if (( detected )); then
+    PREEXISTING_SOLUTIONZ_INSTALL=1
+    SETUP_CONTEXT="refurbish_or_manual_rebuild"
+    progress_message "Setup context: existing Solutionz RMM installation detected; refurbishment/manual rebuild safeguards enabled."
+  else
+    PREEXISTING_SOLUTIONZ_INSTALL=0
+    SETUP_CONTEXT="factory_new"
+    progress_message "Setup context: new/mass-production V1210 build."
+  fi
+}
 
 record_network_requirements() {
   cat > "${NETWORK_REQUIREMENTS_FILE}" <<'EOF'
@@ -509,18 +554,19 @@ Host security baseline
 - auditd records changes to Solutionz-controlled network, SSH, firewall, sysctl, systemd, utility and state paths.
 - AppArmor remains enabled as an OS mandatory-access-control layer.
 - A SHA-256 integrity baseline protects Solutionz scripts and security/network configuration files.
-- The security validator flags unexpected network-reachable TCP listeners beyond approved TCP 22/3000.
+- The security validator flags unexpected network-reachable TCP listeners; dynamic Domotz listeners are allowed only when process/cgroup identity is verified and UFW does not explicitly expose the dynamic port.
 - Security updates use a controlled maintenance policy: unattended installation and automatic reboot are disabled.
 
 Automatic WAN/LAN/VLAN behavior
 - Netplan is generated from /etc/solutionz-rmm/network-profile.json.
 - Default profile: WAN eth0 DHCP; LAN eth1 DHCP with DHCP routes and DNS ignored.
 - WAN eth0 supports DHCP or true static IPv4. Static WAN requires gateway and DNS.
-- LAN eth1 supports DHCP, static IPv4, or unnumbered trunk-parent mode.
+- LAN eth1 supports DHCP, static IPv4, unnumbered trunk-parent mode, or explicit unused mode.
 - eth1 is optional when the profile uses the default DHCP LAN mode with no VLANs.
   If no cable is connected, validation reports OPTIONAL_NOT_CONNECTED instead of failing.
   If carrier is present, the configured LAN is validated normally. Static LAN addressing
-  or configured VLANs make eth1 an explicitly required deployment interface.
+  or configured VLANs make eth1 an explicitly required deployment interface. Explicit
+  unused mode disables native/VLAN use and does not require carrier or IPv4.
 - Tagged VLANs are IEEE 802.1Q subinterfaces linked to eth1, not eth0.
 - VLANs support DHCP or static IPv4, but may not own a default route or DNS.
 - VLAN IDs are never guessed; customer/engineering values must be supplied.
@@ -731,6 +777,47 @@ dns_resolves_ipv4() {
   getent ahostsv4 "${host}" 2>/dev/null | awk '{print $1}' | grep -Eq '^[0-9]+(\.[0-9]+){3}$'
 }
 
+ipv4_addresses_for_host() {
+  local host="$1"
+  getent ahostsv4 "${host}" 2>/dev/null \
+    | awk '$1 ~ /^[0-9]+(\.[0-9]+){3}$/ {print $1}' \
+    | awk '!seen[$0]++'
+}
+
+tcp_connect_ipv4() {
+  local host="$1" port="$2" timeout_seconds="${3:-8}"
+  local ip
+  local -a addresses=()
+
+  mapfile -t addresses < <(ipv4_addresses_for_host "${host}")
+  (( ${#addresses[@]} > 0 )) || return 2
+
+  for ip in "${addresses[@]}"; do
+    if timeout "${timeout_seconds}" bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "${ip}" "${port}" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+https_connect_ipv4_host() {
+  local host="$1" path="${2:-/}" connect_timeout="${3:-5}" max_time="${4:-12}"
+  local ip
+  local -a addresses=()
+  command -v curl >/dev/null 2>&1 || return 3
+  mapfile -t addresses < <(ipv4_addresses_for_host "${host}")
+  (( ${#addresses[@]} > 0 )) || return 2
+  for ip in "${addresses[@]}"; do
+    # --resolve preserves hostname/SNI/TLS validation while pinning one IPv4 target.
+    # Do not use -f: any HTTP status proves the HTTPS/TLS path itself completed.
+    if curl -4 -sS --connect-timeout "${connect_timeout}" --max-time "${max_time}" \
+        --resolve "${host}:443:${ip}" -o /dev/null "https://${host}${path}" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 ntp_is_synchronized() {
   local synced=""
   synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
@@ -859,12 +946,34 @@ preflight_checks() {
   dns_resolves_ipv4 api.snapcraft.io || error_exit "DNS cannot resolve api.snapcraft.io to IPv4."
   dns_resolves_ipv4 security.ubuntu.com || error_exit "DNS cannot resolve security.ubuntu.com to IPv4."
 
-  timeout 8 bash -c '</dev/tcp/archive.ubuntu.com/80' || \
-    error_exit "Cannot establish TCP connectivity to archive.ubuntu.com:80 for package bootstrap."
-  timeout 8 bash -c '</dev/tcp/api.snapcraft.io/443' || \
-    error_exit "Cannot establish TCP connectivity to api.snapcraft.io:443."
-  timeout 8 bash -c '</dev/tcp/security.ubuntu.com/443' || \
-    warning_message "TCP 443 to security.ubuntu.com could not be confirmed; apt source configuration may use another transport/mirror."
+  tcp_connect_ipv4 archive.ubuntu.com 80 8 || \
+    error_exit "Cannot establish IPv4 TCP connectivity to archive.ubuntu.com:80 for package bootstrap. Resolved IPv4 addresses: $(ipv4_addresses_for_host archive.ubuntu.com | paste -sd, -)."
+
+  # Snap Store access must be tested at HTTPS/TLS/SNI level when curl is already
+  # available. A raw TCP handshake alone can succeed while TLS traffic is filtered.
+  # Existing Domotz appliances may continue a maintenance/rebuild run when the
+  # Store is temporarily blocked because install_domotz() retains the installed
+  # revision if refresh fails. A new appliance cannot install Domotz without Store access.
+  if command -v curl >/dev/null 2>&1; then
+    if https_connect_ipv4_host api.snapcraft.io / 5 12; then
+      progress_message "Snap Store HTTPS/TLS connectivity verified over IPv4."
+    elif snap list "${DOMOTZ_SNAP_NAME}" >/dev/null 2>&1; then
+      warning_message "Snap Store HTTPS/TLS connectivity to api.snapcraft.io:443 is unavailable, but Domotz is already installed. Setup will retain the installed revision if refresh also fails."
+    else
+      error_exit "Cannot establish IPv4 HTTPS/TLS connectivity to api.snapcraft.io:443 and Domotz is not installed. Resolved IPv4 addresses: $(ipv4_addresses_for_host api.snapcraft.io | paste -sd, -). Upstream firewall/proxy/TLS inspection policy must permit Snap Store HTTPS."
+    fi
+  else
+    if tcp_connect_ipv4 api.snapcraft.io 443 8; then
+      warning_message "curl is not yet available; Snap Store preflight verified TCP 443 only. Full HTTPS/TLS access will be proven by snap install/refresh after package handling."
+    elif snap list "${DOMOTZ_SNAP_NAME}" >/dev/null 2>&1; then
+      warning_message "Snap Store TCP 443 could not be confirmed, but Domotz is already installed; retaining the installed revision is permitted for this rebuild."
+    else
+      error_exit "Cannot establish IPv4 TCP connectivity to api.snapcraft.io:443 and Domotz is not installed."
+    fi
+  fi
+
+  tcp_connect_ipv4 security.ubuntu.com 443 8 || \
+    warning_message "IPv4 TCP 443 to security.ubuntu.com could not be confirmed; apt source configuration may use another transport/mirror. Resolved IPv4 addresses: $(ipv4_addresses_for_host security.ubuntu.com | paste -sd, -)."
 
   if command -v timedatectl >/dev/null 2>&1; then
     local synced
@@ -1392,6 +1501,14 @@ if command -v sshd >/dev/null 2>&1 && sshd -t >/dev/null 2>&1; then
 else
   fail "sshd configuration validation failed."
 fi
+
+# Engineering remote access is deliberately public-key only. The local password
+# exists for USB-C/local-console and sudo authentication, not for remote SSH.
+ENG_SSH_EFFECTIVE="$(sshd -T -C user=${ENG_USER},host=localhost,addr=127.0.0.1 2>/dev/null || true)"
+grep -q '^passwordauthentication no$' <<<"$ENG_SSH_EFFECTIVE" && pass "$ENG_USER SSH password authentication disabled." || fail "$ENG_USER SSH password authentication is not disabled."
+grep -q '^authenticationmethods publickey$' <<<"$ENG_SSH_EFFECTIVE" && pass "$ENG_USER SSH requires public-key authentication." || fail "$ENG_USER SSH does not require public-key authentication."
+grep -q '^forcecommand sudo -n /usr/local/sbin/solutionz-rmm-local-config --engineering-login$' <<<"$ENG_SSH_EFFECTIVE" && pass "$ENG_USER SSH is forced to the Engineering menu." || fail "$ENG_USER SSH is not forced to the Engineering menu."
+
 getent group "$TECH_GROUP" >/dev/null 2>&1 && pass "Restricted field-tech group exists." || fail "Field-tech group missing."
 getent group "$ENG_GROUP" >/dev/null 2>&1 && pass "Engineering group exists." || fail "Engineering group missing."
 if [[ -s "$SSH_FILE" ]] && grep -q '^Match Group solutionz-rmm-tech,!solutionz-rmm-engineering$' "$SSH_FILE" && grep -q -- '--restricted-login' "$SSH_FILE"; then
@@ -1730,9 +1847,24 @@ MaxAuthTries 3
 LoginGraceTime 30
 X11Forwarding no
 
-# Dedicated field technicians are forced into the controlled configuration
-# menu for SSH sessions. Membership in the engineering group is an explicit
-# exception and preserves an unrestricted administrative shell.
+# Engineering SSH is key-only. A successful key-authenticated solz_eng login is
+# forced into the Solutionz menu in ENGINEERING mode; unrestricted shell access
+# is available only from the authenticated Engineering Session inside that menu.
+# The local engineering password remains usable for USB-C/local-console and sudo,
+# but it is never accepted for remote SSH authentication.
+Match User solz_eng
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    PubkeyAuthentication yes
+    ForceCommand sudo -n /usr/local/sbin/solutionz-rmm-local-config --engineering-login
+    DisableForwarding yes
+    X11Forwarding no
+    PermitTunnel no
+Match all
+
+# Dedicated field technicians are forced into the controlled configuration menu
+# for SSH sessions. Engineering is explicitly excluded from the field-tech Match
+# because solz_eng has its own stronger key-only rule above.
 Match Group solutionz-rmm-tech,!solutionz-rmm-engineering
     ForceCommand sudo -n /usr/local/sbin/solutionz-rmm-local-config --restricted-login
     DisableForwarding yes
@@ -1779,8 +1911,9 @@ EOF
 }
 
 write_default_network_profile() {
-  install -d -m 750 "${NETWORK_PROFILE_DIR}"
-  cat > "${NETWORK_PROFILE_FILE}" <<'JSON'
+  local target="${1:-${NETWORK_PROFILE_FILE}}"
+  install -d -m 750 "$(dirname "${target}")"
+  cat > "${target}" <<'JSON'
 {
   "revision": "V06.100626N",
   "wan": {"interface": "eth0", "mode": "dhcp", "dns": []},
@@ -1788,7 +1921,7 @@ write_default_network_profile() {
   "vlans": []
 }
 JSON
-  chmod 600 "${NETWORK_PROFILE_FILE}"
+  chmod 600 "${target}"
 }
 
 install_network_profile_tool() {
@@ -1869,7 +2002,7 @@ def validate_profile(raw):
         if not wd:invalid("WAN static mode requires at least one IPv4 DNS server.")
     elif wan.get("address") or wg:fail("wan DHCP mode cannot define address or gateway.")
     lm=str(lan.get("mode","dhcp")).strip().lower(); li=None
-    if lm not in {"dhcp","static","none"}:fail("lan.mode must be dhcp, static, or none.")
+    if lm not in {"dhcp","static","none","unused"}:fail("lan.mode must be dhcp, static, none, or unused.")
     if lan.get("gateway") or lan.get("default_route"):fail("LAN eth1 may not define gateway/default route.")
     if lan.get("dns"):fail("LAN eth1 may not define system DNS.")
     if lm=="static":li=parse_static(lan,"lan")
@@ -1878,6 +2011,7 @@ def validate_profile(raw):
     if not isinstance(vlans,list):fail("vlans must be a JSON array.")
     if len(vlans)>MAX_VLANS:fail(f"Maximum {MAX_VLANS} VLANs supported.")
     if lm=="none" and not vlans:fail("lan.mode=none requires at least one VLAN.")
+    if lm=="unused" and vlans:fail("lan.mode=unused cannot define VLANs because eth1 is intentionally disabled for this deployment.")
     nets=[]
     if wi:nets.append(("wan/eth0",wi.network))
     if li:nets.append(("lan/eth1",li.network))
@@ -1968,11 +2102,15 @@ def wizard(path):
     if wm=="static":
         wa=cidr("WAN IPv4/CIDR")
         wan.update(address=wa,gateway=gateway("WAN gateway",wa),dns=dns_list("WAN DNS"))
-    lm=choice("LAN eth1 native mode",["dhcp","static","none"],"dhcp");lan={"interface":"eth1","mode":lm}
+    lm=choice("LAN eth1 native mode",["dhcp","static","none","unused"],"dhcp");lan={"interface":"eth1","mode":lm}
     if lm=="static":lan["address"]=cidr("LAN eth1 IPv4/CIDR")
-    while True:
-        try:n=int(input(f"Tagged VLAN count 0-{MAX_VLANS}: ").strip() or 0);assert 0<=n<=MAX_VLANS;break
-        except Exception:print("Invalid count.")
+    if lm=="unused":
+        n=0
+        print("LAN eth1 marked unused; tagged VLAN count forced to 0.")
+    else:
+        while True:
+            try:n=int(input(f"Tagged VLAN count 0-{MAX_VLANS}: ").strip() or 0);assert 0<=n<=MAX_VLANS;break
+            except Exception:print("Invalid count.")
     vs=[];seen=set()
     for x in range(n):
         while True:
@@ -2227,9 +2365,11 @@ OFFLINE_STAGING="${SOLUTIONZ_RMM_OFFLINE_STAGING:-0}"
 
 CONFIG_FAILS=()
 CONNECT_FAILS=()
+PENDING=()
 
 cf() { CONFIG_FAILS+=("$*"); echo "FAIL - $*"; }
 xf() { CONNECT_FAILS+=("$*"); echo "FAIL - $*"; }
+pend() { PENDING+=("$*"); echo "PENDING - $*"; }
 ok() { echo "PASS - $*"; }
 info() { echo "INFO - $*"; }
 
@@ -2250,7 +2390,20 @@ carrier() {
 }
 
 tcp_open() {
-  timeout 8 bash -c "</dev/tcp/$1/$2" >/dev/null 2>&1
+  local host="$1" port="$2" ip
+  local -a addresses=()
+  mapfile -t addresses < <(
+    getent ahostsv4 "$host" 2>/dev/null \
+      | awk '$1 ~ /^[0-9]+(\.[0-9]+){3}$/ {print $1}' \
+      | awk '!seen[$0]++'
+  )
+  (( ${#addresses[@]} > 0 )) || return 2
+  for ip in "${addresses[@]}"; do
+    if timeout 8 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$ip" "$port" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 profile_meta() {
@@ -2309,9 +2462,10 @@ if [[ -x "$PROFILE_TOOL" && -s "$PROFILE" ]] && "$PROFILE_TOOL" validate "$PROFI
   LAN_MODE="${META[3]:-}"
   LAN_EXPECTED="${META[4]:-}"
   LAN_VLAN_COUNT="$(profile_vlans | awk 'NF {c++} END {print c+0}')"
-  # Default DHCP LAN with no VLANs is optional. An explicitly static LAN or any
-  # configured VLAN means the deployment expects eth1 to be available.
-  if [[ "$LAN_MODE" == "static" || "$LAN_VLAN_COUNT" -gt 0 ]]; then
+  # Default DHCP LAN with no VLANs is optional. Static LAN, an unnumbered
+  # trunk/VLAN profile, or any configured VLAN requires eth1. Explicit unused
+  # mode never requires carrier/addressing and cannot contain VLANs.
+  if [[ "$LAN_MODE" != "unused" && ( "$LAN_MODE" == "static" || "$LAN_MODE" == "none" || "$LAN_VLAN_COUNT" -gt 0 ) ]]; then
     LAN_REQUIRED=1
   fi
 else
@@ -2327,7 +2481,7 @@ fi
 # Give systemd-networkd a bounded opportunity to obtain DHCP leases and create VLANs.
 if command -v networkctl >/dev/null 2>&1; then
   networkctl reconfigure "$WAN" >/dev/null 2>&1 || true
-  networkctl reconfigure "$LAN" >/dev/null 2>&1 || true
+  [[ "$LAN_MODE" != "unused" ]] && networkctl reconfigure "$LAN" >/dev/null 2>&1 || true
   [[ "$WAN_MODE" == "dhcp" ]] && networkctl renew "$WAN" >/dev/null 2>&1 || true
   [[ "$LAN_MODE" == "dhcp" ]] && networkctl renew "$LAN" >/dev/null 2>&1 || true
   if (( PROFILE_VALID )); then
@@ -2339,17 +2493,16 @@ if command -v networkctl >/dev/null 2>&1; then
 fi
 
 ready_now() {
-  [[ "$OFFLINE_STAGING" == "1" ]] && return 0
   carrier "$WAN" || return 1
   [[ -n "$(ip4 "$WAN")" ]] || return 1
   mapfile -t defaults < <(ip -4 route show default 2>/dev/null)
   [[ ${#defaults[@]} -eq 1 && "$(default_iface)" == "$WAN" ]] || return 1
 
   if (( PROFILE_VALID )); then
-    # An unused default DHCP eth1 is allowed to remain physically disconnected.
-    # Once carrier is present, or the profile explicitly requires LAN/VLAN use,
-    # normal LAN validation becomes mandatory.
-    if (( LAN_REQUIRED )) || carrier "$LAN"; then
+    # Explicit unused and default DHCP-without-VLAN profiles do not require
+    # eth1 carrier. Once carrier is present, or the profile requires LAN/VLAN
+    # use, normal LAN validation becomes mandatory.
+    if [[ "$LAN_MODE" != "unused" ]] && { (( LAN_REQUIRED )) || carrier "$LAN"; }; then
       carrier "$LAN" || return 1
       if [[ "$LAN_MODE" == "dhcp" || "$LAN_MODE" == "static" ]]; then
         [[ -n "$(ip4 "$LAN")" ]] || return 1
@@ -2369,27 +2522,34 @@ ready_now() {
 
 attempts=$(( (WAIT_SECONDS + 1) / 2 ))
 (( attempts < 1 )) && attempts=1
-for ((i=1; i<=attempts; i++)); do
-  ready_now && break
-  (( i < attempts )) && sleep 2
-done
+if [[ "$OFFLINE_STAGING" != "1" ]]; then
+  for ((i=1; i<=attempts; i++)); do
+    ready_now && break
+    (( i < attempts )) && sleep 2
+  done
+else
+  info "Offline USB-C staging detected; DHCP/live-connectivity wait is bounded by current carrier state."
+fi
 
 ip link show "$WAN" >/dev/null 2>&1 && ok "WAN eth0 exists." || cf "WAN eth0 missing."
 ip link show "$LAN" >/dev/null 2>&1 && ok "LAN eth1 exists." || cf "LAN eth1 missing."
 if carrier "$WAN"; then
   ok "WAN eth0 carrier UP."
 elif [[ "$OFFLINE_STAGING" == "1" ]]; then
-  info "WAN eth0 carrier DOWN; live-link validation deferred for USB-C offline staging."
+  pend "WAN eth0 carrier DOWN; live-link validation deferred for USB-C offline staging."
 else
   cf "WAN eth0 carrier DOWN."
 fi
-if carrier "$LAN"; then
+if [[ "$LAN_MODE" == "unused" ]]; then
+  LAN_STATUS="UNUSED"
+  ok "LAN eth1 is explicitly UNUSED by profile; physical carrier is not required."
+elif carrier "$LAN"; then
   LAN_STATUS="CONNECTED"
   ok "LAN eth1 carrier UP."
 elif (( LAN_REQUIRED )); then
   LAN_STATUS="REQUIRED_NOT_CONNECTED"
   if [[ "$OFFLINE_STAGING" == "1" ]]; then
-    info "LAN eth1 is required by the configured static LAN/VLAN profile but has no carrier; live-link validation deferred for USB-C offline staging."
+    pend "LAN eth1 is required by the configured static LAN/VLAN profile but has no carrier; live-link validation deferred for USB-C offline staging."
   else
     cf "LAN eth1 is required by the configured static LAN/VLAN profile but has no carrier."
   fi
@@ -2402,13 +2562,13 @@ wan_addr="$(ip4 "$WAN")"
 if [[ -n "$wan_addr" ]]; then
   ok "WAN eth0 IPv4 ${wan_addr}."
 elif [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$WAN"; then
-  info "WAN eth0 has no live IPv4 address because carrier is down; live address validation deferred for USB-C offline staging."
+  pend "WAN eth0 has no live IPv4 address because carrier is down; live address validation deferred for USB-C offline staging."
 else
   cf "WAN eth0 has no IPv4 address."
 fi
 if [[ "$WAN_MODE" == "static" && -n "$WAN_EXPECTED" && "$wan_addr" != "$WAN_EXPECTED" ]]; then
   if [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$WAN"; then
-    info "WAN eth0 live IPv4 ${wan_addr:-none}; expected ${WAN_EXPECTED}. Comparison deferred until carrier is present."
+    pend "WAN eth0 live IPv4 ${wan_addr:-none}; expected ${WAN_EXPECTED}. Comparison deferred until carrier is present."
   else
     cf "WAN eth0 IPv4 ${wan_addr:-none}; expected ${WAN_EXPECTED}."
   fi
@@ -2418,7 +2578,7 @@ mapfile -t DEFAULTS < <(ip -4 route show default 2>/dev/null)
 if [[ ${#DEFAULTS[@]} -eq 1 ]]; then
   ok "Exactly one IPv4 default route is installed."
 elif [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$WAN" && [[ ${#DEFAULTS[@]} -eq 0 ]]; then
-  info "No IPv4 default route is currently installed because WAN carrier is down; route validation deferred for USB-C offline staging."
+  pend "No IPv4 default route is currently installed because WAN carrier is down; route validation deferred for USB-C offline staging."
 else
   cf "Expected exactly one IPv4 default route; found ${#DEFAULTS[@]}."
 fi
@@ -2426,7 +2586,7 @@ fi
 if [[ "$(default_iface)" == "$WAN" ]]; then
   ok "Default route uses WAN eth0."
 elif [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$WAN" && [[ -z "$(default_iface)" ]]; then
-  info "No active default-route interface while WAN carrier is down; ownership validation deferred for USB-C offline staging."
+  pend "No active default-route interface while WAN carrier is down; ownership validation deferred for USB-C offline staging."
 else
   cf "Default route does not use WAN eth0."
 fi
@@ -2449,13 +2609,15 @@ if (( PROFILE_VALID )); then
     if [[ "$actual_gateway" == "$WAN_GATEWAY_EXPECTED" ]]; then
       ok "WAN gateway ${actual_gateway} matches profile."
     elif [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$WAN"; then
-      info "WAN gateway ${actual_gateway:-none}; expected ${WAN_GATEWAY_EXPECTED}. Live gateway validation deferred until carrier is present."
+      pend "WAN gateway ${actual_gateway:-none}; expected ${WAN_GATEWAY_EXPECTED}. Live gateway validation deferred until carrier is present."
     else
       cf "WAN gateway ${actual_gateway:-none}; expected ${WAN_GATEWAY_EXPECTED}."
     fi
   fi
 
-  if [[ "$LAN_MODE" == "none" ]]; then
+  if [[ "$LAN_MODE" == "unused" ]]; then
+    ok "LAN eth1 is intentionally unused; no IPv4 address, carrier, or VLAN path is required."
+  elif [[ "$LAN_MODE" == "none" ]]; then
     if carrier "$LAN" || (( LAN_REQUIRED )); then
       ok "LAN eth1 is configured as an unnumbered VLAN trunk parent."
     else
@@ -2470,7 +2632,7 @@ if (( PROFILE_VALID )); then
       fi
     elif (( LAN_REQUIRED )); then
       if [[ "$OFFLINE_STAGING" == "1" ]]; then
-        info "LAN eth1 has no live IPv4 address because required LAN carrier is down; live address validation deferred for USB-C offline staging."
+        pend "LAN eth1 has no live IPv4 address because required LAN carrier is down; live address validation deferred for USB-C offline staging."
       else
         cf "LAN eth1 has no IPv4 address because the required LAN interface is not connected."
       fi
@@ -2484,6 +2646,8 @@ if (( PROFILE_VALID )); then
     vname="vlan${vid}"
     if ip -d link show "$vname" 2>/dev/null | grep -Eq "vlan protocol 802\\.1Q id ${vid}( |$)"; then
       ok "${vname} VLAN ID ${vid} active on LAN eth1."
+    elif [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$LAN"; then
+      pend "${vname} live interface activation is pending LAN eth1 physical link."
     else
       cf "${vname} missing or has the wrong 802.1Q VLAN ID."
     fi
@@ -2491,13 +2655,13 @@ if (( PROFILE_VALID )); then
     if [[ -n "$vaddr" ]]; then
       ok "${vname} IPv4 ${vaddr}."
     elif [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$LAN"; then
-      info "${vname} has no live IPv4 address while eth1 carrier is down; live address validation deferred for USB-C offline staging."
+      pend "${vname} has no live IPv4 address while eth1 carrier is down; live address validation deferred for USB-C offline staging."
     else
       cf "${vname} has no IPv4 address."
     fi
     if [[ "$vmode" == "static" && -n "$vexpected" && "$vaddr" != "$vexpected" ]]; then
       if [[ "$OFFLINE_STAGING" == "1" ]] && ! carrier "$LAN"; then
-        info "${vname} live IPv4 ${vaddr:-none}; expected ${vexpected}. Comparison deferred until eth1 carrier is present."
+        pend "${vname} live IPv4 ${vaddr:-none}; expected ${vexpected}. Comparison deferred until eth1 carrier is present."
       else
         cf "${vname} IPv4 ${vaddr:-none}; expected ${vexpected}."
       fi
@@ -2508,15 +2672,20 @@ fi
 # WAN/cloud checks. These do not cause rollback of a locally valid Netplan.
 # NTP is intentionally excluded from the network validator. Time synchronization
 # is validated by the dedicated Phase 1 and Phase 2 NTP checks with bounded retry.
-# During authenticated USB-C offline preload, carrier/cloud state is not evidence
-# of a bad configuration. Report it as PENDING and validate it once Ethernet is live.
-if [[ "$OFFLINE_STAGING" == "1" ]]; then
-  info "WAN/cloud connectivity validation PENDING for offline USB-C preload; Ethernet carrier/connectivity will be verified when links are present."
-else
+# During authenticated USB-C offline preload, missing WAN carrier/address/default
+# route is not evidence of a bad configuration. If WAN itself is ready, cloud
+# checks still run even when a required LAN cable is temporarily disconnected.
+WAN_RUNTIME_READY=0
+if carrier "$WAN" && [[ -n "$(ip4 "$WAN")" && "$(default_iface)" == "$WAN" ]]; then
+  WAN_RUNTIME_READY=1
+fi
+if (( WAN_RUNTIME_READY )); then
   getent ahostsv4 api.snapcraft.io >/dev/null 2>&1 && ok "WAN DNS resolves api.snapcraft.io." || xf "WAN DNS cannot resolve api.snapcraft.io."
   getent ahostsv4 portal.domotz.com >/dev/null 2>&1 && ok "WAN DNS resolves portal.domotz.com." || xf "WAN DNS cannot resolve portal.domotz.com."
   tcp_open portal.domotz.com 443 && ok "Domotz TCP 443 reachable through WAN." || xf "Domotz TCP 443 unreachable through WAN."
   tcp_open messaging-us-east-1-cell-1.domotz.com 5671 && ok "Domotz TCP 5671 reachable through WAN." || xf "Domotz TCP 5671 unreachable through WAN."
+else
+  pend "WAN DNS/Domotz connectivity checks deferred until eth0 has carrier, IPv4 and the WAN default route."
 fi
 
 configuration_result="PASS"
@@ -2529,20 +2698,20 @@ if (( ${#CONFIG_FAILS[@]} > 0 )); then
   result="FAIL"
   failure_category="CONFIGURATION"
 fi
-if [[ "$OFFLINE_STAGING" == "1" ]]; then
-  connectivity_result="PENDING"
-  connectivity_reason="OFFLINE_USB_CARRIER_CONNECTIVITY_PENDING"
-  if [[ "$configuration_result" == "PASS" ]]; then
-    result="PENDING"
-    failure_category="NONE"
-  fi
-elif (( ${#CONNECT_FAILS[@]} > 0 )); then
+if (( ${#CONNECT_FAILS[@]} > 0 )); then
   connectivity_result="FAIL"
   result="FAIL"
   if [[ "$failure_category" == "CONFIGURATION" ]]; then
     failure_category="BOTH"
   else
     failure_category="CONNECTIVITY"
+  fi
+elif (( ${#PENDING[@]} > 0 )); then
+  connectivity_result="PENDING"
+  connectivity_reason="OFFLINE_USB_CARRIER_CONNECTIVITY_PENDING"
+  if [[ "$configuration_result" == "PASS" ]]; then
+    result="PENDING"
+    failure_category="PENDING"
   fi
 fi
 
@@ -2554,6 +2723,7 @@ fi
   echo "connectivity_result=${connectivity_result}"
   echo "connectivity_reason=${connectivity_reason}"
   echo "failure_category=${failure_category}"
+  echo "pending_checks=${#PENDING[@]}"
   echo "wan_interface=${WAN}"
   echo "wan_carrier=$(carrier "$WAN" && echo UP || echo DOWN)"
   echo "wan_ipv4=$(ip4 "$WAN")"
@@ -2572,89 +2742,219 @@ fi
   echo
   echo "CONNECTIVITY_FAILURES:"
   if (( ${#CONNECT_FAILS[@]} > 0 )); then printf -- '- %s\n' "${CONNECT_FAILS[@]}"; else echo '- none'; fi
+  echo
+  echo "PENDING_CHECKS:"
+  if (( ${#PENDING[@]} > 0 )); then printf -- '- %s\n' "${PENDING[@]}"; else echo '- none'; fi
 } > "$RESULT"
 chmod 640 "$RESULT"
 
 [[ "$configuration_result" == "FAIL" ]] && exit 10
 [[ "$connectivity_result" == "FAIL" ]] && exit 20
+[[ "$connectivity_result" == "PENDING" ]] && exit 30
 exit 0
 NETVALIDATOR
   chmod 750 "${NETWORK_VALIDATOR}"
   chown root:root "${NETWORK_VALIDATOR}"
 }
 
-stage_production_network_profile() {
-  install_network_profile_tool
-  install_live_network_discovery_tool
-  install_network_validator
-  install -d -m 750 "${NETWORK_PROFILE_DIR}"
-  if [[ -n "${NETWORK_PROFILE_SOURCE}" ]]; then
-    [[ -r "${NETWORK_PROFILE_SOURCE}" ]] || error_exit "Network profile is not readable: ${NETWORK_PROFILE_SOURCE}"
-    cp -f "${NETWORK_PROFILE_SOURCE}" "${NETWORK_PROFILE_FILE}"
-    chmod 600 "${NETWORK_PROFILE_FILE}"
-    progress_message "Using supplied dual-homed WAN/LAN network profile: ${NETWORK_PROFILE_SOURCE}"
-  elif [[ -s "${NETWORK_PROFILE_FILE}" ]]; then
-    if "${NETWORK_PROFILE_TOOL}" validate "${NETWORK_PROFILE_FILE}" >/dev/null 2>&1; then
-      progress_message "Existing valid customer network profile detected; preserving ${NETWORK_PROFILE_FILE}."
-    else
-      error_exit "Existing network profile is present but invalid. Refusing to replace it with the default profile. Supply --network-profile <json> or repair ${NETWORK_PROFILE_FILE}."
-    fi
-  else
-    write_default_network_profile
-    progress_message "No existing network profile found and none supplied; creating default WAN eth0 DHCP + LAN eth1 DHCP profile."
+verify_setup_network_transaction() {
+  local tx="$1"
+  [[ -d "${tx}" && -f "${tx}/manifest.sha256" ]] || return 1
+  [[ -f "${tx}/netplan.yaml" || -f "${tx}/netplan.absent" ]] || return 1
+  [[ -f "${tx}/profile.json" || -f "${tx}/profile.absent" ]] || return 1
+  if [[ -s "${tx}/manifest.sha256" ]]; then
+    (cd "${tx}" && sha256sum -c manifest.sha256 >/dev/null 2>&1) || return 1
   fi
-  "${NETWORK_PROFILE_TOOL}" render "${NETWORK_PROFILE_FILE}" "${NETPLAN_FILE}" "${NETWORK_PROFILE_RESULT_FILE}" || error_exit "WAN/LAN/VLAN profile rendering failed. Review ${NETWORK_PROFILE_RESULT_FILE}."
-  chmod 600 "${NETPLAN_FILE}"
-}
-
-remove_stale_cloud_init_netplans() {
-  shopt -s nullglob
-  local files=(/etc/netplan/50-cloud-init*)
-  if (( ${#files[@]} > 0 )); then
-    rm -f "${files[@]}"
-    progress_message "Removed stale cloud-init Netplan files."
-  fi
-  shopt -u nullglob
+  return 0
 }
 
 create_setup_network_transaction() {
-  install -d -m 750 "${NETWORK_TRANSACTION_ROOT}"
-  local tx id
-  tx="$(mktemp -d "${NETWORK_TRANSACTION_ROOT}/$(date -u +%Y%m%dT%H%M%SZ)-setup-XXXXXX")" || error_exit "Unable to create network configuration transaction backup."
-  chmod 750 "${tx}"
-  id="$(basename "${tx}")"
+  local reason="${1:-engineering_setup}" txid txdir
+  install -d -m 750 "${NETWORK_TRANSACTION_ENGINEERING_DIR}"
+  txid="$(date -u +%Y%m%dT%H%M%SZ)-engineering-$$-$(date +%N)"
+  txdir="${NETWORK_TRANSACTION_ENGINEERING_DIR}/${txid}"
+  install -d -m 700 "${txdir}"
+
+  if [[ -f "${NETPLAN_FILE}" ]]; then
+    cp -a "${NETPLAN_FILE}" "${txdir}/netplan.yaml"
+  else
+    : > "${txdir}/netplan.absent"
+  fi
+  if [[ -f "${NETWORK_PROFILE_FILE}" ]]; then
+    cp -a "${NETWORK_PROFILE_FILE}" "${txdir}/profile.json"
+  else
+    : > "${txdir}/profile.absent"
+  fi
+
   {
-    echo "transaction_id=${id}"
-    echo "created_utc=$(date -u +%FT%TZ)"
-    echo "source=setup"
-    if [[ -f "${NETPLAN_FILE}" ]]; then
-      echo "netplan_present=1"
-      echo "netplan_sha256=$(sha256sum "${NETPLAN_FILE}" | awk '{print $1}')"
+    echo "transaction_id=${txid}"
+    echo "revision=${REVISION}"
+    echo "timestamp_utc=$(date -u +%FT%TZ)"
+    echo "reason=${reason}"
+    echo "source=engineering_setup"
+    echo "setup_context=${SETUP_CONTEXT}"
+  } > "${txdir}/metadata"
+
+  (
+    cd "${txdir}"
+    : > manifest.sha256
+    [[ -f netplan.yaml ]] && sha256sum netplan.yaml >> manifest.sha256
+    [[ -f profile.json ]] && sha256sum profile.json >> manifest.sha256
+  )
+  chmod 600 "${txdir}"/* 2>/dev/null || true
+  SETUP_NETWORK_TRANSACTION="${txdir}"
+  progress_message "Saved pre-Setup network state in engineering transaction ${txid}."
+}
+
+restore_setup_network_transaction() {
+  local tx="$1"
+  [[ -n "${tx}" ]] || return 0
+  verify_setup_network_transaction "${tx}" || return 1
+  if [[ -f "${tx}/netplan.yaml" ]]; then
+    cp -a "${tx}/netplan.yaml" "${NETPLAN_FILE}"
+  else
+    rm -f "${NETPLAN_FILE}"
+  fi
+  if [[ -f "${tx}/profile.json" ]]; then
+    cp -a "${tx}/profile.json" "${NETWORK_PROFILE_FILE}"
+  else
+    rm -f "${NETWORK_PROFILE_FILE}"
+  fi
+}
+
+prepare_production_network_candidate() {
+  install_network_profile_tool
+  install_live_network_discovery_tool
+  install_network_validator
+
+  CANDIDATE_DIR="$(mktemp -d /tmp/solutionz-rmm-network-candidate.XXXXXX)"
+  CANDIDATE_PROFILE="${CANDIDATE_DIR}/network-profile.json"
+  CANDIDATE_NETPLAN="${CANDIDATE_DIR}/00-installer-config.yaml"
+  CANDIDATE_RESULT="${CANDIDATE_DIR}/network-profile.result"
+
+  if [[ -n "${NETWORK_PROFILE_SOURCE}" ]]; then
+    [[ -r "${NETWORK_PROFILE_SOURCE}" ]] || error_exit "Network profile is not readable: ${NETWORK_PROFILE_SOURCE}"
+    cp -f "${NETWORK_PROFILE_SOURCE}" "${CANDIDATE_PROFILE}"
+    progress_message "Validating supplied WAN/LAN/VLAN profile before commit: ${NETWORK_PROFILE_SOURCE}"
+  elif [[ -s "${NETWORK_PROFILE_FILE}" ]]; then
+    if "${NETWORK_PROFILE_TOOL}" validate "${NETWORK_PROFILE_FILE}" >/dev/null 2>&1; then
+      cp -f "${NETWORK_PROFILE_FILE}" "${CANDIDATE_PROFILE}"
+      progress_message "Existing valid customer network profile detected; preserving it through candidate-first validation."
     else
-      echo "netplan_present=0"
+      error_exit "Existing network profile is invalid. Refusing to replace it with defaults. Supply --network-profile <json> or repair ${NETWORK_PROFILE_FILE}."
     fi
-    if [[ -f "${NETWORK_PROFILE_FILE}" ]]; then
-      echo "profile_present=1"
-      echo "profile_sha256=$(sha256sum "${NETWORK_PROFILE_FILE}" | awk '{print $1}')"
-    else
-      echo "profile_present=0"
-    fi
-  } > "${tx}/manifest"
-  chmod 640 "${tx}/manifest"
-  [[ -f "${NETPLAN_FILE}" ]] && cp -a "${NETPLAN_FILE}" "${tx}/netplan.yaml"
-  [[ -f "${NETWORK_PROFILE_FILE}" ]] && cp -a "${NETWORK_PROFILE_FILE}" "${tx}/network-profile.json"
-  NETWORK_TRANSACTION_CURRENT="${tx}"
-  progress_message "Captured exact pre-change network transaction: ${id}"
+  else
+    write_default_network_profile "${CANDIDATE_PROFILE}"
+    progress_message "No existing network profile found; preparing default WAN DHCP + optional LAN DHCP profile in staging."
+  fi
+  chmod 600 "${CANDIDATE_PROFILE}"
+
+  "${NETWORK_PROFILE_TOOL}" validate "${CANDIDATE_PROFILE}" >/dev/null || \
+    error_exit "Candidate WAN/LAN/VLAN profile validation failed; active network configuration was not changed."
+  "${NETWORK_PROFILE_TOOL}" render "${CANDIDATE_PROFILE}" "${CANDIDATE_NETPLAN}" "${CANDIDATE_RESULT}" || \
+    error_exit "Candidate WAN/LAN/VLAN profile rendering failed; active network configuration was not changed."
+  chmod 600 "${CANDIDATE_NETPLAN}"
+  chmod 640 "${CANDIDATE_RESULT}"
+
+  # Validate the rendered candidate in an isolated temporary root when the
+  # installed Netplan supports --root-dir. No live /etc/netplan file is touched.
+  local candidate_root
+  candidate_root="${CANDIDATE_DIR}/root"
+  install -d -m 700 "${candidate_root}/etc/netplan"
+  cp -a "${CANDIDATE_NETPLAN}" "${candidate_root}/etc/netplan/00-installer-config.yaml"
+  if netplan generate --help 2>&1 | grep -q -- '--root-dir'; then
+    netplan generate --root-dir "${candidate_root}" >/dev/null 2>&1 || \
+      error_exit "Candidate Netplan generation failed in staging; active network configuration was not changed."
+    progress_message "Candidate profile and Netplan passed isolated pre-commit validation."
+  else
+    warning_message "Installed Netplan does not advertise --root-dir; candidate profile/render validation passed and final netplan generate will run immediately after commit."
+  fi
+}
+
+archive_conflicting_netplans_main() {
+  local f base archive_id archive_dir found=0 netplan_dir
+  netplan_dir="$(dirname "${NETPLAN_FILE}")"
+  shopt -s nullglob
+  local files=("${netplan_dir}"/*.yaml "${netplan_dir}"/*.yml)
+  shopt -u nullglob
+
+  for f in "${files[@]}"; do
+    [[ "${f}" == "${NETPLAN_FILE}" ]] && continue
+    [[ -e "${f}" || -L "${f}" ]] || continue
+    found=1
+    break
+  done
+  (( found )) || { SETUP_NETPLAN_ARCHIVE=""; return 0; }
+
+  install -d -m 750 "${NETPLAN_ARCHIVE_DIR}"
+  archive_id="$(date -u +%Y%m%dT%H%M%SZ)-setup-$$-$(date +%N)"
+  archive_dir="${NETPLAN_ARCHIVE_DIR}/${archive_id}"
+  install -d -m 700 "${archive_dir}"
+  {
+    echo "archive_id=${archive_id}"
+    echo "revision=${REVISION}"
+    echo "timestamp_utc=$(date -u +%FT%TZ)"
+    echo "setup_context=${SETUP_CONTEXT}"
+    echo "reason=remove_conflicting_netplan_files_before_solutionz_commit"
+  } > "${archive_dir}/metadata"
+  : > "${archive_dir}/manifest.sha256"
+
+  for f in "${files[@]}"; do
+    [[ "${f}" == "${NETPLAN_FILE}" ]] && continue
+    [[ -e "${f}" || -L "${f}" ]] || continue
+    base="$(basename "${f}")"
+    sha256sum "${f}" | awk -v b="${base}" '{print $1 "  " b}' >> "${archive_dir}/manifest.sha256" 2>/dev/null || true
+    mv "${f}" "${archive_dir}/${base}"
+    progress_message "Archived conflicting Netplan file for ${SETUP_CONTEXT}: ${f}"
+  done
+  chmod 600 "${archive_dir}"/* 2>/dev/null || true
+  SETUP_NETPLAN_ARCHIVE="${archive_dir}"
+  progress_message "Conflicting Netplan files archived at ${archive_dir}."
+}
+
+restore_archived_netplans_main() {
+  local archive_dir="${1:-${SETUP_NETPLAN_ARCHIVE:-}}" f netplan_dir
+  [[ -n "${archive_dir}" && -d "${archive_dir}" ]] || return 0
+  netplan_dir="$(dirname "${NETPLAN_FILE}")"
+  install -d -m 755 "${netplan_dir}"
+  shopt -s nullglob
+  for f in "${archive_dir}"/*.yaml "${archive_dir}"/*.yml; do
+    [[ -e "${f}" || -L "${f}" ]] || continue
+    mv "${f}" "${netplan_dir}/$(basename "${f}")"
+  done
+  shopt -u nullglob
+}
+
+commit_production_network_candidate() {
+  install -d -m 750 "${NETWORK_PROFILE_DIR}"
+  cp -f "${CANDIDATE_PROFILE}" "${NETWORK_PROFILE_FILE}"
+  cp -f "${CANDIDATE_NETPLAN}" "${NETPLAN_FILE}"
+  cp -f "${CANDIDATE_RESULT}" "${NETWORK_PROFILE_RESULT_FILE}"
+  chmod 600 "${NETWORK_PROFILE_FILE}" "${NETPLAN_FILE}"
+  chmod 640 "${NETWORK_PROFILE_RESULT_FILE}"
 }
 
 stage_network_config() {
   step_message 10 "Stage dual-homed WAN eth0 / LAN eth1 networking"
+  local network_lock_fd
   install -d -m 755 "$(dirname "${NETWORK_CONFIG_LOCK_FILE}")"
-  exec 8>"${NETWORK_CONFIG_LOCK_FILE}"
-  flock -n 8 || error_exit "Another USB-C/SSH/Setup session is modifying network configuration. Retry after that session completes."
-  create_setup_network_transaction
-  stage_production_network_profile
-  remove_stale_cloud_init_netplans
+  exec {network_lock_fd}>"${NETWORK_CONFIG_LOCK_FILE}"
+  if ! flock -n "${network_lock_fd}"; then
+    error_exit "Network configuration is already being modified by another Setup/USB-C/SSH session."
+  fi
+
+  # Never replace live persistent network state until the candidate validates and
+  # renders successfully. This applies equally to factory and refurbishment runs.
+  prepare_production_network_candidate
+  if (( PREEXISTING_SOLUTIONZ_INSTALL )); then
+    create_setup_network_transaction "refurbish_or_manual_setup_reset"
+  else
+    create_setup_network_transaction "factory_setup_existing_network_safeguard"
+  fi
+
+  archive_conflicting_netplans_main
+  commit_production_network_candidate
+
   mkdir -p /etc/cloud/cloud.cfg.d
   cat > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg <<'EOF'
 network: {config: disabled}
@@ -2663,12 +2963,26 @@ EOF
 # Solutionz RMM V06.100626N - dual-homed collector, not a router.
 net.ipv4.ip_forward=0
 EOF
-  chmod 644 "${IP_FORWARD_SYSCTL_FILE}"; sysctl -w net.ipv4.ip_forward=0 >/dev/null
-  netplan generate
-  progress_message "Netplan validated: eth0 WAN owns the only default route; eth1/VLANs are AV LAN paths with no default route; IPv4 forwarding is disabled."
-  flock -u 8 || true
-  exec 8>&-
+  chmod 644 "${IP_FORWARD_SYSCTL_FILE}"
+  sysctl -w net.ipv4.ip_forward=0 >/dev/null
+
+  if ! netplan generate; then
+    warning_message "Committed candidate failed final Netplan generation; restoring the pre-Setup network state."
+    restore_setup_network_transaction "${SETUP_NETWORK_TRANSACTION}" || true
+    restore_archived_netplans_main "${SETUP_NETPLAN_ARCHIVE}" || true
+    rm -rf "${CANDIDATE_DIR}" 2>/dev/null || true
+    flock -u "${network_lock_fd}" || true
+    eval "exec ${network_lock_fd}>&-" || true
+    error_exit "Final Netplan generation failed after commit; previous network state was restored where available."
+  fi
+
+  rm -rf "${CANDIDATE_DIR}" 2>/dev/null || true
+  CANDIDATE_DIR=""; CANDIDATE_PROFILE=""; CANDIDATE_NETPLAN=""; CANDIDATE_RESULT=""
+  flock -u "${network_lock_fd}" || true
+  eval "exec ${network_lock_fd}>&-" || true
+  progress_message "Network staging complete for ${SETUP_CONTEXT}: candidate validated before commit, conflicting Netplan files archived, and final Netplan generation passed."
 }
+
 
 repair_resolv_conf() {
   step_message 11 "Repair and validate DNS resolver"
@@ -2798,6 +3112,7 @@ EOF
 
 install_local_serial_config_tool() {
   step_message 14 "Install field WAN/LAN/VLAN configuration utility"
+  install -d -m 750 "${NETWORK_TRANSACTION_ENGINEERING_DIR}" "${NETWORK_TRANSACTION_FIELD_DIR}"
   cat > "${LOCAL_CONFIG_TOOL}" <<'LOCALCFG'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -2832,8 +3147,9 @@ REGISTER_NEW_DOMOTZ_DIRECT=0
 PRODUCTION_VALIDATION_RESULT="NOT_RUN"
 PRE_NETPLAN_SHA256=""
 PRE_PROFILE_SHA256=""
-NETWORK_LOCK="/run/lock/solutionz-rmm-network-config.lock"
-TRANSACTION_ROOT="/var/lib/rswsolutionz-rmm/network-transactions"
+NETWORK_LOCK="/run/lock/solutionz-rmm-network.lock"
+# Field Restore is intentionally isolated from factory/engineering transaction history.
+TRANSACTION_ROOT="/var/lib/rswsolutionz-rmm/network-transactions/field"
 CURRENT_TRANSACTION=""
 
 case "${1:-}" in
@@ -2896,62 +3212,94 @@ with_network_lock() {
 create_transaction() {
   local source="${1:-interactive}" tx id
   install -d -m 750 "$TRANSACTION_ROOT"
-  tx="$(mktemp -d "$TRANSACTION_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-${source}-XXXXXX")" || return 1
-  chmod 750 "$tx"
-  id="$(basename "$tx")"
+  id="$(date -u +%Y%m%dT%H%M%SZ)-field-$$-$(date +%N)"
+  tx="$TRANSACTION_ROOT/$id"
+  install -d -m 700 "$tx" || return 1
   PRE_NETPLAN_SHA256="$(sha_file "$NETPLAN")"
   PRE_PROFILE_SHA256="$(sha_file "$PROFILE")"
+
+  if [[ -f "$NETPLAN" ]]; then cp -a "$NETPLAN" "$tx/netplan.yaml"; else : > "$tx/netplan.absent"; fi
+  if [[ -f "$PROFILE" ]]; then cp -a "$PROFILE" "$tx/profile.json"; else : > "$tx/profile.absent"; fi
   {
     echo "transaction_id=$id"
     echo "created_utc=$(date -u +%FT%TZ)"
     echo "source=$source"
     echo "user=${SUDO_USER:-${USER:-unknown}}"
     echo "tty=$(tty 2>/dev/null || echo none)"
-    echo "netplan_present=$([[ -f "$NETPLAN" ]] && echo 1 || echo 0)"
-    echo "profile_present=$([[ -f "$PROFILE" ]] && echo 1 || echo 0)"
+    echo "ssh_connection=${SSH_CONNECTION:-none}"
     echo "netplan_sha256=$PRE_NETPLAN_SHA256"
     echo "profile_sha256=$PRE_PROFILE_SHA256"
-  } > "$tx/manifest"
-  chmod 640 "$tx/manifest"
-  [[ -f "$NETPLAN" ]] && cp -a "$NETPLAN" "$tx/netplan.yaml"
-  [[ -f "$PROFILE" ]] && cp -a "$PROFILE" "$tx/network-profile.json"
+  } > "$tx/metadata"
+  (
+    cd "$tx"
+    : > manifest.sha256
+    [[ -f netplan.yaml ]] && sha256sum netplan.yaml >> manifest.sha256
+    [[ -f profile.json ]] && sha256sum profile.json >> manifest.sha256
+  )
+  chmod 600 "$tx"/* 2>/dev/null || true
   CURRENT_TRANSACTION="$tx"
   echo "Network transaction captured: $id"
 }
 
 latest_transaction() {
-  find "$TRANSACTION_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null     | sort -nr | awk 'NR==1 {$1=""; sub(/^ /,""); print; exit}'
+  find "$TRANSACTION_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr | awk 'NR==1 {$1=""; sub(/^ /,""); print; exit}'
 }
 
-restore_transaction() {
-  local tx="$1" np pf
-  [[ -d "$tx" && -s "$tx/manifest" ]] || { echo "Transaction backup is missing or invalid: $tx"; return 1; }
-  np="$(awk -F= '$1=="netplan_present" {print $2}' "$tx/manifest" | tail -n1)"
-  pf="$(awk -F= '$1=="profile_present" {print $2}' "$tx/manifest" | tail -n1)"
-  if [[ "$np" == "1" ]]; then
-    [[ -f "$tx/netplan.yaml" ]] || { echo "Transaction Netplan snapshot missing."; return 1; }
-    cp -a "$tx/netplan.yaml" "$NETPLAN"
-  else
-    rm -f "$NETPLAN"
-  fi
-  if [[ "$pf" == "1" ]]; then
-    [[ -f "$tx/network-profile.json" ]] || { echo "Transaction profile snapshot missing."; return 1; }
-    cp -a "$tx/network-profile.json" "$PROFILE"
-  else
-    rm -f "$PROFILE"
+verify_transaction() {
+  local tx="$1"
+  [[ -d "$tx" && -f "$tx/manifest.sha256" ]] || return 1
+  [[ -f "$tx/netplan.yaml" || -f "$tx/netplan.absent" ]] || return 1
+  [[ -f "$tx/profile.json" || -f "$tx/profile.absent" ]] || return 1
+  if [[ -s "$tx/manifest.sha256" ]]; then
+    (cd "$tx" && sha256sum -c manifest.sha256 >/dev/null 2>&1) || return 1
   fi
   return 0
 }
+
+restore_transaction() {
+  local tx="$1"
+  verify_transaction "$tx" || { echo "Transaction integrity validation failed: $tx"; return 1; }
+  if [[ -f "$tx/netplan.yaml" ]]; then cp -a "$tx/netplan.yaml" "$NETPLAN"; else rm -f "$NETPLAN"; fi
+  if [[ -f "$tx/profile.json" ]]; then cp -a "$tx/profile.json" "$PROFILE"; else rm -f "$PROFILE"; fi
+  return 0
+}
+
 
 backup() {
   create_transaction interactive
 }
 
 usb_c_offline_staging() {
-  local t
+  local t lan_mode="dhcp" vlan_count=0 lan_required=0
   t="$(tty 2>/dev/null || true)"
   [[ -z "${SSH_CONNECTION:-}" && -z "${SSH_CLIENT:-}" && "$t" == "/dev/ttyS0" ]] || return 1
-  [[ "$(cat /sys/class/net/eth0/carrier 2>/dev/null || echo 0)" != "1" || "$(cat /sys/class/net/eth1/carrier 2>/dev/null || echo 0)" != "1" ]]
+
+  # WAN is always required. eth1 is required only for an explicitly static LAN,
+  # unnumbered trunk/VLAN deployment, or configured VLANs. Default DHCP eth1
+  # remains optional, and explicit unused mode never triggers offline staging.
+  if [[ -s "$PROFILE" ]]; then
+    read -r lan_mode vlan_count < <(python3 - "$PROFILE" <<'OFFLINEPROFILE'
+import json,sys
+try:
+    p=json.load(open(sys.argv[1],encoding='utf-8'))
+    mode=str(p.get('lan',{}).get('mode','dhcp')).strip().lower() or 'dhcp'
+    count=len(p.get('vlans',[]) or [])
+    print(mode,count)
+except Exception:
+    print('dhcp',0)
+OFFLINEPROFILE
+)
+  fi
+  if [[ "$lan_mode" != "unused" && ( "$lan_mode" == "static" || "$lan_mode" == "none" || "$vlan_count" -gt 0 ) ]]; then
+    lan_required=1
+  fi
+
+  [[ "$(cat /sys/class/net/eth0/carrier 2>/dev/null || echo 0)" != "1" ]] && return 0
+  if (( lan_required )) && [[ "$(cat /sys/class/net/eth1/carrier 2>/dev/null || echo 0)" != "1" ]]; then
+    return 0
+  fi
+  return 1
 }
 prechange_integrity_verify() {
   if [[ ! -x "$INTEGRITY" || ! -s "$SECURITY_BASELINE" ]]; then
@@ -3105,14 +3453,36 @@ rollback_and_validate() {
   [[ $rc -ne 10 ]]
 }
 
+discard_failed_transaction() {
+  local tx="${1:-${CURRENT_TRANSACTION:-}}"
+  [[ -n "$tx" && -d "$tx" ]] || { CURRENT_TRANSACTION=""; return 0; }
+  rm -rf -- "$tx" || return 1
+  [[ "${CURRENT_TRANSACTION:-}" == "$tx" ]] && CURRENT_TRANSACTION=""
+  echo "Candidate transaction removed after confirmed rollback; Restore history still points to the previous successful configuration."
+}
+
 stage() {
   local src="$1" t r
   [[ -r "$src" ]] || { echo "Profile not readable."; return 1; }
   prechange_integrity_verify || return 1
-  backup
   t="$(mktemp)"
   r="$(mktemp)"
-  "$TOOL" render "$src" "$t" "$r" || { cat "$r" 2>/dev/null || true; rm -f "$t" "$r"; return 1; }
+
+  # Validate/render the candidate before creating transaction history or touching
+  # the committed profile. A rejected candidate must leave Restore history alone.
+  if ! "$TOOL" validate "$src" >/dev/null 2>&1; then
+    echo "PROFILE VALIDATION: FAIL - proposed network settings were rejected; current configuration and Restore history are unchanged."
+    rm -f "$t" "$r"
+    return 1
+  fi
+  if ! "$TOOL" render "$src" "$t" "$r"; then
+    cat "$r" 2>/dev/null || true
+    echo "PROFILE RENDER: FAIL - proposed network settings were rejected; no transaction was created."
+    rm -f "$t" "$r"
+    return 1
+  fi
+
+  backup || { rm -f "$t" "$r"; return 1; }
   mkdir -p /etc/solutionz-rmm
   cp -f "$src" "$PROFILE"
   cp -f "$t" "$NETPLAN"
@@ -3160,21 +3530,35 @@ apply() {
   prompt_yes_no a "Apply this network configuration now?"
   if [[ "$a" == "NO" ]]; then
     echo "Change cancelled; restoring the previously committed Netplan/profile."
-    restore_prev || true
+    if restore_prev; then
+      discard_failed_transaction || true
+      echo "Cancelled candidate discarded; Restore history is unchanged."
+    else
+      echo "ERROR - Unable to restore staged files after cancellation."
+      return 1
+    fi
     return 0
   fi
 
   if ! netplan generate; then
     echo "Netplan generation failed; rolling back."
-    rollback_and_validate || true
-    change FAIL "$type" NETPLAN_GENERATE_FAILED
+    if rollback_and_validate; then
+      change FAIL "$type" NETPLAN_GENERATE_FAILED_ROLLBACK_COMPLETED
+      discard_failed_transaction || echo "WARN - rollback succeeded but candidate transaction could not be removed."
+    else
+      change FAIL "$type" NETPLAN_GENERATE_FAILED_ROLLBACK_FAILED
+    fi
     return 1
   fi
 
   if ! netplan apply; then
     echo "Netplan apply failed; rolling back."
-    rollback_and_validate || true
-    change FAIL "$type" NETPLAN_APPLY_FAILED
+    if rollback_and_validate; then
+      change FAIL "$type" NETPLAN_APPLY_FAILED_ROLLBACK_COMPLETED
+      discard_failed_transaction || echo "WARN - rollback succeeded but candidate transaction could not be removed."
+    else
+      change FAIL "$type" NETPLAN_APPLY_FAILED_ROLLBACK_FAILED
+    fi
     return 1
   fi
 
@@ -3187,8 +3571,8 @@ apply() {
   set +e
   if usb_c_offline_staging; then
     offline_apply=1
-    echo "OFFLINE USB-C STAGING MODE: one or more Ethernet interfaces have no carrier."
-    echo "Carrier/DHCP/live-route checks for disconnected links are deferred; profile syntax, Netplan generation, route isolation, VLAN structure, and security controls still validate."
+    echo "OFFLINE USB-C STAGING MODE: a required Ethernet path has no carrier."
+    echo "Persistent configuration will be retained when local validation passes; physical/cloud checks remain PENDING."
     SOLUTIONZ_RMM_OFFLINE_STAGING=1 "$VALIDATOR"
   else
     "$VALIDATOR"
@@ -3202,6 +3586,7 @@ apply() {
     echo "Restoring the previous working Netplan/profile automatically..."
     if rollback_and_validate; then
       change FAIL "$type" CONFIGURATION_FAILED_ROLLBACK_COMPLETED
+      discard_failed_transaction || echo "WARN - rollback succeeded but candidate transaction could not be removed."
       echo "ROLLBACK COMPLETED AND LOCAL CONFIGURATION REVALIDATED."
     else
       change FAIL "$type" CONFIGURATION_FAILED_ROLLBACK_FAILED
@@ -3210,16 +3595,19 @@ apply() {
     return 1
   fi
 
-  if (( offline_apply == 1 )); then
+  if [[ $rc -eq 30 ]]; then
     echo
-    echo "OFFLINE USB-C NETWORK STAGING: ACCEPTED"
-    echo "The persistent Netplan/profile transaction is retained. Carrier, DHCP lease, live gateway, and cloud reachability checks will be completed when Ethernet connectivity is present."
+    echo "LOCAL NETWORK CONFIGURATION: PASS"
+    echo "PHYSICAL/CONNECTIVITY VALIDATION: PENDING"
+    echo "Configuration is saved for offline USB-C preload. No rollback is required."
+    echo "Connect the required Ethernet path(s) later and run validation again."
     if ! refresh_integrity_baseline; then
-      change FAIL "$type" OFFLINE_STAGING_SECURITY_BASELINE_REFRESH_FAILED_CONFIGURATION_RETAINED
+      change FAIL "$type" SECURITY_BASELINE_REFRESH_FAILED_CONFIGURATION_RETAINED
       echo "SECURITY BASELINE REFRESH: FAIL. Network configuration remains applied for recovery."
       return 1
     fi
-    change PASS "$type" OFFLINE_USB_STAGED_LIVE_VALIDATION_DEFERRED
+    PRODUCTION_VALIDATION_RESULT="NOT_RUN_CONNECTIVITY_PENDING"
+    change PASS "$type" CONFIGURATION_SAVED_CONNECTIVITY_PENDING
     return 0
   fi
 
@@ -3257,6 +3645,7 @@ apply() {
   fi
   return 0
 }
+
 
 modify() {
   local section="$1" mode="$2" addr="${3:-}" g="${4:-}" dns="${5:-}" tmp
@@ -3314,7 +3703,7 @@ wan_locked() {
 lan_locked() {
   guard_change lan || return 1
   local m a
-  read -r -p "LAN native mode [dhcp/static/none]: " m
+  read -r -p "LAN native mode [dhcp/static/none/unused]: " m
   m="${m:-dhcp}"
   if [[ "$m" == "static" ]]; then
     prompt_ipv4_cidr a "LAN IPv4/CIDR (no gateway)"
@@ -3322,7 +3711,7 @@ lan_locked() {
       echo "CONFIGURATION REJECTED: address/profile validation failed. Netplan was not applied."
       return 1
     fi
-  elif [[ "$m" == "dhcp" || "$m" == "none" ]]; then
+  elif [[ "$m" == "dhcp" || "$m" == "none" || "$m" == "unused" ]]; then
     if ! modify lan "$m"; then
       echo "CONFIGURATION REJECTED: profile validation failed. Netplan was not applied."
       return 1
@@ -3455,6 +3844,10 @@ nic_status_line() {
         match_text="LINK PRESENT"
       fi
       ;;
+    unused)
+      profile_text="EXPLICITLY UNUSED"
+      match_text="NO LAN LINK/IPv4 REQUIRED"
+      ;;
     invalid)
       profile_text="INVALID PROFILE"
       match_text="PROFILE REVIEW REQUIRED"
@@ -3533,9 +3926,24 @@ validate() {
 }
 
 validate_full() {
-  validate || true
+  local rc
+  set +e
+  validate
+  rc=$?
+  set -e
+  if [[ $rc -eq 30 ]]; then
+    echo
+    echo "FULL VALIDATION DEFERRED: network configuration is valid but required physical/connectivity checks are pending."
+    echo "No full production validation is run until the required Ethernet connectivity is available."
+    return 0
+  fi
+  if [[ $rc -eq 10 ]]; then
+    echo "LOCAL NETWORK CONFIGURATION VALIDATION: FAIL"
+    return 1
+  fi
   run_production_validation
   [[ -s "$SECURITY_RESULT" ]] && { echo; cat "$SECURITY_RESULT"; }
+  [[ $rc -eq 0 ]]
 }
 
 restore_locked() {
@@ -3545,7 +3953,7 @@ restore_locked() {
   tx="$(latest_transaction)"
   [[ -n "$tx" ]] || { echo "No prior network transaction is available to restore."; return 0; }
   echo "Previous network transaction: $(basename "$tx")"
-  cat "$tx/manifest"
+  [[ -f "$tx/metadata" ]] && cat "$tx/metadata"
   prompt_yes_no a "Restore this exact network transaction?"
   [[ "$a" == "YES" ]] || { echo "Restore cancelled."; return 0; }
 
@@ -3605,13 +4013,12 @@ restore_locked() {
 
   case "$rc" in
     0)
-      if grep -q '^connectivity_result=PENDING$' "$RESULT" 2>/dev/null; then
-        validation_state="PENDING"
-        echo "MANUAL RESTORE VALIDATION: PENDING - configuration is valid; carrier/connectivity checks are deferred for offline USB-C preload."
-      else
-        validation_state="PASS"
-        echo "MANUAL RESTORE VALIDATION: PASS"
-      fi
+      validation_state="PASS"
+      echo "MANUAL RESTORE VALIDATION: PASS"
+      ;;
+    30)
+      validation_state="PENDING"
+      echo "MANUAL RESTORE VALIDATION: PENDING - configuration is valid; carrier/connectivity checks are deferred for offline USB-C preload."
       ;;
     10)
       validation_state="CONFIGURATION_FAIL"
@@ -3752,12 +4159,28 @@ engineering_password_transition() {
   echo "The technician session will not inherit engineering privileges."
   echo
 
-  # Run su as the original technician rather than as root. This forces PAM to
-  # validate the engineering password locally and does not depend on SSH
-  # PasswordAuthentication being enabled.
+  # Run su as the original technician rather than as root so PAM validates the
+  # local engineering password. Do NOT use `su -` here: a login shell would
+  # source /etc/profile.d/solutionz-rmm-access.sh again, recursively enter the
+  # managed RMM menu, and can terminate the parent technician login when that
+  # nested profile-managed menu exits. Use a non-login Bash command instead and
+  # bind it explicitly to the current terminal. When the engineering child menu
+  # returns, control resumes in this technician menu.
+  local transition_rc=0
+  set +e
   runuser -u "${invoking_user}" -- \
-    /bin/su - "${ENGINEERING_USER}" -c \
-    "sudo -n ${LOCAL_CONFIG_TOOL} ${direct_arg}" || true
+    /bin/su "${ENGINEERING_USER}" -s /bin/bash -c \
+    "exec sudo -n ${LOCAL_CONFIG_TOOL} ${direct_arg}" \
+    </dev/tty >/dev/tty 2>&1
+  transition_rc=$?
+  set -e
+
+  if (( transition_rc != 0 )); then
+    echo
+    echo "Engineering authentication/transition did not complete (exit ${transition_rc})."
+    echo "Returning to the technician RMM menu; the login session remains open."
+  fi
+  return 0
 }
 
 engineering_tools_entry() {
@@ -3983,16 +4406,17 @@ while true; do
 
 Solutionz RMM Dual-Homed Network Configuration - Revision V06.100626N
 1) Configure WAN / eth0 (DHCP or static; default route/DNS)
-2) Configure LAN / eth1 native network (DHCP, static, or unnumbered trunk)
+2) Configure LAN / eth1 native network (DHCP, static, unnumbered trunk, or explicitly unused)
 3) Guided WAN + LAN + 802.1Q VLAN configuration (VLANs on eth1)
-4) Show live + persistent network status
-5) Refresh detected live network information
-6) Run automatic network + security validation
-7) Restore previous network configuration
-8) Engineering Login / Password Setup
-9) Engineering Tools / Setup Script (engineering authentication required)
-10) Register NEW Domotz Collector Now (technician or engineering)
-11) Log out
+4) Apply saved WAN/LAN/VLAN JSON profile
+5) Show live + persistent network status
+6) Refresh detected live network information
+7) Run automatic network + security validation
+8) Restore previous network configuration
+9) Engineering Login / Password Setup
+10) Engineering Tools / Setup Script (engineering authentication required)
+11) Register NEW Domotz Collector Now (technician or engineering)
+12) Log out
 
 eth0 = WAN/cloud | eth1 = AV/control LAN | VLANs on eth1 | forwarding disabled
 Address entry = IPv4 only in this revision | exactly 4 octets (0-255) | static CIDR /1-/30 | IPv6 rejected
@@ -4014,14 +4438,15 @@ MENU
     1) wan ;;
     2) lan ;;
     3) wizard ;;
-    4) show ;;
-    5) show_live ;;
-    6) validate_full || true ;;
-    7) restore ;;
-    8) engineering_access ;;
-    9) engineering_tools_entry ;;
-    10) domotz_register_new_now || true ;;
-    11) if (( AUTO )); then exit 90; else exit 0; fi ;;
+    4) saved ;;
+    5) show ;;
+    6) show_live ;;
+    7) validate_full || true ;;
+    8) restore ;;
+    9) engineering_access ;;
+    10) engineering_tools_entry ;;
+    11) domotz_register_new_now || true ;;
+    12) if (( AUTO )); then exit 90; else exit 0; fi ;;
     *) echo "Invalid selection." ;;
   esac
 done
@@ -4274,6 +4699,17 @@ m="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
 
 if [[ -x "$PT" && -s "$PF" ]] && "$PT" validate "$PF" >/dev/null 2>&1; then
   pass "WAN/LAN/VLAN profile valid."
+  phase2_lan_mode="$(python3 - "$PF" <<'PHASE2LAN'
+import json,sys
+try:
+    print(json.load(open(sys.argv[1],encoding='utf-8')).get("lan",{}).get("mode",""))
+except Exception:
+    print("")
+PHASE2LAN
+)"
+  if [[ "$phase2_lan_mode" == "unused" ]]; then
+    pass "LAN eth1 is explicitly unused by profile; Phase 2 does not require eth1 carrier/addressing."
+  fi
 else
   fail "Network profile invalid or missing."
 fi
@@ -4298,6 +4734,8 @@ if [[ -x "$NV" ]]; then
     pass "Automatic WAN/LAN/VLAN network validation passed."
   elif [[ $rc -eq 10 ]]; then
     fail "Local WAN/LAN/VLAN configuration validation failed; see $NVR."
+  elif [[ $rc -eq 30 ]]; then
+    fail "WAN/LAN physical connectivity is pending; Phase 2 requires connected validation for every required interface. See $NVR."
   else
     fail "WAN connectivity validation failed; see $NVR."
   fi
@@ -5445,229 +5883,6 @@ final_summary_check() {
   check_final_requirement "Technician access profile launches restricted-login mode" grep -q -- '--restricted-login' "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Engineering access profile launches engineering-login mode" grep -q -- '--engineering-login' "${ACCESS_PROFILE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Network menu provides authenticated engineering-tools transition" grep -q -- '--engineering-tools' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Network menu displays live eth0/eth1 IP and cabling banner" grep -q 'LIVE NIC / CABLING STATUS' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Solutionz registration policy forces network scanning enabled" grep -q 'deny = False' "${DOMOTZ_ACTIVATION_HELPER}" || failures=$((failures + 1))
-  check_final_requirement "Network menu provides technician-accessible NEW Domotz registration" grep -q 'Register NEW Domotz Collector Now (technician or engineering)' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Network menu provides engineering-only NEW Domotz registration" grep -q -- '--register-new-domotz' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "SSH field-tech policy excludes engineering group" grep -q '^Match Group solutionz-rmm-tech,!solutionz-rmm-engineering$' "${SSH_HARDENING_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Local config sudoers policy installed" test -s "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Local config sudoers policy valid" visudo -cf "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Engineering password provisioning helper installed" test -x "${ENGINEERING_PASSWORD_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Engineering password provisioning sudoers policy valid" visudo -cf "${ENGINEERING_PASSWORD_SUDOERS_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Protectli V1210 hardware" bash -c 'vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null); model=$(cat /sys/class/dmi/id/product_name 2>/dev/null); [[ "${vendor,,}" == *protectli* && "$model" == "V1210" ]]' || failures=$((failures + 1))
-  check_final_requirement "SSH active" systemctl is-active --quiet ssh || failures=$((failures + 1))
-  check_final_requirement "UFW active" bash -c "ufw status | grep -q 'Status: active'" || failures=$((failures + 1))
-  check_final_requirement "UFW globally permits TCP 22" bash -c "ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW'" || failures=$((failures + 1))
-  check_final_requirement "UFW globally permits TCP 3000" bash -c "ufw status | grep -Eq '^3000/tcp[[:space:]]+ALLOW'" || failures=$((failures + 1))
-  check_final_requirement "UFW denies routed/forwarded traffic by default" grep -Eq '^DEFAULT_FORWARD_POLICY="?DROP"?$' /etc/default/ufw || failures=$((failures + 1))
-  check_final_requirement "UFW persists martian logging for all interfaces" grep -Eq '^[[:space:]]*net[./]ipv4[./]conf[./]all[./]log_martians[[:space:]]*=[[:space:]]*1[[:space:]]*$' "${UFW_SYSCTL_FILE}" || failures=$((failures + 1))
-  check_final_requirement "UFW persists default martian logging" grep -Eq '^[[:space:]]*net[./]ipv4[./]conf[./]default[./]log_martians[[:space:]]*=[[:space:]]*1[[:space:]]*$' "${UFW_SYSCTL_FILE}" || failures=$((failures + 1))
-  check_final_requirement "SSH hardening policy installed" test -s "${SSH_HARDENING_FILE}" || failures=$((failures + 1))
-  check_final_requirement "SSH configuration valid" sshd -t || failures=$((failures + 1))
-  check_final_requirement "SSH root login disabled" bash -c "sshd -T | grep -q '^permitrootlogin no$'" || failures=$((failures + 1))
-  check_final_requirement "Restricted field-tech group exists" getent group "${FIELD_TECH_GROUP}" || failures=$((failures + 1))
-  check_final_requirement "Engineering group exists" getent group "${ENGINEERING_GROUP}" || failures=$((failures + 1))
-  check_final_requirement "Default engineering account exists" id "${ENGINEERING_USER}" || failures=$((failures + 1))
-  if id "${ENGINEERING_USER}" >/dev/null 2>&1; then
-    check_final_requirement "Default engineering account is in engineering group" bash -c "id -nG '${ENGINEERING_USER}' | tr ' ' '\\n' | grep -qx '${ENGINEERING_GROUP}'" || failures=$((failures + 1))
-    check_final_requirement "Default engineering account has sudo membership" bash -c "id -nG '${ENGINEERING_USER}' | tr ' ' '\\n' | grep -qx sudo" || failures=$((failures + 1))
-    check_final_requirement "Default engineering account is not in field-tech group" bash -c "! id -nG '${ENGINEERING_USER}' | tr ' ' '\\n' | grep -qx '${FIELD_TECH_GROUP}'" || failures=$((failures + 1))
-    check_final_requirement "Default engineering account uses Bash shell" bash -c '[[ "$(getent passwd "$1" | cut -d: -f7)" == /bin/bash ]]' _ "${ENGINEERING_USER}" || failures=$((failures + 1))
-    check_final_requirement "Default engineering account has authorized SSH key" bash -c 'home="$(getent passwd "$1" | cut -d: -f6)"; [[ -n "$home" && -s "$home/.ssh/authorized_keys" ]]' _ "${ENGINEERING_USER}" || failures=$((failures + 1))
-    check_final_requirement "Engineering SSH key fingerprint record present" test -s "${ENGINEERING_SSH_FINGERPRINT_FILE}" || failures=$((failures + 1))
-    check_final_requirement "Engineering SSH public-key authentication enabled" bash -c "sshd -T | grep -q '^pubkeyauthentication yes$'" || failures=$((failures + 1))
-  fi
-  if id "${TECHNICIAN_USER}" >/dev/null 2>&1; then
-    check_final_requirement "Default technician account is in field-tech group" bash -c "id -nG '${TECHNICIAN_USER}' | tr ' ' '\\n' | grep -qx '${FIELD_TECH_GROUP}'" || failures=$((failures + 1))
-    check_final_requirement "Default technician account does not have engineering shell bypass" bash -c "! id -nG '${TECHNICIAN_USER}' | tr ' ' '\\n' | grep -qx '${ENGINEERING_GROUP}'" || failures=$((failures + 1))
-    check_final_requirement "Default technician account has no unrestricted sudo membership" bash -c "! id -nG '${TECHNICIAN_USER}' | tr ' ' '\\n' | grep -qx sudo" || failures=$((failures + 1))
-  else
-    warning_message "Default technician account ${TECHNICIAN_USER} does not exist; group-based policy remains installed for later technician accounts."
-  fi
-  check_final_requirement "Field network menu has no unrestricted Linux shell option" bash -c "! grep -q 'Open Linux shell' '${LOCAL_CONFIG_TOOL}'" || failures=$((failures + 1))
-  check_final_requirement "auditd active" systemctl is-active --quiet auditd || failures=$((failures + 1))
-  check_final_requirement "Solutionz audit rules installed" test -s "${AUDIT_RULES_FILE}" || failures=$((failures + 1))
-  check_final_requirement "AppArmor active" systemctl is-active --quiet apparmor || failures=$((failures + 1))
-  check_final_requirement "Controlled security-update policy installed" test -s "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Automatic security reboot disabled" grep -q 'Automatic-Reboot "false"' "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Unattended package installation disabled" grep -q 'APT::Periodic::Unattended-Upgrade "0"' "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Security integrity baseline exists" test -s "${SECURITY_BASELINE_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Security integrity baseline validates" "${INTEGRITY_TOOL}" --verify || failures=$((failures + 1))
-check_final_requirement "Solutionz security validator installed" test -x "${SECURITY_VALIDATOR}" || failures=$((failures + 1))
-  check_final_requirement "Solutionz security validation passes" "${SECURITY_VALIDATOR}" || failures=$((failures + 1))
-  check_final_requirement "DNS resolves api.snapcraft.io to IPv4" dns_resolves_ipv4 api.snapcraft.io || failures=$((failures + 1))
-  check_final_requirement "DNS resolves archive.ubuntu.com to IPv4" dns_resolves_ipv4 archive.ubuntu.com || failures=$((failures + 1))
-  check_final_requirement "systemd-timesyncd enabled" systemctl is-enabled --quiet systemd-timesyncd.service || failures=$((failures + 1))
-  check_final_requirement "systemd-timesyncd active" systemctl is-active --quiet systemd-timesyncd.service || failures=$((failures + 1))
-  check_final_requirement "systemd-time-wait-sync enabled" systemctl is-enabled --quiet systemd-time-wait-sync.service || failures=$((failures + 1))
-  echo "INFO - Waiting up to 180 seconds for NTP synchronization before Phase 1 completion."
-  if ! check_final_requirement "NTP synchronization active" wait_for_ntp_sync 36 5; then
-    failures=$((failures + 1))
-    report_ntp_diagnostics
-  fi
-  check_final_requirement "Initial OS runtime baseline record exists" test -s "${OS_BASELINE_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Manufacturer system baseline record exists" test -s "${MANUFACTURER_BASELINE_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Manufacturer package inventory exists" test -s "${MANUFACTURER_PACKAGE_BASELINE_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Manufacturer required-package validation exists" test -s "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Manufacturer baseline checksum record exists" test -s "${MANUFACTURER_BASELINE_SHA256_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Manufacturer baseline integrity is valid" \
-    sha256sum -c "${MANUFACTURER_BASELINE_SHA256_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Manufacturer package validation has a recognized result" \
-    grep -Eq '^manufacturer_package_validation=(PASS|DEVIATION)$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" || failures=$((failures + 1))
-  if grep -q '^manufacturer_package_validation=DEVIATION$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" 2>/dev/null; then
-    warning_message "Manufacturer package baseline contained a recorded deviation. Final required-package state is validated separately and must pass."
-  fi
-  check_final_requirement "Final required-package baseline record exists" test -s "${BASELINE_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Network requirements record exists" test -s "${NETWORK_REQUIREMENTS_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Netplan generates successfully" netplan generate || failures=$((failures + 1))
-  check_final_requirement "Automatic Netplan/VLAN profile helper installed" test -x "${NETWORK_PROFILE_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Production network profile installed" test -s "${NETWORK_PROFILE_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Production network profile validates" "${NETWORK_PROFILE_TOOL}" validate "${NETWORK_PROFILE_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Production network profile render result exists" test -s "${NETWORK_PROFILE_RESULT_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Production network profile render result is PASS" grep -q '^result=PASS$' "${NETWORK_PROFILE_RESULT_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Automatic dual-homed network validator installed" test -x "${NETWORK_VALIDATOR}" || failures=$((failures + 1))
-  check_final_requirement "Network configuration locking available" command -v flock || failures=$((failures + 1))
-  check_final_requirement "Network transaction root exists" test -d "${NETWORK_TRANSACTION_ROOT}" || failures=$((failures + 1))
-  check_final_requirement "Persistent IPv4 forwarding disable policy installed" grep -Eq '^net\.ipv4\.ip_forward=0$' "${IP_FORWARD_SYSCTL_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Current IPv4 forwarding is disabled" bash -c '[[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "0" ]]' || failures=$((failures + 1))
-  check_final_requirement "Installed Setup copy does not retain embedded Domotz activation key" grep -q '^DOMOTZ_COLLECTOR_ACTIVATION_KEY_DEFAULT=""$' "${INSTALLED_SCRIPT_COPY}" || failures=$((failures + 1))
-
-  check_final_requirement "Domotz provisioning credential lifecycle is valid" \
-    validate_domotz_provisioning_lifecycle || failures=$((failures + 1))
-  check_final_requirement "Integrated Domotz activation helper installed" test -x "${DOMOTZ_ACTIVATION_HELPER}" || failures=$((failures + 1))
-  check_final_requirement "Domotz activation service unit installed" test -s "${DOMOTZ_ACTIVATION_SERVICE}" || failures=$((failures + 1))
-  check_final_requirement "Domotz activation timer unit installed" test -s "${DOMOTZ_ACTIVATION_TIMER}" || failures=$((failures + 1))
-  check_final_requirement "Domotz activation helper syntax valid" python3 -m py_compile "${DOMOTZ_ACTIVATION_HELPER}" || failures=$((failures + 1))
-  check_final_requirement "Domotz activation systemd units valid" systemd-analyze verify "${DOMOTZ_ACTIVATION_SERVICE}" "${DOMOTZ_ACTIVATION_TIMER}" || failures=$((failures + 1))
-  check_final_requirement "Unified setup command installed" test -x "${SETUP_COMMAND}" || failures=$((failures + 1))
-  check_final_requirement "Domotz installed" snap list "${DOMOTZ_SNAP_NAME}" || failures=$((failures + 1))
-  check_final_requirement "Post-reboot production validator installed" test -x "${POSTREBOOT_VALIDATOR}" || failures=$((failures + 1))
-
-  local permission
-  for permission in "${REQUIRED_DOMOTZ_PERMISSIONS[@]}"; do
-    if snap connections "${DOMOTZ_SNAP_NAME}" | awk -v p="${permission}" '
-      $1 == p && $3 != "-" {found=1}
-      END {exit found ? 0 : 1}
-    '; then
-      printf '%sPASS - Domotz permission %s connected%s\n' "${COLOR_GREEN}" "${permission}" "${COLOR_RESET}"
-    else
-      printf '%sFAIL - Domotz permission %s not connected%s\n' "${COLOR_RED}" "${permission}" "${COLOR_RESET}"
-      PRE_REBOOT_FAILED_CHECKS+=("Domotz permission ${permission} not connected")
-      failures=$((failures + 1))
-    fi
-  done
-
-  progress_message "Domotz is intentionally not revision-pinned; installed revision is recorded for audit."
-
-  echo "------------------------------------------------------------"
-  echo "Pre-reboot mandatory failures: ${failures}"
-  echo "Validation result: ${PREREBOOT_RESULT_FILE}"
-  echo "============================================================"
-
-  write_prereboot_result "${failures}"
-  (( failures == 0 ))
-}
-
-main() {
-  parse_args "$@"
-  require_root
-  init_logging
-
-  case "${RUN_MODE}" in
-    activation_status)
-      activation_status
-      return 0
-      ;;
-    prepare_deployment)
-      prepare_deployment
-      return 0
-      ;;
-  esac
-
-  printf '\n%sSolutionz RMM Agent Installation%s\n' "${COLOR_CYAN}" "${COLOR_RESET}"
-  info_message "Revision ${REVISION} | Release ${RELEASE_DATE}"
-  info_message "Command output is displayed on the console and recorded in ${LOG_FILE}."
-
-  prompt_confirmation
-
-  backup_previous_state
-  write_state "phase1_in_progress"
-  record_network_requirements
-
-  preflight_checks
-  capture_manufacturer_baseline
-  install_required_packages
-  verify_required_packages
-  verify_ssh_service
-  configure_time_sync
-  configure_tun
-  ensure_snapd
-  install_domotz
-  configure_domotz_permissions
-  configure_ufw
-  configure_security_hardening
-  stage_network_config
-  repair_resolv_conf
-  normalize_host_entries
-  configure_grub_and_serial
-  install_local_serial_config_tool
-  update_banner
-  install_postreboot_validation
-  install_domotz_activation
-
-  if ! final_summary_check; then
-    error_exit "Mandatory pre-reboot validation failed. Review ${PREREBOOT_RESULT_FILE} for failed check names."
-  fi
-
-  write_state "phase1_complete" \
-    "reboot_required=1" \
-    "prereboot_result=${PREREBOOT_RESULT_FILE}" \
-    "postreboot_validator=${POSTREBOOT_VALIDATOR}" \
-    "postreboot_result=${POSTREBOOT_RESULT_FILE}" \
-    "network_profile=${NETWORK_PROFILE_FILE}" \
-    "network_profile_result=${NETWORK_PROFILE_RESULT_FILE}" \
-    "network_validation_result=${NETWORK_VALIDATION_RESULT_FILE}" \
-    "network_live_discovery_result=${LIVE_DISCOVERY_RESULT_FILE}" \
-    "security_validation_result=${SECURITY_VALIDATION_RESULT_FILE}" \
-    "security_baseline=${SECURITY_BASELINE_FILE}" \
-    "domotz_activation_helper=${DOMOTZ_ACTIVATION_HELPER}" \
-    "domotz_activation_config=${DOMOTZ_ACTIVATION_CONFIG}" \
-    "engineering_login=${ENGINEERING_USER}" \
-    "engineering_ssh_key_fingerprint=$(awk -F= '$1=="fingerprint" {print $2}' "${ENGINEERING_SSH_FINGERPRINT_FILE}" 2>/dev/null | head -n1)" \
-    "engineering_password_status=configured" \
-    "engineering_password_provisioning=default_hash_or_authenticated_engineering_change" \
-    "setup_command=${SETUP_COMMAND}" \
-    "log=${LOG_FILE}"
-
-  completion_message
-  progress_message "Phase 1 completed successfully."
-  progress_message "Completion Time: $(date -u +%FT%TZ)"
-  progress_message "Hostname: $(hostname)"
-  progress_message "Script Revision: ${REVISION}"
-  progress_message "Default technician login: ${TECHNICIAN_USER} (restricted configuration menu)."
-  progress_message "Default engineering login: ${ENGINEERING_USER} (engineering shell + sudo)."
-  if [[ -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
-    progress_message "Engineering password status: configured; default provisioned on fresh builds or existing credential preserved on rerun."
-  else
-    warning_message "Engineering password marker is missing; review account provisioning before deployment."
-  fi
-  progress_message "Network mode after reboot is generated from ${NETWORK_PROFILE_FILE}. Existing valid customer profiles are preserved on rerun; the default eth0 DHCP + optional eth1 DHCP profile is created only when no profile exists."
-  progress_message "eth0 is WAN/cloud and owns the only default route. eth1 is optional AV/control LAN unless a static LAN or VLAN profile requires it; 802.1Q VLANs, when used, are linked to eth1."
-  progress_message "Automatic network validation tool: ${NETWORK_VALIDATOR}"
-  progress_message "Automatic security validation tool: ${SECURITY_VALIDATOR}"
-  progress_message "Security integrity baseline: ${SECURITY_BASELINE_FILE}"
-  progress_message "State File: ${STATE_FILE}"
-  progress_message "Log File: ${LOG_FILE}"
-  warning_message "Manual reboot is required. Post-reboot validation will run automatically after restart."
-  info_message "After Phase 2 reaches phase2_system_validated, engineering may log in as ${ENGINEERING_USER} with the Solutionz engineering SSH private key; the approved default local password is already provisioned on fresh builds. Option 9 remains available for Engineering to change the password."
-  info_message "Technician account ${TECHNICIAN_USER} cannot create or change the ${ENGINEERING_USER} password and remains restricted to the technician menu."
-  info_message "Deployment preparation requires a configured engineering password marker; fresh builds receive the approved default automatically."
-  info_message "That same Setup source securely stages and arms automatic Domotz registration for the next boot, then powers the appliance off by default."
-  info_message "Interactive access: ${FIELD_TECH_GROUP} and ${ENGINEERING_GROUP} members both enter the Solutionz RMM configuration menu. Only an authenticated ${ENGINEERING_USER} session can create/change the engineering password or open the unrestricted engineering shell."
-  info_message "USB-C COM recovery/configuration remains available at 115200 8N1."
-  info_message "After every network change the script validates WAN eth0, LAN eth1/VLANs, default-route ownership, DNS/Domotz reachability, IPv4 forwarding, firewall/SSH hardening, audit state, and file integrity."
-  info_message "Automated VLAN deployment: use --network-profile <json> or network-menu option 3 onsite; VLANs are created on eth1."
-  info_message "Domotz is not revision-pinned; the installed revision is recorded in ${SNAP_BASELINE_FILE}."
-}
-
-main "$@"
+  check_final_requirement "Network menu restores saved JSON profile as option 4" grep -q '^4) Apply saved WAN/LAN/VLAN JSON profile$' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Network menu exposes explicit unused LAN mode" grep -q 'dhcp/static/none/unused' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Network menu restores Engineering Login / Password Setup as option 9" grep -q '^9) Engineering

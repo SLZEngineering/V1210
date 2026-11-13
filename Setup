@@ -2797,13 +2797,29 @@ create_setup_network_transaction() {
     echo "setup_context=${SETUP_CONTEXT}"
   } > "${txdir}/metadata"
 
-  (
-    cd "${txdir}"
-    : > manifest.sha256
-    [[ -f netplan.yaml ]] && sha256sum netplan.yaml >> manifest.sha256
-    [[ -f profile.json ]] && sha256sum profile.json >> manifest.sha256
-  )
+  if ! (
+    cd "${txdir}" || exit 1
+    : > manifest.sha256 || exit 1
+    sha256sum metadata >> manifest.sha256 || exit 1
+    if [[ -f netplan.yaml ]]; then
+      sha256sum netplan.yaml >> manifest.sha256 || exit 1
+    else
+      sha256sum netplan.absent >> manifest.sha256 || exit 1
+    fi
+    if [[ -f profile.json ]]; then
+      sha256sum profile.json >> manifest.sha256 || exit 1
+    else
+      sha256sum profile.absent >> manifest.sha256 || exit 1
+    fi
+  ); then
+    rm -rf "${txdir}"
+    error_exit "Unable to create the pre-Setup network transaction integrity manifest."
+  fi
   chmod 600 "${txdir}"/* 2>/dev/null || true
+  if ! verify_setup_network_transaction "${txdir}"; then
+    rm -rf "${txdir}"
+    error_exit "Pre-Setup network transaction failed integrity validation immediately after creation."
+  fi
   SETUP_NETWORK_TRANSACTION="${txdir}"
   progress_message "Saved pre-Setup network state in engineering transaction ${txid}."
 }
@@ -3232,13 +3248,31 @@ create_transaction() {
     echo "netplan_sha256=$PRE_NETPLAN_SHA256"
     echo "profile_sha256=$PRE_PROFILE_SHA256"
   } > "$tx/metadata"
-  (
-    cd "$tx"
-    : > manifest.sha256
-    [[ -f netplan.yaml ]] && sha256sum netplan.yaml >> manifest.sha256
-    [[ -f profile.json ]] && sha256sum profile.json >> manifest.sha256
-  )
+  if ! (
+    cd "$tx" || exit 1
+    : > manifest.sha256 || exit 1
+    sha256sum metadata >> manifest.sha256 || exit 1
+    if [[ -f netplan.yaml ]]; then
+      sha256sum netplan.yaml >> manifest.sha256 || exit 1
+    else
+      sha256sum netplan.absent >> manifest.sha256 || exit 1
+    fi
+    if [[ -f profile.json ]]; then
+      sha256sum profile.json >> manifest.sha256 || exit 1
+    else
+      sha256sum profile.absent >> manifest.sha256 || exit 1
+    fi
+  ); then
+    rm -rf "$tx"
+    echo "Unable to create network transaction integrity manifest." >&2
+    return 1
+  fi
   chmod 600 "$tx"/* 2>/dev/null || true
+  if ! verify_transaction "$tx"; then
+    rm -rf "$tx"
+    echo "Network transaction failed integrity validation immediately after creation." >&2
+    return 1
+  fi
   CURRENT_TRANSACTION="$tx"
   echo "Network transaction captured: $id"
 }

@@ -3163,6 +3163,8 @@ AUTO=0
 SESSION_MODE="manual"
 ENGINEERING_TOOLS_DIRECT=0
 REGISTER_NEW_DOMOTZ_DIRECT=0
+# Evaluate the original authenticated account; never trust the menu mode alone.
+CALLER_USER="${SUDO_USER:-}"
 PRODUCTION_VALIDATION_RESULT="NOT_RUN"
 PRE_NETPLAN_SHA256=""
 PRE_PROFILE_SHA256=""
@@ -3201,6 +3203,34 @@ esac
 [[ $# -le 1 ]] || { echo "Usage: $(basename "$0") [--restricted-login|--engineering-login|--engineering-tools|--register-new-domotz]"; exit 2; }
 [[ $EUID -eq 0 ]] || { echo "Run with sudo."; exit 1; }
 
+# Direct modes are privileged entry points, not labels that confer authorization.
+# Use the authenticated sudo origin, and reject roots/unknown caller identities.
+case "${1:-}" in
+  --engineering-login|--engineering-tools)
+    if [[ "${CALLER_USER}" != "${ENGINEERING_USER}" ]] ||
+       ! id -nG "${ENGINEERING_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx "${ENGINEERING_GROUP}"; then
+      echo "ERROR: Engineering mode requires authenticated ${ENGINEERING_USER}." >&2
+      exit 81
+    fi
+    ;;
+  --register-new-domotz)
+    if [[ -z "${CALLER_USER}" ]] ||
+       ! id -nG "${CALLER_USER}" 2>/dev/null | tr ' ' '\n' | grep -Eqx 'solutionz-rmm-tech|solutionz-rmm-engineering'; then
+      echo "ERROR: direct registration requires an authenticated field technician or engineer." >&2
+      exit 81
+    fi
+    if [[ "${CALLER_USER}" == "${ENGINEERING_USER}" ]]; then
+      SESSION_MODE="engineering"
+    fi
+    ;;
+  --restricted-login|--serial-auto)
+    if [[ -z "${CALLER_USER}" ]] ||
+       ! id -nG "${CALLER_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx 'solutionz-rmm-tech'; then
+      echo "ERROR: restricted login requires an authenticated field technician." >&2
+      exit 81
+    fi
+    ;;
+esac
 
 sha_file() { [[ -f "$1" ]] && sha256sum "$1" | awk '{print $1}' || true; }
 
@@ -4164,8 +4194,8 @@ SETUPMENU
 }
 
 engineering_password_transition() {
-  local direct_mode="$1"
-  local invoking_user="${SUDO_USER:-}"
+  local direct_mode="${1:-tools}"
+  local invoking_user="${CALLER_USER}"
   local direct_arg="" eng_home transition_rc=0
 
   case "${direct_mode}" in
@@ -4175,60 +4205,60 @@ engineering_password_transition() {
     *) echo "ERROR: invalid engineering transition mode." >&2; return 2 ;;
   esac
 
+  # An authorized technician must explicitly authenticate as solz_eng. Never
+  # allow root's implicit su privileges to bypass the local engineering password.
+  if [[ -z "${invoking_user}" || "${invoking_user}" == "root" || "${invoking_user}" == "${ENGINEERING_USER}" ]] ||
+     ! id -nG "${invoking_user}" 2>/dev/null | tr ' ' '\n' | grep -qx 'solutionz-rmm-tech'; then
+    echo "ERROR: engineering transition requires an authenticated technician session." >&2
+    return 81
+  fi
+
   if [[ ! -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
-    echo "Engineering password has not been provisioned yet."
-    echo "Log in directly as ${ENGINEERING_USER} using the approved engineering credential."
-    return 1
-  fi
-
-  if [[ -z "${invoking_user}" || "${invoking_user}" == "root" ]]; then
-    echo "ERROR: unable to identify the restricted technician invoking this transition." >&2
-    echo "Log in directly as ${ENGINEERING_USER} for unrestricted engineering shell access." >&2
-    return 1
-  fi
-
-  if ! id -nG "${invoking_user}" 2>/dev/null | tr ' ' '\n' | grep -qx "${FIELD_TECH_GROUP}"; then
-    echo "ERROR: local engineering transition is permitted only from an authenticated technician session." >&2
+    echo "Engineering password is not provisioned. Authenticate directly as solz_eng using the engineering SSH key."
+    echo "From that engineering shell, run: sudo ${LOCAL_CONFIG_TOOL} --engineering-tools"
     return 1
   fi
 
   eng_home="$(getent passwd "${ENGINEERING_USER}" | awk -F: '{print $6}')"
   [[ -n "${eng_home}" ]] || eng_home="/home/${ENGINEERING_USER}"
+  echo "Authenticate as ${ENGINEERING_USER}. The technician session retains no engineering privileges."
 
-  echo
-  echo "Authenticate as ${ENGINEERING_USER}."
-  echo "The technician session will not inherit engineering privileges."
-  echo
-
-  # PAM authentication must occur as the original technician, not as root.
-  # Do not use `su -`: a login shell can source profile policy again. The shell
-  # transition uses an explicit --noprofile/--norc Bash session; the tools path
-  # uses solz_eng's NOPASSWD sudo permission only after PAM authentication.
-  set +e
-  if [[ "${direct_mode}" == "shell" ]]; then
-    runuser -u "${invoking_user}" -- \
-      /bin/su -s /bin/bash "${ENGINEERING_USER}" -c \
-      "exec env HOME='${eng_home}' USER='${ENGINEERING_USER}' LOGNAME='${ENGINEERING_USER}' SHELL=/bin/bash PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -i" \
-      </dev/tty >/dev/tty 2>&1
-  else
-    runuser -u "${invoking_user}" -- \
-      /bin/su -s /bin/bash "${ENGINEERING_USER}" -c \
-      "exec sudo -n ${LOCAL_CONFIG_TOOL} ${direct_arg}" \
-      </dev/tty >/dev/tty 2>&1
+  # PAM must run as the original technician UID. Do not use a login-shell su,
+  # which sources /etc/profile.d and can recursively launch/close the menu.
+  # Preserving the TTY enables password entry over an interactive SSH/USB-C
+  # console. Retain the caller's menu after the child engineering process exits.
+  if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+    echo "ERROR: interactive terminal required for Engineering authentication." >&2
+    return 82
   fi
-  transition_rc=$?
-  set -e
+  if [[ "${direct_mode}" == "shell" ]]; then
+    if runuser -u "${invoking_user}" -- \
+        /bin/su -s /bin/bash "${ENGINEERING_USER}" -c \
+        "exec env HOME='${eng_home}' USER='${ENGINEERING_USER}' LOGNAME='${ENGINEERING_USER}' SHELL=/bin/bash PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -i" \
+        </dev/tty >/dev/tty 2>&1; then
+      transition_rc=0
+    else
+      transition_rc=$?
+    fi
+  else
+    if runuser -u "${invoking_user}" -- \
+        /bin/su -s /bin/bash "${ENGINEERING_USER}" -c \
+        "exec sudo -n '${LOCAL_CONFIG_TOOL}' '${direct_arg}'" \
+        </dev/tty >/dev/tty 2>&1; then
+      transition_rc=0
+    else
+      transition_rc=$?
+    fi
+  fi
 
-  echo
   if (( transition_rc != 0 )); then
-    echo "Engineering authentication/transition did not complete (exit ${transition_rc})."
+    echo "Engineering authentication/session failed (exit ${transition_rc}); no engineering access granted."
   else
     echo "Engineering session ended normally."
   fi
-  echo "Returning to the technician RMM menu; the technician login remains open."
-  return 0
+  echo "Returning to the technician RMM menu."
+  return "${transition_rc}"
 }
-
 open_engineering_shell() {
   local eng_home
   eng_home="$(getent passwd "${ENGINEERING_USER}" | awk -F: '{print $6}')"
@@ -4359,6 +4389,10 @@ engineering_register_entry() {
 }
 
 engineering_access() {
+  if ! engineering_session_authenticated; then
+    echo "ERROR: Engineering Session requires authenticated solz_eng." >&2
+    return 81
+  fi
   echo
   echo "============================================================"
   echo "ENGINEERING TOOLS / PASSWORD MANAGEMENT"
@@ -5960,7 +5994,9 @@ final_summary_check() {
   check_final_requirement "Network menu provides Engineering Shell Login as option 9" grep -q '^9) Engineering Shell Login (authenticate as solz_eng)$' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Network menu provides Engineering Tools / Setup Script as option 10" grep -q '^10) Engineering Tools / Setup Script (authenticate as solz_eng)$' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Network menu logout remains option 12" grep -q '^12) Log out$' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Engineering password transition avoids recursive login-shell profile" bash -c "! grep -Eq '/bin/su[[:space:]]+-[[:space:]]+.*solz_eng|/bin/su[[:space:]]+-[[:space:]]+\"\$\{ENGINEERING_USER\}\"' '${LOCAL_CONFIG_TOOL}'" || failures=$((failures + 1))
+  check_final_requirement "Engineering transition rejects login-shell su" bash -c "! grep -Eq '(^|[[:space:]])(/bin/)?su[[:space:]]+-([[:space:]]|$)' '${LOCAL_CONFIG_TOOL}'" || failures=$((failures + 1))
+  check_final_requirement "Engineering direct modes enforce authenticated caller" grep -q 'Engineering mode requires authenticated' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Engineering PAM handoff uses non-login Bash" grep -q '/bin/su -s /bin/bash' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Network menu displays live eth0/eth1 IP and cabling banner" grep -q 'LIVE NIC / CABLING STATUS' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Solutionz registration policy forces network scanning enabled" grep -q 'deny = False' "${DOMOTZ_ACTIVATION_HELPER}" || failures=$((failures + 1))
   check_final_requirement "Network menu provides technician-accessible NEW Domotz registration" grep -q 'Register NEW Domotz Collector Now (technician or engineering)' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))

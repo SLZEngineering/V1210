@@ -349,7 +349,7 @@ Options:
   --activation-status           Show build and Domotz activation/deployment status only.
   --prepare-deployment          Stage Domotz registration settings for on-site submission, then power off.
   --prepare-deployment --no-poweroff
-                                Arm the staged registration but keep the appliance powered on.
+                                Stage registration settings and keep the appliance powered on.
   -h, --help                    Show this help.
 
 Domotz update model:
@@ -1593,7 +1593,9 @@ configure_security_hardening() {
   install -d -m 750 /usr/local/share/solutionz-rmm
   if [[ -r "$0" ]]; then
     install -o root -g root -m 640 "$0" "${INSTALLED_SCRIPT_COPY}"
-    install -o root -g root -m 750 "$0" "${INSTALLED_SETUP_COMMAND}"
+    if [[ ! "$0" -ef "${INSTALLED_SETUP_COMMAND}" ]]; then
+      install -o root -g root -m 750 "$0" "${INSTALLED_SETUP_COMMAND}"
+    fi
   else
     warning_message "Unable to preserve/install the Setup script for engineering access and integrity validation."
   fi
@@ -3022,9 +3024,7 @@ backup_network_transaction_main() {
 
   (
     cd "${txdir}"
-    : > manifest.sha256
-    [[ -f netplan.yaml ]] && sha256sum netplan.yaml >> manifest.sha256
-    [[ -f profile.json ]] && sha256sum profile.json >> manifest.sha256
+    sha256sum netplan.* profile.* > manifest.sha256
   )
   chmod 600 "${txdir}"/* 2>/dev/null || true
   SETUP_NETWORK_TRANSACTION="${txdir}"

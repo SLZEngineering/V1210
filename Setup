@@ -75,7 +75,7 @@ set -Eeuo pipefail
 #   - Security hardening enforces UFW deny-incoming/deny-routed defaults while
 #     preserving Domotz-required inbound TCP 22 and TCP 3000; disables IP
 #     forwarding, redirects, source routing and proxy ARP; hardens SSH; enables
-#     auditd/AppArmor; restricts the field-tech path; and maintains a SHA-256
+#     auditd; restricts the field-tech path; and maintains a SHA-256
 #     integrity baseline that is revalidated around approved network changes.
 #   - Live network discovery reads the running kernel/network state before the
 #     technician is asked to configure anything. It reports MAC, carrier, link
@@ -89,7 +89,7 @@ set -Eeuo pipefail
 #     They remain Phase-2 controls requiring V1210/Domotz compatibility testing.
 #   - NTP synchronization is standardized on systemd-timesyncd. Phase 2 is not
 #     gated by time-sync.target; validators perform a bounded 180-second current-boot
-#     synchronization check so NTP failure is reported instead of blocking validation.
+#     synchronization check so NTP unavailability is reported as a warning instead of blocking validation.
 #   - Serial-console acceptance is based on ttyS0 presence, serial-getty systemd
 #     enabled/active state, and GRUB configuration; a transient agetty process
 #     match is diagnostic only and is not a production failure criterion.
@@ -276,7 +276,6 @@ REQUIRED_PACKAGES=(
   sudo
   python3
   auditd
-  apparmor
   unattended-upgrades
   util-linux
 )
@@ -506,7 +505,7 @@ Host security baseline
 - Dedicated solutionz-rmm-tech and solutionz-rmm-engineering groups separate controlled field configuration from engineering administration.
 - The field configuration menu does not expose an unrestricted Linux shell option.
 - auditd records changes to Solutionz-controlled network, SSH, firewall, sysctl, systemd, utility and state paths.
-- AppArmor remains enabled as an OS mandatory-access-control layer.
+- Native OS security services are left unchanged; custom AppArmor integration is deferred to V7.
 - A SHA-256 integrity baseline protects Solutionz scripts and security/network configuration files.
 - The security validator flags unexpected network-reachable TCP listeners beyond approved TCP 22/3000.
 - Security updates use a controlled maintenance policy: unattended installation and automatic reboot are disabled.
@@ -1437,7 +1436,6 @@ systemctl is-active --quiet auditd 2>/dev/null && pass "auditd active." || fail 
 if command -v auditctl >/dev/null 2>&1; then
   auditctl -l 2>/dev/null | grep -q 'solutionz_netplan' && pass "Solutionz audit rules loaded." || warn "Solutionz audit rules are not visible in auditctl output; verify after reboot."
 fi
-systemctl is-active --quiet apparmor 2>/dev/null && pass "AppArmor service active." || fail "AppArmor service inactive."
 [[ -s "$APT_POLICY" ]] && grep -q 'Automatic-Reboot "false"' "$APT_POLICY" && pass "Controlled security-update policy installed with automatic reboot disabled." || fail "Controlled security-update policy missing/invalid."
 grep -q 'APT::Periodic::Unattended-Upgrade "0"' "$APT_POLICY" 2>/dev/null && pass "Unattended package installation disabled; security updates require an approved maintenance action." || fail "Unattended package installation is not disabled by Solutionz policy."
 
@@ -1713,11 +1711,10 @@ EOF
   systemctl enable --now auditd >/dev/null 2>&1 || error_exit "Unable to enable/start auditd."
   augenrules --load >/dev/null 2>&1 || warning_message "auditd rules could not be reloaded immediately; they will be loaded at reboot."
 
-  systemctl enable --now apparmor >/dev/null 2>&1 || error_exit "Unable to enable/start AppArmor."
   install_security_integrity_tool
   install_security_validator
 
-  progress_message "Security hardening installed: forwarding/redirect/source-route protections, SSH hardening, auditd, AppArmor, integrity tooling, and security validation."
+  progress_message "Security hardening installed: forwarding/redirect/source-route protections, SSH hardening, auditd, integrity tooling, and security validation."
 }
 
 write_default_network_profile() {
@@ -2699,7 +2696,7 @@ configure_grub_and_serial() {
   cat > "${SERIAL_DROPIN_FILE}" <<'EOF'
 [Service]
 ExecStart=
-ExecStart=-/sbin/agetty -o '-p -- \u' --local-line=always --noclear ttyS0 115200 vt220
+ExecStart=-/sbin/agetty -o '-p -- \\u' --local-line=always --noclear ttyS0 115200 vt220
 EOF
 
   systemctl daemon-reload
@@ -4206,7 +4203,7 @@ except Exception: pass' 2>/dev/null || true)"
   fi
 fi
 systemctl is-active --quiet systemd-timesyncd.service && pass "systemd-timesyncd active." || fail "systemd-timesyncd inactive."
-waitntp && pass "NTP synchronized." || fail "NTP synchronization failed."
+waitntp && pass "NTP synchronized." || warn "NTP synchronization unavailable after bounded wait; review upstream NTP connectivity."
 [[ -c /dev/ttyS0 ]] && pass "ttyS0 present." || fail "ttyS0 missing."
 check "Serial service active" systemctl is-active --quiet "$SER"
 [[ -x "$CFG" && -s "$AP" ]] && grep -q 'solutionz-rmm-tech' "$AP" && grep -q 'solutionz-rmm-engineering' "$AP" && grep -q -- '--restricted-login' "$AP" && grep -q -- '--engineering-login' "$AP" && grep -q -- '--engineering-tools' "$CFG" && pass "Unified technician/engineering interactive menu policy installed, including engineering-tools transition." || fail "Unified interactive menu policy missing or engineering-tools transition unavailable."
@@ -5270,7 +5267,6 @@ final_summary_check() {
   check_final_requirement "Field network menu has no unrestricted Linux shell option" bash -c "! grep -q 'Open Linux shell' '${LOCAL_CONFIG_TOOL}'" || failures=$((failures + 1))
   check_final_requirement "auditd active" systemctl is-active --quiet auditd || failures=$((failures + 1))
   check_final_requirement "Solutionz audit rules installed" test -s "${AUDIT_RULES_FILE}" || failures=$((failures + 1))
-  check_final_requirement "AppArmor active" systemctl is-active --quiet apparmor || failures=$((failures + 1))
   check_final_requirement "Controlled security-update policy installed" test -s "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
   check_final_requirement "Automatic security reboot disabled" grep -q 'Automatic-Reboot "false"' "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
   check_final_requirement "Unattended package installation disabled" grep -q 'APT::Periodic::Unattended-Upgrade "0"' "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
@@ -5282,10 +5278,12 @@ check_final_requirement "Solutionz security validator installed" test -x "${SECU
   check_final_requirement "DNS resolves archive.ubuntu.com to IPv4" dns_resolves_ipv4 archive.ubuntu.com || failures=$((failures + 1))
   check_final_requirement "systemd-timesyncd enabled" systemctl is-enabled --quiet systemd-timesyncd.service || failures=$((failures + 1))
   check_final_requirement "systemd-timesyncd active" systemctl is-active --quiet systemd-timesyncd.service || failures=$((failures + 1))
-  check_final_requirement "systemd-time-wait-sync enabled" systemctl is-enabled --quiet systemd-time-wait-sync.service || failures=$((failures + 1))
+  echo "INFO - systemd-time-wait-sync is not a mandatory V6 prerequisite."
   echo "INFO - Waiting up to 180 seconds for NTP synchronization before Phase 1 completion."
-  if ! check_final_requirement "NTP synchronization active" wait_for_ntp_sync 36 5; then
-    failures=$((failures + 1))
+  if wait_for_ntp_sync 36 5; then
+    echo "PASS - NTP synchronization active"
+  else
+    warning_message "NTP synchronization unavailable after bounded wait; review upstream NTP connectivity."
     report_ntp_diagnostics
   fi
   check_final_requirement "Initial OS runtime baseline record exists" test -s "${OS_BASELINE_FILE}" || failures=$((failures + 1))

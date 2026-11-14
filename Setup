@@ -2696,7 +2696,7 @@ configure_grub_and_serial() {
   cat > "${SERIAL_DROPIN_FILE}" <<'EOF'
 [Service]
 ExecStart=
-ExecStart=-/sbin/agetty -o '-p -- \\u' --local-line=always --noclear ttyS0 115200 vt220
+ExecStart=-/sbin/agetty -o '-p -- \u' --local-line=always --noclear ttyS0 115200 vt220
 EOF
 
   systemctl daemon-reload

@@ -13,7 +13,6 @@ set -Eeuo pipefail
 # SOC 2 / AppArmor Least-Privilege Update: 2026-11-12
 # Mass-Production / Refurbishment Workflow Update: 2026-11-12
 # Attached Baseline Feature-Parity / Direct Engineering Shell Update: 2026-11-13
-# R4 Privilege-Cutover Safety Fix: 2026-11-13
 #
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
@@ -215,7 +214,7 @@ LOCAL_CONFIG_TOOL="/usr/local/sbin/solutionz-rmm-local-config"
 LOCAL_CONFIG_SUDOERS_FILE="/etc/sudoers.d/solutionz-rmm-local-config"
 ENGINEERING_SHELL_TOOL="/usr/local/sbin/solutionz-rmm-engineering-shell"
 ENGINEERING_PASSWORD_TOOL="/usr/local/sbin/solutionz-rmm-engineering-password"
-APPARMOR_POLICY_REVISION="AA-SOC2-V07111226-R4"
+APPARMOR_POLICY_REVISION="AA-SOC2-V07111226"
 APPARMOR_DIR="/etc/apparmor.d"
 APPARMOR_COMMON_ABSTRACTION="${APPARMOR_DIR}/abstractions/solutionz-rmm-common"
 APPARMOR_PROFILE_FILES=(
@@ -1325,7 +1324,6 @@ APT_POLICY="/etc/apt/apt.conf.d/52solutionz-rmm-security-updates"
 INTEGRITY="/usr/local/sbin/solutionz-rmm-integrity-baseline"
 BASELINE="/var/lib/rswsolutionz-rmm/security-baseline-SOC2-V07111226.sha256"
 TECH_GROUP="solutionz-rmm-tech"
-TECH_USER="solz_rmm"
 ENG_GROUP="solutionz-rmm-engineering"
 ENG_USER="solz_eng"
 ENG_KEYS="/home/solz_eng/.ssh/authorized_keys"
@@ -1336,7 +1334,7 @@ ACCESS_PROFILE="/etc/profile.d/solutionz-rmm-access.sh"
 LOCALCFG="/usr/local/sbin/solutionz-rmm-local-config"
 LIVE="/usr/local/sbin/solutionz-rmm-live-network-discovery"
 LIVE_RESULT="/var/lib/rswsolutionz-rmm/network-live-discovery-SOC2-V07111226.result"
-APPARMOR_POLICY_REVISION="AA-SOC2-V07111226-R4"
+APPARMOR_POLICY_REVISION="AA-SOC2-V07111226"
 APPARMOR_REQUIRED_PROFILES=(solutionz-rmm-setup solutionz-rmm-local-config solutionz-rmm-network-profile solutionz-rmm-network-validate solutionz-rmm-live-network-discovery solutionz-rmm-security-validate solutionz-rmm-integrity-baseline solutionz-rmm-postreboot-validate solutionz-domotz-activate solutionz-rmm-engineering-shell solutionz-rmm-engineering-password)
 APPARMOR_REQUIRED_FILES=(/etc/apparmor.d/abstractions/solutionz-rmm-common /etc/apparmor.d/solutionz-rmm-setup /etc/apparmor.d/solutionz-rmm-local-config /etc/apparmor.d/solutionz-rmm-network-profile /etc/apparmor.d/solutionz-rmm-network-validate /etc/apparmor.d/solutionz-rmm-live-network-discovery /etc/apparmor.d/solutionz-rmm-security-validate /etc/apparmor.d/solutionz-rmm-integrity-baseline /etc/apparmor.d/solutionz-rmm-postreboot-validate /etc/apparmor.d/solutionz-domotz-activate /etc/apparmor.d/solutionz-rmm-engineering-shell /etc/apparmor.d/solutionz-rmm-engineering-password)
 DOMOTZ_SNAP="domotzpro-agent-publicstore"
@@ -1407,36 +1405,6 @@ else
 fi
 getent group "$TECH_GROUP" >/dev/null 2>&1 && pass "Restricted field-tech group exists." || fail "Field-tech group missing."
 getent group "$ENG_GROUP" >/dev/null 2>&1 && pass "Engineering group exists." || fail "Engineering group missing."
-
-if id "$TECH_USER" >/dev/null 2>&1; then
-  pass "Technician account $TECH_USER exists."
-  tech_groups="$(id -nG "$TECH_USER" 2>/dev/null || true)"
-  tr ' ' '\n' <<<"$tech_groups" | grep -qx "$TECH_GROUP" &&     pass "Technician account is in $TECH_GROUP." || fail "Technician account is not in $TECH_GROUP."
-  if tr ' ' '\n' <<<"$tech_groups" | grep -qx sudo; then
-    fail "Technician account retains broad sudo group membership."
-  else
-    pass "Technician account is not in the sudo group."
-  fi
-  if tr ' ' '\n' <<<"$tech_groups" | grep -qx "$ENG_GROUP"; then
-    fail "Technician account is incorrectly in the Engineering group."
-  else
-    pass "Technician account is not in the Engineering group."
-  fi
-
-  tech_direct_grants="$(grep -RhsE "^[[:space:]]*${TECH_USER}[[:space:]]+" /etc/sudoers /etc/sudoers.d 2>/dev/null || true)"
-  [[ -z "$tech_direct_grants" ]] &&     pass "No direct sudoers grant exists for technician account." ||     fail "Direct sudoers grant detected for technician account: ${tech_direct_grants}"
-
-  tech_group_grants="$(grep -RhsE "^[[:space:]]*%${TECH_GROUP}[[:space:]]+" /etc/sudoers /etc/sudoers.d 2>/dev/null || true)"
-  expected_tech_grant="%${TECH_GROUP} ALL=(root) NOPASSWD: ${LOCALCFG}"
-  if [[ "$tech_group_grants" == "$expected_tech_grant" ]]; then
-    pass "Technician group sudo policy is limited to the controlled local-config menu."
-  else
-    fail "Technician group sudo policy is missing or broader than the controlled local-config menu: ${tech_group_grants:-none}"
-  fi
-else
-  fail "Technician account $TECH_USER missing."
-fi
-
 if id "$ENG_USER" >/dev/null 2>&1; then
   pass "Engineering account $ENG_USER exists."
   [[ "$(getent passwd "$ENG_USER" | cut -d: -f7)" == "/bin/bash" ]] && pass "Engineering account uses Bash shell." || fail "Engineering account does not use Bash shell."
@@ -1634,30 +1602,6 @@ PYFP
   progress_message "Engineering SSH key installed and verified: ${actual_fp}. Local console password is configured; SSH remains public-key only."
 }
 
-normalize_technician_privileges() {
-  # solz_rmm is a menu-only field identity. Preserve the account itself and
-  # its normal login path, but remove privilege paths that bypass the managed
-  # network/Domotz menu. The managed NOPASSWD grant is installed later for
-  # solutionz-rmm-local-config only.
-  if ! id "${TECHNICIAN_USER}" >/dev/null 2>&1; then
-    warning_message "Default technician account ${TECHNICIAN_USER} does not exist; technician privilege normalization skipped."
-    return 0
-  fi
-
-  usermod -aG "${FIELD_TECH_GROUP}" "${TECHNICIAN_USER}" ||     error_exit "Unable to add technician account ${TECHNICIAN_USER} to ${FIELD_TECH_GROUP}."
-
-  if id -nG "${TECHNICIAN_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx "${ENGINEERING_GROUP}"; then
-    gpasswd -d "${TECHNICIAN_USER}" "${ENGINEERING_GROUP}" >/dev/null 2>&1 ||       error_exit "Unable to remove technician account ${TECHNICIAN_USER} from ${ENGINEERING_GROUP}."
-  fi
-
-  if id -nG "${TECHNICIAN_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx sudo; then
-    gpasswd -d "${TECHNICIAN_USER}" sudo >/dev/null 2>&1 ||       error_exit "Unable to remove unrestricted sudo membership from technician account ${TECHNICIAN_USER}."
-    progress_message "Removed unrestricted sudo membership from technician account ${TECHNICIAN_USER}."
-  fi
-
-  progress_message "Technician account ${TECHNICIAN_USER} normalized for menu-only access through ${FIELD_TECH_GROUP}; Engineering and broad sudo access are not retained."
-}
-
 configure_security_hardening() {
   progress_message "Applying Solutionz host security hardening baseline."
 
@@ -1671,10 +1615,6 @@ configure_security_hardening() {
 
   groupadd -f "${FIELD_TECH_GROUP}"
   groupadd -f "${ENGINEERING_GROUP}"
-  # Establish and verify Engineering recovery access before changing the
-  # factory technician's legacy privilege state. The technician privilege
-  # cutover is intentionally deferred until the controlled menu, sudoers
-  # policy, post-reboot validator, and AppArmor profiles are installed.
   install_engineering_identity
 
   cat > "${SECURITY_SYSCTL_FILE}" <<'EOF'
@@ -1819,7 +1759,7 @@ ENGPASS
   chmod 750 "${ENGINEERING_PASSWORD_TOOL}"
 
   cat > "${APPARMOR_COMMON_ABSTRACTION}" <<'AACOMMON'
-# Policy revision: AA-SOC2-V07111226-R4
+# Policy revision: AA-SOC2-V07111226
 # Solutionz RMM common AppArmor abstraction
 #include <abstractions/base>
 #include <abstractions/nameservice>
@@ -1890,7 +1830,7 @@ AACOMMON
   chmod 644 "${APPARMOR_COMMON_ABSTRACTION}"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-network-profile" <<'AAPROFILE_SOLUTIONZ_RMM_NETWORK_PROFILE'
-# Policy revision: AA-SOC2-V07111226-R4
+# Policy revision: AA-SOC2-V07111226
 #include <tunables/global>
 profile solutionz-rmm-network-profile /usr/local/sbin/solutionz-rmm-network-profile flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -1914,7 +1854,7 @@ AAPROFILE_SOLUTIONZ_RMM_NETWORK_PROFILE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-network-profile"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-network-validate" <<'AAPROFILE_SOLUTIONZ_RMM_NETWORK_VALIDATE'
-# Policy revision: AA-SOC2-V07111226-R4
+# Policy revision: AA-SOC2-V07111226
 #include <tunables/global>
 profile solutionz-rmm-network-validate /usr/local/sbin/solutionz-rmm-network-validate flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -1939,7 +1879,7 @@ AAPROFILE_SOLUTIONZ_RMM_NETWORK_VALIDATE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-network-validate"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-live-network-discovery" <<'AAPROFILE_SOLUTIONZ_RMM_LIVE_NETWORK_DISCOVERY'
-# Policy revision: AA-SOC2-V07111226-R4
+# Policy revision: AA-SOC2-V07111226
 #include <tunables/global>
 profile solutionz-rmm-live-network-discovery /usr/local/sbin/solutionz-rmm-live-network-discovery flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -1961,7 +1901,7 @@ AAPROFILE_SOLUTIONZ_RMM_LIVE_NETWORK_DISCOVERY
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-live-network-discovery"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-security-validate" <<'AAPROFILE_SOLUTIONZ_RMM_SECURITY_VALIDATE'
-# Policy revision: AA-SOC2-V07111226-R4
+# Policy revision: AA-SOC2-V07111226
 #include <tunables/global>
 profile solutionz-rmm-security-validate /usr/local/sbin/solutionz-rmm-security-validate flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -1970,8 +1910,6 @@ profile solutionz-rmm-security-validate /usr/local/sbin/solutionz-rmm-security-v
   /usr/local/sbin/solutionz-rmm-security-validate r,
   /usr/local/sbin/solutionz-rmm-integrity-baseline Px,
   /usr/sbin/ufw ix,
-  # UFW takes an exclusive lock even for read-only status queries.
-  # Permit only its dedicated runtime lock, not broad /run write access.
   /run/ufw.lock rwk,
   /usr/sbin/sshd ix,
   /usr/sbin/auditctl ix,
@@ -1992,8 +1930,6 @@ profile solutionz-rmm-security-validate /usr/local/sbin/solutionz-rmm-security-v
   /etc/default/ufw r,
   /etc/ufw/** r,
   /etc/systemd/system/** r,
-  /etc/sudoers r,
-  /etc/sudoers.d/ r,
   /etc/sudoers.d/** r,
   /home/solz_eng/.ssh/authorized_keys r,
   /var/lib/rswsolutionz-rmm/** r,
@@ -2008,7 +1944,7 @@ AAPROFILE_SOLUTIONZ_RMM_SECURITY_VALIDATE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-security-validate"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-integrity-baseline" <<'AAPROFILE_SOLUTIONZ_RMM_INTEGRITY_BASELINE'
-# Policy revision: AA-SOC2-V07111226-R4
+# Policy revision: AA-SOC2-V07111226
 #include <tunables/global>
 profile solutionz-rmm-integrity-baseline /usr/local/sbin/solutionz-rmm-integrity-baseline flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -2038,7 +1974,7 @@ AAPROFILE_SOLUTIONZ_RMM_INTEGRITY_BASELINE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-integrity-baseline"
 
   cat > "${APPARMOR_DIR}/solutionz-domotz-activate" <<'AAPROFILE_SOLUTIONZ_DOMOTZ_ACTIVATE'
-# Policy revision: AA-SOC2-V07111226-R4
+# Policy revision: AA-SOC2-V07111226
 #include <tunables/global>
 profile solutionz-domotz-activate /usr/local/sbin/solutionz-domotz-activate flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -2059,7 +1995,7 @@ AAPROFILE_SOLUTIONZ_DOMOTZ_ACTIVATE
   chmod 644 "${APPARMOR_DIR}/solutionz-domotz-activate"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-postreboot-validate" <<'AAPROFILE_SOLUTIONZ_RMM_POSTREBOOT_VALIDATE'
-# Policy revision: AA-SOC2-V07111226-R4
+# Policy revision: AA-SOC2-V07111226
 #include <tunables/global>
 profile solutionz-rmm-postreboot-validate /usr/local/sbin/rswsolutionz-rmm-postreboot-validate flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -2091,7 +2027,7 @@ AAPROFILE_SOLUTIONZ_RMM_POSTREBOOT_VALIDATE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-postreboot-validate"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-local-config" <<'AAPROFILE_SOLUTIONZ_RMM_LOCAL_CONFIG'
-# Policy revision: AA-SOC2-V07111226-R4
+# Policy revision: AA-SOC2-V07111226
 #include <tunables/global>
 profile solutionz-rmm-local-config /usr/local/sbin/solutionz-rmm-local-config flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -2143,7 +2079,7 @@ AAPROFILE_SOLUTIONZ_RMM_LOCAL_CONFIG
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-local-config"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-engineering-shell" <<'AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_SHELL'
-# Policy revision: AA-SOC2-V07111226-R4
+# Policy revision: AA-SOC2-V07111226
 #include <tunables/global>
 profile solutionz-rmm-engineering-shell /usr/local/sbin/solutionz-rmm-engineering-shell flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
@@ -2184,7 +2120,7 @@ AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_SHELL
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-engineering-shell"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-engineering-password" <<'AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_PASSWORD'
-# Policy revision: AA-SOC2-V07111226-R4
+# Policy revision: AA-SOC2-V07111226
 #include <tunables/global>
 profile solutionz-rmm-engineering-password /usr/local/sbin/solutionz-rmm-engineering-password flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
@@ -2212,7 +2148,7 @@ AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_PASSWORD
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-engineering-password"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-setup" <<'AAPROFILE_SOLUTIONZ_RMM_SETUP'
-# Policy revision: AA-SOC2-V07111226-R4
+# Policy revision: AA-SOC2-V07111226
 #include <tunables/global>
 profile solutionz-rmm-setup /usr/local/sbin/solutionz-rmm-setup flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
@@ -4638,13 +4574,9 @@ LOCALCFG
   chown root:root "${LOCAL_CONFIG_TOOL}"
 
   cat > "${LOCAL_CONFIG_SUDOERS_FILE}" <<EOF
-# Field technicians receive exactly one privileged entry point: the controlled
-# Solutionz menu. Domotz registration remains reachable through that menu, so
-# technicians do not require direct sudo access to the activation helper.
 %${FIELD_TECH_GROUP} ALL=(root) NOPASSWD: ${LOCAL_CONFIG_TOOL}
-
-# Engineering retains the controlled menu plus Setup and the Domotz helper.
 %${ENGINEERING_GROUP} ALL=(root) NOPASSWD: ${LOCAL_CONFIG_TOOL}, ${INSTALLED_SETUP_COMMAND}, ${DOMOTZ_ACTIVATION_TOOL}
+%sudo ALL=(root) NOPASSWD: ${LOCAL_CONFIG_TOOL}
 EOF
   chmod 440 "${LOCAL_CONFIG_SUDOERS_FILE}"
   visudo -cf "${LOCAL_CONFIG_SUDOERS_FILE}" >/dev/null || error_exit "Local config sudoers validation failed."
@@ -4998,44 +4930,6 @@ EOF
   systemctl enable rswsolutionz-rmm-postreboot-validation.service
 }
 
-technician_managed_menu_privilege_ok() {
-  local sudo_out
-  id "${TECHNICIAN_USER}" >/dev/null 2>&1 || return 1
-  id -nG "${TECHNICIAN_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx "${FIELD_TECH_GROUP}" || return 1
-  sudo_out="$(sudo -l -U "${TECHNICIAN_USER}" 2>&1)" || return 1
-  grep -Fq "(root) NOPASSWD: ${LOCAL_CONFIG_TOOL}" <<<"${sudo_out}"
-}
-
-technician_effective_privileges_restricted() {
-  local groups sudo_out
-  local -a grants=()
-
-  id "${TECHNICIAN_USER}" >/dev/null 2>&1 || return 1
-  groups="$(id -nG "${TECHNICIAN_USER}" 2>/dev/null || true)"
-  tr ' ' '\n' <<<"${groups}" | grep -qx sudo && return 1
-  tr ' ' '\n' <<<"${groups}" | grep -qx "${ENGINEERING_GROUP}" && return 1
-
-  sudo_out="$(sudo -l -U "${TECHNICIAN_USER}" 2>&1)" || return 1
-  mapfile -t grants < <(printf '%s\n' "${sudo_out}" | sed -n -E '/^[[:space:]]*\([^)]*\)[[:space:]]*(NOPASSWD:[[:space:]]*)?/p')
-
-  # The technician must have exactly one effective sudo command and it must be
-  # the controlled root-owned Solutionz menu. Domotz registration is performed
-  # inside that menu, so no direct Setup/Domotz/Engineering sudo grant is needed.
-  (( ${#grants[@]} == 1 )) || return 1
-  [[ "${grants[0]}" == *"(root) NOPASSWD: ${LOCAL_CONFIG_TOOL}"* ]] || return 1
-  [[ "${sudo_out}" != *"${INSTALLED_SETUP_COMMAND}"* ]] || return 1
-  [[ "${sudo_out}" != *"${DOMOTZ_ACTIVATION_TOOL}"* ]] || return 1
-  [[ "${sudo_out}" != *"${ENGINEERING_SHELL_TOOL}"* ]] || return 1
-  [[ "${sudo_out}" != *"${ENGINEERING_PASSWORD_TOOL}"* ]] || return 1
-  return 0
-}
-
-print_technician_privilege_diagnostics() {
-  echo "Technician privilege diagnostics:"
-  id "${TECHNICIAN_USER}" 2>&1 || true
-  sudo -l -U "${TECHNICIAN_USER}" 2>&1 || true
-}
-
 check_final_requirement() {
   local description="$1"
   shift
@@ -5107,12 +5001,6 @@ final_summary_check() {
   check_final_requirement "All-interactive access profile recognizes solz_eng" grep -q "${ENGINEERING_USER}" "${SERIAL_PROFILE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Local config sudoers policy installed" test -s "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
   check_final_requirement "Local config sudoers policy valid" visudo -cf "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
-  check_final_requirement "Factory technician can launch SSH and serial menus" technician_managed_menu_privilege_ok || failures=$((failures + 1))
-  if ! check_final_requirement "Factory technician has no broad sudo, Setup grant, Domotz-helper grant, Engineering-shell grant, or Engineering group membership" technician_effective_privileges_restricted; then
-    failures=$((failures + 1))
-    warning_message "Review effective privileges below. The technician must retain only the managed ${LOCAL_CONFIG_TOOL} sudo grant."
-    print_technician_privilege_diagnostics
-  fi
   check_final_requirement "Protectli V1210 hardware" bash -c 'vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null); model=$(cat /sys/class/dmi/id/product_name 2>/dev/null); [[ "${vendor,,}" == *protectli* && "$model" == "V1210" ]]' || failures=$((failures + 1))
   check_final_requirement "SSH active" systemctl is-active --quiet ssh || failures=$((failures + 1))
   check_final_requirement "UFW active" bash -c "ufw status | grep -q 'Status: active'" || failures=$((failures + 1))
@@ -5367,12 +5255,6 @@ main() {
   update_banner
   install_postreboot_validation
   install_solutionz_apparmor_profiles
-
-  # Privilege cutover is last: the replacement technician menu path and the
-  # Engineering recovery path must already be installed before broad legacy
-  # technician sudo is removed. This prevents a mid-build failure from
-  # stranding the appliance without an administrative recovery path.
-  normalize_technician_privileges
 
   if ! final_summary_check; then
     error_exit "Mandatory pre-reboot validation failed. Review ${PREREBOOT_RESULT_FILE} for failed check names."

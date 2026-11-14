@@ -2699,11 +2699,14 @@ configure_grub_and_serial() {
   cat > "${SERIAL_DROPIN_FILE}" <<'EOF'
 [Service]
 ExecStart=
-ExecStart=-/sbin/agetty -o '-p -- \u' --keep-baud 115200,57600,38400,9600 ttyS0 vt220
+ExecStart=-/sbin/agetty -o '-p -- \u' --local-line=always --noclear ttyS0 115200 vt220
 EOF
 
   systemctl daemon-reload
   systemctl enable --now "${SERIAL_SERVICE}"
+  # Do not restart a getty from a potentially active serial login. The new
+  # fixed-baud override takes effect on the next planned reboot.
+  info_message "Serial override staged at fixed 115200 baud; an already-running getty adopts it on the next planned reboot."
   systemctl is-enabled "${SERIAL_SERVICE}" >/dev/null 2>&1 || \
     error_exit "${SERIAL_SERVICE} is not enabled."
   systemctl is-active "${SERIAL_SERVICE}" >/dev/null 2>&1 || \

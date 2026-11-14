@@ -13,6 +13,7 @@ set -Eeuo pipefail
 # SOC 2 / AppArmor Least-Privilege Update: 2026-11-12
 # Mass-Production / Refurbishment Workflow Update: 2026-11-12
 # Attached Baseline Feature-Parity / Direct Engineering Shell Update: 2026-11-13
+# R4 Privilege-Cutover Safety Fix: 2026-11-13
 #
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
@@ -1670,7 +1671,10 @@ configure_security_hardening() {
 
   groupadd -f "${FIELD_TECH_GROUP}"
   groupadd -f "${ENGINEERING_GROUP}"
-  normalize_technician_privileges
+  # Establish and verify Engineering recovery access before changing the
+  # factory technician's legacy privilege state. The technician privilege
+  # cutover is intentionally deferred until the controlled menu, sudoers
+  # policy, post-reboot validator, and AppArmor profiles are installed.
   install_engineering_identity
 
   cat > "${SECURITY_SYSCTL_FILE}" <<'EOF'
@@ -5363,6 +5367,12 @@ main() {
   update_banner
   install_postreboot_validation
   install_solutionz_apparmor_profiles
+
+  # Privilege cutover is last: the replacement technician menu path and the
+  # Engineering recovery path must already be installed before broad legacy
+  # technician sudo is removed. This prevents a mid-build failure from
+  # stranding the appliance without an administrative recovery path.
+  normalize_technician_privileges
 
   if ! final_summary_check; then
     error_exit "Mandatory pre-reboot validation failed. Review ${PREREBOOT_RESULT_FILE} for failed check names."

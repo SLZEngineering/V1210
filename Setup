@@ -214,7 +214,7 @@ LOCAL_CONFIG_TOOL="/usr/local/sbin/solutionz-rmm-local-config"
 LOCAL_CONFIG_SUDOERS_FILE="/etc/sudoers.d/solutionz-rmm-local-config"
 ENGINEERING_SHELL_TOOL="/usr/local/sbin/solutionz-rmm-engineering-shell"
 ENGINEERING_PASSWORD_TOOL="/usr/local/sbin/solutionz-rmm-engineering-password"
-APPARMOR_POLICY_REVISION="AA-SOC2-V07111226-R1"
+APPARMOR_POLICY_REVISION="AA-SOC2-V07111226-R2"
 APPARMOR_DIR="/etc/apparmor.d"
 APPARMOR_COMMON_ABSTRACTION="${APPARMOR_DIR}/abstractions/solutionz-rmm-common"
 APPARMOR_PROFILE_FILES=(
@@ -1325,7 +1325,7 @@ ACCESS_PROFILE="/etc/profile.d/solutionz-rmm-access.sh"
 LOCALCFG="/usr/local/sbin/solutionz-rmm-local-config"
 LIVE="/usr/local/sbin/solutionz-rmm-live-network-discovery"
 LIVE_RESULT="/var/lib/rswsolutionz-rmm/network-live-discovery-SOC2-V07111226.result"
-APPARMOR_POLICY_REVISION="AA-SOC2-V07111226-R1"
+APPARMOR_POLICY_REVISION="AA-SOC2-V07111226-R2"
 APPARMOR_REQUIRED_PROFILES=(solutionz-rmm-setup solutionz-rmm-local-config solutionz-rmm-network-profile solutionz-rmm-network-validate solutionz-rmm-live-network-discovery solutionz-rmm-security-validate solutionz-rmm-integrity-baseline solutionz-rmm-postreboot-validate solutionz-domotz-activate solutionz-rmm-engineering-shell solutionz-rmm-engineering-password)
 APPARMOR_REQUIRED_FILES=(/etc/apparmor.d/abstractions/solutionz-rmm-common /etc/apparmor.d/solutionz-rmm-setup /etc/apparmor.d/solutionz-rmm-local-config /etc/apparmor.d/solutionz-rmm-network-profile /etc/apparmor.d/solutionz-rmm-network-validate /etc/apparmor.d/solutionz-rmm-live-network-discovery /etc/apparmor.d/solutionz-rmm-security-validate /etc/apparmor.d/solutionz-rmm-integrity-baseline /etc/apparmor.d/solutionz-rmm-postreboot-validate /etc/apparmor.d/solutionz-domotz-activate /etc/apparmor.d/solutionz-rmm-engineering-shell /etc/apparmor.d/solutionz-rmm-engineering-password)
 F=(); W=()
@@ -1369,9 +1369,13 @@ for iface in eth0 eth1; do
   fi
 done
 
-ufw status 2>/dev/null | grep -q 'Status: active' && pass "UFW active." || fail "UFW inactive."
-ufw status 2>/dev/null | grep -Eq '^22/tcp[[:space:]]+ALLOW' && pass "Domotz-required TCP 22 permitted." || fail "Required UFW TCP 22 rule missing."
-ufw status 2>/dev/null | grep -Eq '^3000/tcp[[:space:]]+ALLOW' && pass "Domotz-required TCP 3000 permitted." || fail "Required UFW TCP 3000 rule missing."
+if ufw_status="$(ufw status 2>&1)"; then
+  grep -q '^Status: active' <<<"$ufw_status" && pass "UFW active." || fail "UFW inactive."
+  grep -Eq '^22/tcp[[:space:]]+ALLOW' <<<"$ufw_status" && pass "Domotz-required TCP 22 permitted." || fail "Required UFW TCP 22 rule missing."
+  grep -Eq '^3000/tcp[[:space:]]+ALLOW' <<<"$ufw_status" && pass "Domotz-required TCP 3000 rule missing."
+else
+  fail "UFW status could not be read: $ufw_status"
+fi
 grep -Eq '^DEFAULT_INPUT_POLICY="?DROP"?$' /etc/default/ufw 2>/dev/null && pass "UFW default inbound policy is DROP." || fail "UFW default inbound policy is not DROP."
 grep -Eq '^DEFAULT_OUTPUT_POLICY="?ACCEPT"?$' /etc/default/ufw 2>/dev/null && pass "UFW default outbound policy is ACCEPT." || fail "UFW default outbound policy is not ACCEPT."
 grep -Eq '^DEFAULT_FORWARD_POLICY="?DROP"?$' /etc/default/ufw 2>/dev/null && pass "UFW forwarded/routed policy is DROP." || fail "UFW forwarded/routed policy is not DROP."
@@ -1424,7 +1428,11 @@ grep -q 'Register NEW Domotz Collector Now' "$LOCALCFG" 2>/dev/null && pass "NEW
 [[ -x "$LIVE" ]] && pass "Live network discovery utility installed." || fail "Live network discovery utility missing."
 [[ -s "$LIVE_RESULT" ]] && pass "Live network discovery result record exists." || warn "Live network discovery result record is not present yet."
 
-systemctl is-active --quiet auditd 2>/dev/null && pass "auditd active." || fail "auditd inactive."
+if service_status="$(systemctl is-active auditd 2>&1)"; then
+  pass "auditd active."
+else
+  fail "auditd status check failed: ${service_status:-no status returned}"
+fi
 [[ -s "$AUDIT_FILE" ]] && pass "Solutionz audit rules installed." || fail "Solutionz audit rules missing."
 grep -q 'solutionz_apparmor' "$AUDIT_FILE" 2>/dev/null && pass "AppArmor policy directory changes are audited." || fail "AppArmor audit watch is missing."
 if loaded_audit_rules="$(auditctl -l 2>/dev/null)"; then
@@ -1433,7 +1441,11 @@ if loaded_audit_rules="$(auditctl -l 2>/dev/null)"; then
 else
   fail "Loaded audit rules could not be read."
 fi
-systemctl is-active --quiet apparmor 2>/dev/null && pass "AppArmor service active." || fail "AppArmor service inactive."
+if service_status="$(systemctl is-active apparmor 2>&1)"; then
+  pass "AppArmor service active."
+else
+  fail "AppArmor service status check failed: ${service_status:-no status returned}"
+fi
 if [[ -r /sys/kernel/security/apparmor/profiles ]]; then
   for aa_file in "${APPARMOR_REQUIRED_FILES[@]}"; do
     [[ -s "$aa_file" ]] && pass "AppArmor policy file installed: $aa_file" || fail "Required AppArmor policy file missing: $aa_file"
@@ -1747,7 +1759,7 @@ ENGPASS
   chmod 750 "${ENGINEERING_PASSWORD_TOOL}"
 
   cat > "${APPARMOR_COMMON_ABSTRACTION}" <<'AACOMMON'
-# Policy revision: AA-SOC2-V07111226-R1
+# Policy revision: AA-SOC2-V07111226-R2
 # Solutionz RMM common AppArmor abstraction
 #include <abstractions/base>
 #include <abstractions/nameservice>
@@ -1773,7 +1785,7 @@ ENGPASS
 
 /usr/bin/bash ix,
 /usr/bin/sh ix,
-/usr/bin/awk ix,
+/usr/bin/{awk,mawk,gawk,original-awk} ix,
 /usr/bin/basename ix,
 /usr/bin/cat ix,
 /usr/bin/chmod ix,
@@ -1818,7 +1830,7 @@ AACOMMON
   chmod 644 "${APPARMOR_COMMON_ABSTRACTION}"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-network-profile" <<'AAPROFILE_SOLUTIONZ_RMM_NETWORK_PROFILE'
-# Policy revision: AA-SOC2-V07111226-R1
+# Policy revision: AA-SOC2-V07111226-R2
 #include <tunables/global>
 profile solutionz-rmm-network-profile /usr/local/sbin/solutionz-rmm-network-profile flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -1842,7 +1854,7 @@ AAPROFILE_SOLUTIONZ_RMM_NETWORK_PROFILE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-network-profile"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-network-validate" <<'AAPROFILE_SOLUTIONZ_RMM_NETWORK_VALIDATE'
-# Policy revision: AA-SOC2-V07111226-R1
+# Policy revision: AA-SOC2-V07111226-R2
 #include <tunables/global>
 profile solutionz-rmm-network-validate /usr/local/sbin/solutionz-rmm-network-validate flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -1877,7 +1889,7 @@ AAPROFILE_SOLUTIONZ_RMM_NETWORK_VALIDATE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-network-validate"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-live-network-discovery" <<'AAPROFILE_SOLUTIONZ_RMM_LIVE_NETWORK_DISCOVERY'
-# Policy revision: AA-SOC2-V07111226-R1
+# Policy revision: AA-SOC2-V07111226-R2
 #include <tunables/global>
 profile solutionz-rmm-live-network-discovery /usr/local/sbin/solutionz-rmm-live-network-discovery flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -1899,7 +1911,7 @@ AAPROFILE_SOLUTIONZ_RMM_LIVE_NETWORK_DISCOVERY
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-live-network-discovery"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-security-validate" <<'AAPROFILE_SOLUTIONZ_RMM_SECURITY_VALIDATE'
-# Policy revision: AA-SOC2-V07111226-R1
+# Policy revision: AA-SOC2-V07111226-R2
 #include <tunables/global>
 profile solutionz-rmm-security-validate /usr/local/sbin/solutionz-rmm-security-validate flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -1912,6 +1924,9 @@ profile solutionz-rmm-security-validate /usr/local/sbin/solutionz-rmm-security-v
   /usr/sbin/xtables-{nft,legacy}-multi ix,
   /usr/sbin/ip{,6}tables{,-save} ix,
   /run/xtables.lock rwk,
+  /usr/lib/ufw/** rix,
+  /usr/bin/iptables-xml ix,
+  /usr/sbin/iptables-xml ix,
   /usr/bin/passwd ix,
   /etc/shadow r,
   /usr/local/sbin/solutionz-rmm-local-config r,
@@ -1925,6 +1940,8 @@ profile solutionz-rmm-security-validate /usr/local/sbin/solutionz-rmm-security-v
   /usr/sbin/apparmor_status ix,
   /usr/sbin/nft ix,
   /usr/bin/systemctl ix,
+  /run/systemd/private rw,
+  /etc/profile.d/solutionz-rmm-access.sh r,
   /usr/bin/ssh-keygen ix,
   /usr/bin/mokutil ix,
   /etc/solutionz-rmm/** r,
@@ -1938,6 +1955,7 @@ profile solutionz-rmm-security-validate /usr/local/sbin/solutionz-rmm-security-v
   /etc/ufw/** r,
   /etc/systemd/system/** r,
   /etc/sudoers.d/** r,
+  capability dac_read_search,
   /home/solz_eng/.ssh/authorized_keys r,
   /var/lib/rswsolutionz-rmm/** r,
   /var/lib/rswsolutionz-rmm/security-validation-* rwk,
@@ -1948,7 +1966,7 @@ AAPROFILE_SOLUTIONZ_RMM_SECURITY_VALIDATE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-security-validate"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-integrity-baseline" <<'AAPROFILE_SOLUTIONZ_RMM_INTEGRITY_BASELINE'
-# Policy revision: AA-SOC2-V07111226-R1
+# Policy revision: AA-SOC2-V07111226-R2
 #include <tunables/global>
 profile solutionz-rmm-integrity-baseline /usr/local/sbin/solutionz-rmm-integrity-baseline flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -1969,6 +1987,7 @@ profile solutionz-rmm-integrity-baseline /usr/local/sbin/solutionz-rmm-integrity
   /etc/profile.d/** r,
   /etc/sudoers.d/** r,
   /etc/systemd/system/** r,
+  capability dac_read_search,
   /home/solz_eng/.ssh/authorized_keys r,
   /var/lib/rswsolutionz-rmm/ rw,
   /var/lib/rswsolutionz-rmm/** r,
@@ -1979,7 +1998,7 @@ AAPROFILE_SOLUTIONZ_RMM_INTEGRITY_BASELINE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-integrity-baseline"
 
   cat > "${APPARMOR_DIR}/solutionz-domotz-activate" <<'AAPROFILE_SOLUTIONZ_DOMOTZ_ACTIVATE'
-# Policy revision: AA-SOC2-V07111226-R1
+# Policy revision: AA-SOC2-V07111226-R2
 #include <tunables/global>
 profile solutionz-domotz-activate /usr/local/sbin/solutionz-domotz-activate flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -2003,7 +2022,7 @@ AAPROFILE_SOLUTIONZ_DOMOTZ_ACTIVATE
   chmod 644 "${APPARMOR_DIR}/solutionz-domotz-activate"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-postreboot-validate" <<'AAPROFILE_SOLUTIONZ_RMM_POSTREBOOT_VALIDATE'
-# Policy revision: AA-SOC2-V07111226-R1
+# Policy revision: AA-SOC2-V07111226-R2
 #include <tunables/global>
 profile solutionz-rmm-postreboot-validate /usr/local/sbin/rswsolutionz-rmm-postreboot-validate flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -2027,6 +2046,7 @@ profile solutionz-rmm-postreboot-validate /usr/local/sbin/rswsolutionz-rmm-postr
   /usr/local/sbin/solutionz-rmm-network-profile Px,
   /usr/local/sbin/solutionz-rmm-local-config r,
   /usr/local/sbin/solutionz-rmm-setup r,
+  capability dac_read_search,
   /home/solz_eng/.ssh/authorized_keys r,
   /usr/sbin/visudo ix,
   /dev/ttyS0 r,
@@ -2045,7 +2065,7 @@ AAPROFILE_SOLUTIONZ_RMM_POSTREBOOT_VALIDATE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-postreboot-validate"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-local-config" <<'AAPROFILE_SOLUTIONZ_RMM_LOCAL_CONFIG'
-# Policy revision: AA-SOC2-V07111226-R1
+# Policy revision: AA-SOC2-V07111226-R2
 #include <tunables/global>
 profile solutionz-rmm-local-config /usr/local/sbin/solutionz-rmm-local-config flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -2104,7 +2124,7 @@ AAPROFILE_SOLUTIONZ_RMM_LOCAL_CONFIG
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-local-config"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-engineering-shell" <<'AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_SHELL'
-# Policy revision: AA-SOC2-V07111226-R1
+# Policy revision: AA-SOC2-V07111226-R2
 #include <tunables/global>
 profile solutionz-rmm-engineering-shell /usr/local/sbin/solutionz-rmm-engineering-shell flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
@@ -2145,7 +2165,7 @@ AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_SHELL
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-engineering-shell"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-engineering-password" <<'AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_PASSWORD'
-# Policy revision: AA-SOC2-V07111226-R1
+# Policy revision: AA-SOC2-V07111226-R2
 #include <tunables/global>
 profile solutionz-rmm-engineering-password /usr/local/sbin/solutionz-rmm-engineering-password flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
@@ -2173,7 +2193,7 @@ AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_PASSWORD
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-engineering-password"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-setup" <<'AAPROFILE_SOLUTIONZ_RMM_SETUP'
-# Policy revision: AA-SOC2-V07111226-R1
+# Policy revision: AA-SOC2-V07111226-R2
 #include <tunables/global>
 profile solutionz-rmm-setup /usr/local/sbin/solutionz-rmm-setup flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
@@ -3311,7 +3331,7 @@ configure_grub_and_serial() {
   cat > "${SERIAL_DROPIN_FILE}" <<'EOF'
 [Service]
 ExecStart=
-ExecStart=-/sbin/agetty -o '-p -- \u' --keep-baud 115200,57600,38400,9600 ttyS0 vt220
+ExecStart=-/sbin/agetty -o '-p -- \\u' --keep-baud 115200,57600,38400,9600 ttyS0 vt220
 EOF
 
   systemctl daemon-reload
@@ -5045,7 +5065,10 @@ final_summary_check() {
   check_final_requirement "Local config sudoers policy installed" test -s "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
   check_final_requirement "Local config sudoers policy valid" visudo -c || failures=$((failures + 1))
   check_final_requirement "Factory technician can launch the SSH and serial menus" bash -c 'sudo -n -l -U "$1" "$2" >/dev/null && sudo -n -l -U "$1" "$2" --serial-auto >/dev/null' _ "${TECHNICIAN_USER}" "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Factory technician has no broad sudo or Engineering group membership" bash -c 'groups=$(id -nG "$1") && ! grep -Eq "(^| )(sudo|$2)( |$)" <<<"$groups" && ! sudo -n -l -U "$1" /bin/bash >/dev/null 2>&1 && ! sudo -n -l -U "$1" "$3" >/dev/null 2>&1' _ "${TECHNICIAN_USER}" "${ENGINEERING_GROUP}" "${INSTALLED_SETUP_COMMAND}" || failures=$((failures + 1))
+  check_final_requirement "Factory technician has no broad sudo or Engineering group membership" bash -c 'groups=$(id -nG "$1") && ! grep -Eq "(^| )(sudo|$2)( |$)" <<<"$groups" && ! sudo -n -l -U "$1" /bin/bash >/dev/null 2>&1 && ! sudo -n -l -U "$1" "$3" >/dev/null 2>&1' _ "${TECHNICIAN_USER}" "${ENGINEERING_GROUP}" "${INSTALLED_SETUP_COMMAND}" || {
+    failures=$((failures + 1))
+    warning_message "Review effective privileges from an administrator session: id solz_rmm; sudo -l -U solz_rmm. Remove any legacy Setup or broad sudo grant while retaining the managed menu grant."
+  }
   check_final_requirement "Protectli V1210 hardware" bash -c 'vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null); model=$(cat /sys/class/dmi/id/product_name 2>/dev/null); [[ "${vendor,,}" == *protectli* && "$model" == "V1210" ]]' || failures=$((failures + 1))
   check_final_requirement "SSH active" systemctl is-active --quiet ssh || failures=$((failures + 1))
   check_final_requirement "UFW active" bash -c "ufw status | grep -q 'Status: active'" || failures=$((failures + 1))
@@ -5098,7 +5121,6 @@ check_final_requirement "Solutionz security validator installed" test -x "${SECU
   check_final_requirement "DNS resolves archive.ubuntu.com to IPv4" dns_resolves_ipv4 archive.ubuntu.com || failures=$((failures + 1))
   check_final_requirement "systemd-timesyncd enabled" systemctl is-enabled --quiet systemd-timesyncd.service || failures=$((failures + 1))
   check_final_requirement "systemd-timesyncd active" systemctl is-active --quiet systemd-timesyncd.service || failures=$((failures + 1))
-  check_final_requirement "systemd-time-wait-sync enabled" systemctl is-enabled --quiet systemd-time-wait-sync.service || failures=$((failures + 1))
   echo "INFO - Waiting up to 180 seconds for NTP synchronization before Phase 1 completion."
   if ! check_final_requirement "NTP synchronization active" wait_for_ntp_sync 36 5; then
     failures=$((failures + 1))

@@ -1592,9 +1592,16 @@ configure_security_hardening() {
   # unprovisioned accounts receive the approved default engineering password via
   # its one-way SHA-512 crypt hash. Setup never needs the plaintext value.
   engineering_password_state="$(passwd -S "${ENGINEERING_USER}" 2>/dev/null | awk '{print $2}' || true)"
-  if [[ -s "${ENGINEERING_PASSWORD_MARKER}" && "${engineering_password_state}" == "P" ]]; then
+  if [[ "${engineering_password_state}" == "P" ]]; then
+    if [[ ! -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
+      install -d -m 750 "$(dirname "${ENGINEERING_PASSWORD_MARKER}")"
+      (umask 027; printf 'engineering_login=%s\nstatus=configured\nsource=existing_password_preserved\n' "${ENGINEERING_USER}" > "${ENGINEERING_PASSWORD_MARKER}")
+      chmod 640 "${ENGINEERING_PASSWORD_MARKER}"
+      chown root:root "${ENGINEERING_PASSWORD_MARKER}"
+    fi
     progress_message "Engineering password was previously provisioned; Setup preserved it unchanged."
   else
+    [[ "${engineering_password_state}" == "L" || "${engineering_password_state}" == "NP" ]] || error_exit "Unable to determine Engineering password status; existing credentials were not modified."
     [[ -n "${ENGINEERING_DEFAULT_PASSWORD_HASH}" ]] || \
       error_exit "Default engineering password hash is empty."
     [[ "${ENGINEERING_DEFAULT_PASSWORD_HASH}" == '$6$'* ]] || \
@@ -2699,7 +2706,7 @@ configure_grub_and_serial() {
   cat > "${SERIAL_DROPIN_FILE}" <<'EOF'
 [Service]
 ExecStart=
-ExecStart=-/sbin/agetty -o '-p -- \u' --local-line=always --noclear ttyS0 115200 vt220
+ExecStart=-/sbin/agetty -L --noclear ttyS0 115200 vt220
 EOF
 
   systemctl daemon-reload
@@ -2749,6 +2756,7 @@ SECURITY_BASELINE="/var/lib/rswsolutionz-rmm/security-baseline-V06.100626N.sha25
 INSTALL_STATE="/var/lib/rswsolutionz-rmm/install.state"
 ENGINEERING_USER="solz_eng"
 ENGINEERING_GROUP="solutionz-rmm-engineering"
+FIELD_TECH_GROUP="solutionz-rmm-tech"
 ENGINEERING_PASSWORD_TOOL="/usr/local/sbin/solutionz-rmm-engineering-password-setup"
 ENGINEERING_PASSWORD_MARKER="/var/lib/rswsolutionz-rmm/engineering-password-provisioned"
 SETUP_COMMAND="/usr/local/sbin/solutionz-rmm-setup"
@@ -3585,9 +3593,14 @@ engineering_password_transition() {
   # Run su as the original technician rather than as root. This forces PAM to
   # validate the engineering password locally and does not depend on SSH
   # PasswordAuthentication being enabled.
-  runuser -u "${invoking_user}" -- \
-    /bin/su - "${ENGINEERING_USER}" -c \
-    "sudo -n ${LOCAL_CONFIG_TOOL} ${direct_arg}" || true
+  if runuser -u "${invoking_user}" -- \
+    /bin/su --pty -s /bin/bash -c \
+    "exec /usr/bin/sudo -n ${LOCAL_CONFIG_TOOL} ${direct_arg}" "${ENGINEERING_USER}"; then
+    return 0
+  else
+    echo "Engineering authentication or session failed. Returning to the menu." >&2
+    return 1
+  fi
 }
 
 engineering_shell_entry() {
@@ -3753,11 +3766,6 @@ engineering_access() {
     return 0
   fi
 
-  if [[ "$(head -n1 "${INSTALL_STATE}" 2>/dev/null || true)" != "phase2_system_validated" ]]; then
-    echo "Engineering password setup is unavailable until Phase 2 reports phase2_system_validated."
-    return 1
-  fi
-
   if [[ ! -s "${ENGINEERING_PASSWORD_MARKER}" ]]; then
     echo "First-time engineering setup detected."
     echo "The current session is authenticated as ${ENGINEERING_USER}."
@@ -3878,8 +3886,8 @@ MENU
     5) show_live ;;
     6) validate_full || true ;;
     7) restore ;;
-    8) engineering_access ;;
-    9) engineering_tools_entry ;;
+    8) engineering_access || true ;;
+    9) engineering_tools_entry || true ;;
     10) domotz_register_new_now || true ;;
     11) if (( AUTO )); then exit 90; else exit 0; fi ;;
     12) engineering_shell_entry || true ;;
@@ -3909,10 +3917,6 @@ esac
 [[ ${EUID} -eq 0 ]] || { echo "ERROR: engineering password setup must run through its authorized sudo rule." >&2; exit 80; }
 [[ "${SUDO_USER:-}" == "${ENGINEERING_USER}" ]] || { echo "ERROR: only ${ENGINEERING_USER} may provision the engineering password." >&2; exit 81; }
 [[ -t 0 && -t 1 ]] || { echo "ERROR: an interactive terminal is required." >&2; exit 82; }
-[[ "$(head -n1 "${STATE_FILE}" 2>/dev/null || true)" == "phase2_system_validated" ]] || {
-  echo "ERROR: engineering password provisioning is blocked until Phase 2 system validation passes." >&2
-  exit 83
-}
 
 if [[ -s "${MARKER}" && "${MODE}" == "initial" ]]; then
   exit 0

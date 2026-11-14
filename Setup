@@ -214,7 +214,7 @@ LOCAL_CONFIG_TOOL="/usr/local/sbin/solutionz-rmm-local-config"
 LOCAL_CONFIG_SUDOERS_FILE="/etc/sudoers.d/solutionz-rmm-local-config"
 ENGINEERING_SHELL_TOOL="/usr/local/sbin/solutionz-rmm-engineering-shell"
 ENGINEERING_PASSWORD_TOOL="/usr/local/sbin/solutionz-rmm-engineering-password"
-APPARMOR_POLICY_REVISION="AA-SOC2-V07111226-R2"
+APPARMOR_POLICY_REVISION="AA-SOC2-V07111226-R3"
 APPARMOR_DIR="/etc/apparmor.d"
 APPARMOR_COMMON_ABSTRACTION="${APPARMOR_DIR}/abstractions/solutionz-rmm-common"
 APPARMOR_PROFILE_FILES=(
@@ -1325,7 +1325,7 @@ ACCESS_PROFILE="/etc/profile.d/solutionz-rmm-access.sh"
 LOCALCFG="/usr/local/sbin/solutionz-rmm-local-config"
 LIVE="/usr/local/sbin/solutionz-rmm-live-network-discovery"
 LIVE_RESULT="/var/lib/rswsolutionz-rmm/network-live-discovery-SOC2-V07111226.result"
-APPARMOR_POLICY_REVISION="AA-SOC2-V07111226-R2"
+APPARMOR_POLICY_REVISION="AA-SOC2-V07111226-R3"
 APPARMOR_REQUIRED_PROFILES=(solutionz-rmm-setup solutionz-rmm-local-config solutionz-rmm-network-profile solutionz-rmm-network-validate solutionz-rmm-live-network-discovery solutionz-rmm-security-validate solutionz-rmm-integrity-baseline solutionz-rmm-postreboot-validate solutionz-domotz-activate solutionz-rmm-engineering-shell solutionz-rmm-engineering-password)
 APPARMOR_REQUIRED_FILES=(/etc/apparmor.d/abstractions/solutionz-rmm-common /etc/apparmor.d/solutionz-rmm-setup /etc/apparmor.d/solutionz-rmm-local-config /etc/apparmor.d/solutionz-rmm-network-profile /etc/apparmor.d/solutionz-rmm-network-validate /etc/apparmor.d/solutionz-rmm-live-network-discovery /etc/apparmor.d/solutionz-rmm-security-validate /etc/apparmor.d/solutionz-rmm-integrity-baseline /etc/apparmor.d/solutionz-rmm-postreboot-validate /etc/apparmor.d/solutionz-domotz-activate /etc/apparmor.d/solutionz-rmm-engineering-shell /etc/apparmor.d/solutionz-rmm-engineering-password)
 F=(); W=()
@@ -1460,11 +1460,7 @@ fi
 [[ -s "$APT_POLICY" ]] && grep -q 'Automatic-Reboot "false"' "$APT_POLICY" && pass "Controlled security-update policy installed with automatic reboot disabled." || fail "Controlled security-update policy missing/invalid."
 grep -q 'APT::Periodic::Unattended-Upgrade "0"' "$APT_POLICY" 2>/dev/null && pass "Unattended package installation disabled; security updates require an approved maintenance action." || fail "Unattended package installation is not disabled by Solutionz policy."
 
-if [[ -x "$INTEGRITY" && -s "$BASELINE" ]]; then
-  "$INTEGRITY" --verify >/dev/null 2>&1 && pass "Security integrity baseline validates." || fail "Security integrity baseline validation failed."
-else
-  fail "Security integrity baseline/tool missing."
-fi
+[[ -x "$INTEGRITY" && -s "$BASELINE" ]] && pass "Security integrity baseline and verifier present." || fail "Security integrity baseline/tool missing."
 
 listener_tmp="$(mktemp /tmp/solutionz-rmm-listeners.XXXXXX)"
 trap 'rm -f "$listener_tmp"' EXIT
@@ -1759,7 +1755,7 @@ ENGPASS
   chmod 750 "${ENGINEERING_PASSWORD_TOOL}"
 
   cat > "${APPARMOR_COMMON_ABSTRACTION}" <<'AACOMMON'
-# Policy revision: AA-SOC2-V07111226-R2
+# Policy revision: AA-SOC2-V07111226-R3
 # Solutionz RMM common AppArmor abstraction
 #include <abstractions/base>
 #include <abstractions/nameservice>
@@ -1830,7 +1826,7 @@ AACOMMON
   chmod 644 "${APPARMOR_COMMON_ABSTRACTION}"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-network-profile" <<'AAPROFILE_SOLUTIONZ_RMM_NETWORK_PROFILE'
-# Policy revision: AA-SOC2-V07111226-R2
+# Policy revision: AA-SOC2-V07111226-R3
 #include <tunables/global>
 profile solutionz-rmm-network-profile /usr/local/sbin/solutionz-rmm-network-profile flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -1854,7 +1850,7 @@ AAPROFILE_SOLUTIONZ_RMM_NETWORK_PROFILE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-network-profile"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-network-validate" <<'AAPROFILE_SOLUTIONZ_RMM_NETWORK_VALIDATE'
-# Policy revision: AA-SOC2-V07111226-R2
+# Policy revision: AA-SOC2-V07111226-R3
 #include <tunables/global>
 profile solutionz-rmm-network-validate /usr/local/sbin/solutionz-rmm-network-validate flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -1877,6 +1873,7 @@ profile solutionz-rmm-network-validate /usr/local/sbin/solutionz-rmm-network-val
   /run/systemd/network/** rwk,
   /run/systemd/netif/** r,
   /run/systemd/private rw,
+  network unix stream,
   /usr/bin/nc ix,
   /usr/bin/curl ix,
   /usr/bin/networkctl ix,
@@ -1889,7 +1886,7 @@ AAPROFILE_SOLUTIONZ_RMM_NETWORK_VALIDATE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-network-validate"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-live-network-discovery" <<'AAPROFILE_SOLUTIONZ_RMM_LIVE_NETWORK_DISCOVERY'
-# Policy revision: AA-SOC2-V07111226-R2
+# Policy revision: AA-SOC2-V07111226-R3
 #include <tunables/global>
 profile solutionz-rmm-live-network-discovery /usr/local/sbin/solutionz-rmm-live-network-discovery flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -1911,7 +1908,7 @@ AAPROFILE_SOLUTIONZ_RMM_LIVE_NETWORK_DISCOVERY
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-live-network-discovery"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-security-validate" <<'AAPROFILE_SOLUTIONZ_RMM_SECURITY_VALIDATE'
-# Policy revision: AA-SOC2-V07111226-R2
+# Policy revision: AA-SOC2-V07111226-R3
 #include <tunables/global>
 profile solutionz-rmm-security-validate /usr/local/sbin/solutionz-rmm-security-validate flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -1925,6 +1922,7 @@ profile solutionz-rmm-security-validate /usr/local/sbin/solutionz-rmm-security-v
   /usr/sbin/ip{,6}tables{,-save} ix,
   /run/xtables.lock rwk,
   /usr/lib/ufw/** rix,
+  /usr/share/ufw/** r,
   /usr/bin/iptables-xml ix,
   /usr/sbin/iptables-xml ix,
   /usr/bin/passwd ix,
@@ -1932,8 +1930,8 @@ profile solutionz-rmm-security-validate /usr/local/sbin/solutionz-rmm-security-v
   /usr/local/sbin/solutionz-rmm-local-config r,
   network netlink raw,
   /usr/local/sbin/solutionz-rmm-security-validate r,
-  /usr/local/sbin/solutionz-rmm-integrity-baseline Px,
-  /usr/sbin/ufw ix,
+  /usr/local/sbin/solutionz-rmm-integrity-baseline r,
+  /usr/sbin/ufw rix,
   /usr/sbin/sshd ix,
   /usr/sbin/auditctl ix,
   /usr/sbin/aa-status ix,
@@ -1941,6 +1939,7 @@ profile solutionz-rmm-security-validate /usr/local/sbin/solutionz-rmm-security-v
   /usr/sbin/nft ix,
   /usr/bin/systemctl ix,
   /run/systemd/private rw,
+  network unix stream,
   /etc/profile.d/solutionz-rmm-access.sh r,
   /usr/bin/ssh-keygen ix,
   /usr/bin/mokutil ix,
@@ -1966,7 +1965,7 @@ AAPROFILE_SOLUTIONZ_RMM_SECURITY_VALIDATE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-security-validate"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-integrity-baseline" <<'AAPROFILE_SOLUTIONZ_RMM_INTEGRITY_BASELINE'
-# Policy revision: AA-SOC2-V07111226-R2
+# Policy revision: AA-SOC2-V07111226-R3
 #include <tunables/global>
 profile solutionz-rmm-integrity-baseline /usr/local/sbin/solutionz-rmm-integrity-baseline flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -1998,7 +1997,7 @@ AAPROFILE_SOLUTIONZ_RMM_INTEGRITY_BASELINE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-integrity-baseline"
 
   cat > "${APPARMOR_DIR}/solutionz-domotz-activate" <<'AAPROFILE_SOLUTIONZ_DOMOTZ_ACTIVATE'
-# Policy revision: AA-SOC2-V07111226-R2
+# Policy revision: AA-SOC2-V07111226-R3
 #include <tunables/global>
 profile solutionz-domotz-activate /usr/local/sbin/solutionz-domotz-activate flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -2022,7 +2021,7 @@ AAPROFILE_SOLUTIONZ_DOMOTZ_ACTIVATE
   chmod 644 "${APPARMOR_DIR}/solutionz-domotz-activate"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-postreboot-validate" <<'AAPROFILE_SOLUTIONZ_RMM_POSTREBOOT_VALIDATE'
-# Policy revision: AA-SOC2-V07111226-R2
+# Policy revision: AA-SOC2-V07111226-R3
 #include <tunables/global>
 profile solutionz-rmm-postreboot-validate /usr/local/sbin/rswsolutionz-rmm-postreboot-validate flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -2059,13 +2058,14 @@ profile solutionz-rmm-postreboot-validate /usr/local/sbin/rswsolutionz-rmm-postr
   /run/systemd/network/** rwk,
   /run/systemd/netif/** r,
   /run/systemd/private rw,
+  network unix stream,
   /tmp/** rwk,
 }
 AAPROFILE_SOLUTIONZ_RMM_POSTREBOOT_VALIDATE
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-postreboot-validate"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-local-config" <<'AAPROFILE_SOLUTIONZ_RMM_LOCAL_CONFIG'
-# Policy revision: AA-SOC2-V07111226-R2
+# Policy revision: AA-SOC2-V07111226-R3
 #include <tunables/global>
 profile solutionz-rmm-local-config /usr/local/sbin/solutionz-rmm-local-config flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/solutionz-rmm-common>
@@ -2124,7 +2124,7 @@ AAPROFILE_SOLUTIONZ_RMM_LOCAL_CONFIG
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-local-config"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-engineering-shell" <<'AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_SHELL'
-# Policy revision: AA-SOC2-V07111226-R2
+# Policy revision: AA-SOC2-V07111226-R3
 #include <tunables/global>
 profile solutionz-rmm-engineering-shell /usr/local/sbin/solutionz-rmm-engineering-shell flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
@@ -2165,7 +2165,7 @@ AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_SHELL
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-engineering-shell"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-engineering-password" <<'AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_PASSWORD'
-# Policy revision: AA-SOC2-V07111226-R2
+# Policy revision: AA-SOC2-V07111226-R3
 #include <tunables/global>
 profile solutionz-rmm-engineering-password /usr/local/sbin/solutionz-rmm-engineering-password flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
@@ -2193,7 +2193,7 @@ AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_PASSWORD
   chmod 644 "${APPARMOR_DIR}/solutionz-rmm-engineering-password"
 
   cat > "${APPARMOR_DIR}/solutionz-rmm-setup" <<'AAPROFILE_SOLUTIONZ_RMM_SETUP'
-# Policy revision: AA-SOC2-V07111226-R2
+# Policy revision: AA-SOC2-V07111226-R3
 #include <tunables/global>
 profile solutionz-rmm-setup /usr/local/sbin/solutionz-rmm-setup flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
@@ -4787,6 +4787,7 @@ IPF="/etc/sysctl.d/90-solutionz-rmm-no-forwarding.conf"
 SV="/usr/local/sbin/solutionz-rmm-security-validate"
 SVR="/var/lib/rswsolutionz-rmm/security-validation-SOC2-V07111226.result"
 IB="/var/lib/rswsolutionz-rmm/security-baseline-SOC2-V07111226.sha256"
+INTEGRITY="/usr/local/sbin/solutionz-rmm-integrity-baseline"
 FORCE=0
 
 if [[ "${1:-}" == "--force" ]]; then
@@ -4874,6 +4875,8 @@ if [[ -x "$NV" ]]; then
 else
   fail "Network validator missing."
 fi
+
+check "Solutionz integrity baseline validates" "$INTEGRITY" --verify
 
 if [[ -x "$SV" ]]; then
   set +e
@@ -5065,7 +5068,7 @@ final_summary_check() {
   check_final_requirement "Local config sudoers policy installed" test -s "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
   check_final_requirement "Local config sudoers policy valid" visudo -c || failures=$((failures + 1))
   check_final_requirement "Factory technician can launch the SSH and serial menus" bash -c 'sudo -n -l -U "$1" "$2" >/dev/null && sudo -n -l -U "$1" "$2" --serial-auto >/dev/null' _ "${TECHNICIAN_USER}" "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Factory technician has no broad sudo or Engineering group membership" bash -c 'groups=$(id -nG "$1") && ! grep -Eq "(^| )(sudo|$2)( |$)" <<<"$groups" && ! sudo -n -l -U "$1" /bin/bash >/dev/null 2>&1 && ! sudo -n -l -U "$1" "$3" >/dev/null 2>&1' _ "${TECHNICIAN_USER}" "${ENGINEERING_GROUP}" "${INSTALLED_SETUP_COMMAND}" || {
+  check_final_requirement "Factory technician has no broad sudo, Setup grant, or Engineering group membership" bash -c 'groups=$(id -nG "$1") && ! grep -Eq "(^| )(sudo|$2)( |$)" <<<"$groups" && ! sudo -n -l -U "$1" /bin/bash >/dev/null 2>&1 && ! sudo -n -l -U "$1" "$3" >/dev/null 2>&1 && ! sudo -n -l -U "$1" /tmp/Setup >/dev/null 2>&1' _ "${TECHNICIAN_USER}" "${ENGINEERING_GROUP}" "${INSTALLED_SETUP_COMMAND}" || {
     failures=$((failures + 1))
     warning_message "Review effective privileges from an administrator session: id solz_rmm; sudo -l -U solz_rmm. Remove any legacy Setup or broad sudo grant while retaining the managed menu grant."
   }

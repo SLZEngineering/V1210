@@ -198,6 +198,7 @@ NO_POWEROFF=0
 TOTAL_INSTALL_STEPS=17
 PRE_REBOOT_FAILED_CHECKS=()
 CURRENT_STEP="startup"
+UI_FD=1
 
 # Terminal color output. ANSI color is used only for interactive terminals and
 # can be disabled by setting NO_COLOR=1. Log files remain plain text because
@@ -340,6 +341,10 @@ init_logging() {
   # Display command output normally while also preserving a plain-text copy in
   # the installation log. Nothing is intentionally hidden from the console.
   exec > >(tee -i >(sed -u 's/\x1B\[[0-9;]*[mK]//g' >> "${LOG_FILE}")) 2>&1
+}
+
+append_ui_log() {
+  printf '%s\n' "$*"
 }
 
 info_message() {
@@ -2339,8 +2344,8 @@ backup_network_transaction_main() {
   (
     cd "${txdir}"
     : > manifest.sha256
-    [[ -f netplan.yaml ]] && sha256sum netplan.yaml >> manifest.sha256
-    [[ -f profile.json ]] && sha256sum profile.json >> manifest.sha256
+    if [[ -f netplan.yaml ]]; then sha256sum netplan.yaml >> manifest.sha256; fi
+    if [[ -f profile.json ]]; then sha256sum profile.json >> manifest.sha256; fi
   )
   chmod 600 "${txdir}"/* 2>/dev/null || true
   SETUP_NETWORK_TRANSACTION="${txdir}"
@@ -2944,8 +2949,8 @@ create_transaction() {
   (
     cd "$txdir"
     : > manifest.sha256
-    [[ -f netplan.yaml ]] && sha256sum netplan.yaml >> manifest.sha256
-    [[ -f profile.json ]] && sha256sum profile.json >> manifest.sha256
+    if [[ -f netplan.yaml ]]; then sha256sum netplan.yaml >> manifest.sha256; fi
+    if [[ -f profile.json ]]; then sha256sum profile.json >> manifest.sha256; fi
   )
   chmod 600 "$txdir"/* 2>/dev/null || true
   CURRENT_TRANSACTION="$txdir"

@@ -622,14 +622,13 @@ record_failure_and_exit() {
     "result_file=${PHASE1_FAILURE_RESULT_FILE}" \
     "log=${LOG_FILE}"
 
-  printf ' %s[!] INSTALLATION FAILED%s\n' "${COLOR_RED}" "${COLOR_RESET}" >&${UI_FD}
-  printf ' %s[!] Step: %s%s\n' "${COLOR_RED}" "${CURRENT_STEP}" "${COLOR_RESET}" >&${UI_FD}
-  printf ' %s[!] Line: %s%s\n' "${COLOR_RED}" "${line}" "${COLOR_RESET}" >&${UI_FD}
-  printf ' %s[!] Exit code: %s%s\n' "${COLOR_RED}" "${rc}" "${COLOR_RESET}" >&${UI_FD}
-  printf ' %s[!] Command: %s%s\n' "${COLOR_RED}" "${command}" "${COLOR_RESET}" >&${UI_FD}
-  printf ' %s[!] Failure result: %s%s\n' "${COLOR_RED}" "${PHASE1_FAILURE_RESULT_FILE}" "${COLOR_RESET}" >&${UI_FD}
-  printf ' %s[!] Log: %s%s\n' "${COLOR_RED}" "${LOG_FILE}" "${COLOR_RESET}" >&${UI_FD}
-  append_ui_log "INSTALLATION FAILED | step=${CURRENT_STEP} | line=${line} | exit_code=${rc} | command=${command} | result=${PHASE1_FAILURE_RESULT_FILE} | log=${LOG_FILE}"
+  printf ' %s[!] INSTALLATION FAILED%s\n' "${COLOR_RED}" "${COLOR_RESET}" >&2
+  printf ' %s[!] Step: %s%s\n' "${COLOR_RED}" "${CURRENT_STEP}" "${COLOR_RESET}" >&2
+  printf ' %s[!] Line: %s%s\n' "${COLOR_RED}" "${line}" "${COLOR_RESET}" >&2
+  printf ' %s[!] Exit code: %s%s\n' "${COLOR_RED}" "${rc}" "${COLOR_RESET}" >&2
+  printf ' %s[!] Command: %s%s\n' "${COLOR_RED}" "${command}" "${COLOR_RESET}" >&2
+  printf ' %s[!] Failure result: %s%s\n' "${COLOR_RED}" "${PHASE1_FAILURE_RESULT_FILE}" "${COLOR_RESET}" >&2
+  printf ' %s[!] Log: %s%s\n' "${COLOR_RED}" "${LOG_FILE}" "${COLOR_RESET}" >&2
   exit "${rc}"
 }
 
@@ -657,11 +656,10 @@ error_exit() {
   } > "${PHASE1_FAILURE_RESULT_FILE}"
   chmod 640 "${PHASE1_FAILURE_RESULT_FILE}"
 
-  printf ' %s[!] ERROR: %s%s\n' "${COLOR_RED}" "${message}" "${COLOR_RESET}" >&${UI_FD}
-  printf ' %s[!] Step: %s%s\n' "${COLOR_RED}" "${CURRENT_STEP}" "${COLOR_RESET}" >&${UI_FD}
-  printf ' %s[!] Failure result: %s%s\n' "${COLOR_RED}" "${PHASE1_FAILURE_RESULT_FILE}" "${COLOR_RESET}" >&${UI_FD}
-  printf ' %s[!] Log: %s%s\n' "${COLOR_RED}" "${LOG_FILE}" "${COLOR_RESET}" >&${UI_FD}
-  append_ui_log "ERROR | step=${CURRENT_STEP} | message=${message} | result=${PHASE1_FAILURE_RESULT_FILE} | log=${LOG_FILE}"
+  printf ' %s[!] ERROR: %s%s\n' "${COLOR_RED}" "${message}" "${COLOR_RESET}" >&2
+  printf ' %s[!] Step: %s%s\n' "${COLOR_RED}" "${CURRENT_STEP}" "${COLOR_RESET}" >&2
+  printf ' %s[!] Failure result: %s%s\n' "${COLOR_RED}" "${PHASE1_FAILURE_RESULT_FILE}" "${COLOR_RESET}" >&2
+  printf ' %s[!] Log: %s%s\n' "${COLOR_RED}" "${LOG_FILE}" "${COLOR_RESET}" >&2
 
   write_state "phase1_failed" \
     "error=${message}" \
@@ -688,9 +686,9 @@ prompt_confirmation() {
 
 Solutionz RMM Agent Build - Revision ${REVISION}
 Created by Reiko Seneathia Williams
-\e[0m" >&${UI_FD}
+\e[0m" >&2
 
-  cat >&${UI_FD} <<EOF
+  cat >&2 <<EOF
 This script will:
   1. Validate the Ubuntu 24.04 LTS OS family and Protectli V1210 hardware.
   2. Record the manufacturer-delivered OS/package state before modification.
@@ -718,11 +716,11 @@ Domotz note:
   recorded for audit and support.
 EOF
 
-  printf "Type 'yes' to proceed: " >&${UI_FD}
+  printf "Type 'yes' to proceed: " >&2
   read -r confirmation1
   [[ "${confirmation1}" == "yes" ]] || error_exit "Confirmation not received."
 
-  printf "Type 'yes' again to confirm production configuration changes: " >&${UI_FD}
+  printf "Type 'yes' again to confirm production configuration changes: " >&2
   read -r confirmation2
   [[ "${confirmation2}" == "yes" ]] || error_exit "Second confirmation not received."
 }
@@ -5269,7 +5267,7 @@ main() {
   fi
   init_logging
 
-  printf '\n%sSolutionz RMM Agent Installation%s\n' "${COLOR_CYAN}" "${COLOR_RESET}" >&${UI_FD}
+  printf '\n%sSolutionz RMM Agent Installation%s\n' "${COLOR_CYAN}" "${COLOR_RESET}" >&2
   info_message "Revision ${REVISION} | Release ${RELEASE_DATE}"
   info_message "Command output is displayed on the console and recorded in ${LOG_FILE}."
 

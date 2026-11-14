@@ -3590,6 +3590,35 @@ engineering_password_transition() {
     "sudo -n ${LOCAL_CONFIG_TOOL} ${direct_arg}" || true
 }
 
+engineering_shell_entry() {
+  local invoking_user="${SUDO_USER:-}" eng_home
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    echo "ERROR: Shell requires an interactive terminal." >&2
+    return 1
+  fi
+  if engineering_session_authenticated; then
+    eng_home="$(getent passwd "${ENGINEERING_USER}" | cut -d: -f6)"
+    [[ -n "${eng_home}" ]] || return 1
+    echo "Opening Engineering shell. Type exit to return to the menu."
+    runuser -u "${ENGINEERING_USER}" -- env HOME="${eng_home}" USER="${ENGINEERING_USER}" LOGNAME="${ENGINEERING_USER}" SHELL=/bin/bash TERM="${TERM:-xterm}" PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -i
+    return $?
+  fi
+  if [[ -z "${invoking_user}" || "${invoking_user}" == root || "${invoking_user}" == "${ENGINEERING_USER}" ]] || ! id -nG "${invoking_user}" 2>/dev/null | tr ' ' '\n' | grep -qx 'solutionz-rmm-tech'; then
+    echo "ERROR: Shell requires an authenticated technician or Engineering session." >&2
+    return 1
+  fi
+  echo "Enter the ${ENGINEERING_USER} password. Type exit to return to the menu."
+  # Drop to the original technician UID before su so PAM authenticates the
+  # Engineering password. Do not start a login shell that relaunches the menu.
+  # The new PTY isolates the authenticated shell from the technician terminal.
+  if runuser -u "${invoking_user}" -- /bin/su --pty -s /bin/bash -c 'cd -- "$HOME" && exec /bin/bash --noprofile --norc -i' "${ENGINEERING_USER}"; then
+    return 0
+  else
+    echo "Engineering shell authentication or session failed." >&2
+    return 1
+  fi
+}
+
 engineering_tools_entry() {
   if engineering_session_authenticated; then
     engineering_access
@@ -3823,6 +3852,7 @@ Solutionz RMM Dual-Homed Network Configuration - Revision V06.100626N
 9) Engineering Tools / Setup Script (engineering authentication required)
 10) Register NEW Domotz Collector Now (technician or engineering)
 11) Log out
+12) Shell (Engineering authentication required)
 
 eth0 = WAN/cloud | eth1 = AV/control LAN | VLANs on eth1 | forwarding disabled
 Address entry = IPv4 only in this revision | exactly 4 octets (0-255) | static CIDR /1-/30 | IPv6 rejected
@@ -3852,6 +3882,7 @@ MENU
     9) engineering_tools_entry ;;
     10) domotz_register_new_now || true ;;
     11) if (( AUTO )); then exit 90; else exit 0; fi ;;
+    12) engineering_shell_entry || true ;;
     *) echo "Invalid selection." ;;
   esac
 done

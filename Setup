@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 ###############################################################################
-# Script: SOC2-V07111226
+# Script: V06.100626N
 # Company: Solutionz INC / RSW
-# Revision: SOC2-V07111226
+# Revision: V06.100626N
 # Created by Reiko Seneathia Williams
-# Release Date: 2026-11-12
+# Release Date: 2026-10-06
 # Dual-Homed WAN/LAN + Auto-Validation Update: 2026-10-18
 # Security Hardening Update: 2026-11-03
 # Live Network Discovery Update: 2026-11-03
 # Production Gate / Offline Preload Update: 2026-11-12
-# SOC 2 / AppArmor Least-Privilege Update: 2026-11-12
 # Mass-Production / Refurbishment Workflow Update: 2026-11-12
-# Attached Baseline Feature-Parity / Direct Engineering Shell Update: 2026-11-13
 #
 # Purpose:
 #   Build and harden the Solutionz RMM Agent on the approved Protectli V1210
@@ -36,14 +34,9 @@ set -Eeuo pipefail
 #   - Domotz is intentionally not revision-pinned. The installed Snap revision
 #     is recorded for audit, and updates are governed by operating policy.
 #   - The V1210 USB-C port labeled COM is a serial console, not USB Ethernet.
-#     Authenticated technician and Engineering interactive logins enter the
-#     Solutionz configuration menu. solz_rmm remains menu-only. solz_eng uses
-#     the approved SSH private key for remote login and can enter the Engineering
-#     shell only through an explicit Engineering menu option.
-#   - Fresh/unprovisioned appliances receive the approved baseline local solz_eng
-#     password via a one-way SHA-512 crypt hash. The plaintext password is never
-#     stored or logged. Existing configured Engineering passwords are preserved.
-#     SSH for solz_eng remains public-key-only regardless of local password state.
+#     This script exposes an authenticated login on ttyS0 and automatically
+#     launches the Solutionz local configuration menu after a successful USB-C
+#     COM login. Technicians do not need to type a Linux command to open it.
 #   - Ubuntu 24.04 LTS is the controlled OS family. Supported Noble point
 #     releases include Ubuntu 24.04.4 LTS.
 #   - Network changes are staged and take effect after manual reboot unless the
@@ -80,14 +73,9 @@ set -Eeuo pipefail
 #     state. Netplan remains the persistent configuration mechanism across reboot.
 #     A true static address that has never been configured or delivered by DHCP
 #     cannot be inferred safely and is therefore never guessed.
-#   - Role-specific AppArmor enforcement profiles are installed for every
-#     Solutionz-developed executable component. Validation, configuration,
-#     deployment, integrity, post-reboot validation and cloud-registration
-#     processes are separately confined. Domotz Snap confinement remains managed
-#     by snapd and its required interfaces/confinement level are independently
-#     validated by the Solutionz security baseline.
-#   - Secure Boot, TPM-backed disk encryption, CIS remediation and SIEM/EDR are
-#     not auto-enabled by this build and remain separate operational controls.
+#   - Secure Boot, TPM-backed disk encryption, CIS remediation, SIEM/EDR and
+#     custom AppArmor application profiles are not auto-enabled by this build.
+#     They remain Phase-2 controls requiring V1210/Domotz compatibility testing.
 #   - NTP synchronization is standardized on systemd-timesyncd. Phase 2 is not
 #     gated by time-sync.target; validators perform a bounded 180-second current-boot
 #     synchronization check so NTP failure is reported instead of blocking validation.
@@ -96,16 +84,14 @@ set -Eeuo pipefail
 #     match is diagnostic only and is not a production failure criterion.
 ###############################################################################
 
-REVISION="SOC2-V07111226"
-SCRIPT_NAME="SOC2-V07111226"
-RELEASE_DATE="2026-11-12"
+REVISION="V06.100626N"
+SCRIPT_NAME="V06.100626N"
+RELEASE_DATE="2026-10-06"
 NETWORK_FEATURE_UPDATE_DATE="2026-10-18"
 SECURITY_FEATURE_UPDATE_DATE="2026-11-03"
 LIVE_DISCOVERY_UPDATE_DATE="2026-11-03"
 PRODUCTION_GATE_UPDATE_DATE="2026-11-12"
 MASS_PRODUCTION_WORKFLOW_UPDATE_DATE="2026-11-12"
-SOC2_APPARMOR_UPDATE_DATE="2026-11-12"
-FEATURE_PARITY_UPDATE_DATE="2026-11-13"
 
 SUPPORTED_OS_ID="ubuntu"
 SUPPORTED_UBUNTU_VERSION_ID="24.04"
@@ -118,18 +104,6 @@ SUPPORTED_MODEL="V1210"
 # installed revision is recorded for audit/troubleshooting. Update timing is
 # governed operationally rather than by hard-coding a revision in this script.
 DOMOTZ_SNAP_NAME="domotzpro-agent-publicstore"
-
-# Optional mass-production Domotz registration defaults. The endpoint and key-name
-# are non-secret. The Collector Activation Key is intentionally NOT embedded in
-# this SOC2 build; supply it at build time through SOLUTIONZ_RMM_DOMOTZ_ACTIVATION_KEY.
-# When supplied, Setup stages it in a root-only provisioning-defaults file for the
-# same technician-assisted NEW-collector registration workflow used by the baseline.
-DOMOTZ_PUBLIC_ENDPOINT_DEFAULT="https://api-us-east-1-cell-1.domotz.com/public-api/v1/"
-DOMOTZ_COLLECTOR_ACTIVATION_KEY_NAME_DEFAULT="Solutionz RMM V1210 Deployment"
-DOMOTZ_COLLECTOR_ACTIVATION_KEY_DEFAULT=""
-DOMOTZ_PUBLIC_ENDPOINT="${SOLUTIONZ_RMM_DOMOTZ_PUBLIC_ENDPOINT:-${DOMOTZ_PUBLIC_ENDPOINT_DEFAULT}}"
-DOMOTZ_COLLECTOR_ACTIVATION_KEY_NAME="${SOLUTIONZ_RMM_DOMOTZ_ACTIVATION_KEY_NAME:-${DOMOTZ_COLLECTOR_ACTIVATION_KEY_NAME_DEFAULT}}"
-DOMOTZ_COLLECTOR_ACTIVATION_KEY="${SOLUTIONZ_RMM_DOMOTZ_ACTIVATION_KEY:-${DOMOTZ_COLLECTOR_ACTIVATION_KEY_DEFAULT}}"
 
 LOG_DIR="/var/log/solutionz-rmm/setup"
 RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -150,7 +124,6 @@ NETWORK_PROFILE_FILE="${NETWORK_PROFILE_DIR}/network-profile.json"
 NETWORK_PROFILE_TOOL="/usr/local/sbin/solutionz-rmm-network-profile"
 NETWORK_PROFILE_RESULT_FILE="${STATE_DIR}/network-profile-${REVISION}.result"
 NETWORK_PROFILE_SOURCE=""
-PRESERVE_EXISTING_NETWORK_PROFILE=0
 NETWORK_TRANSACTION_DIR="${STATE_DIR}/network-transactions/engineering"
 NETPLAN_ARCHIVE_DIR="${STATE_DIR}/netplan-archives"
 NETWORK_LOCK_FILE="/run/lock/solutionz-rmm-network.lock"
@@ -185,64 +158,24 @@ SECURITY_APT_POLICY_FILE="/etc/apt/apt.conf.d/52solutionz-rmm-security-updates"
 INSTALLED_SCRIPT_COPY="/usr/local/share/solutionz-rmm/${REVISION}"
 FIELD_TECH_GROUP="solutionz-rmm-tech"
 ENGINEERING_GROUP="solutionz-rmm-engineering"
-TECHNICIAN_USER="${SOLUTIONZ_RMM_TECHNICIAN_USER:-solz_rmm}"
-ENGINEERING_USER="${SOLUTIONZ_RMM_ENGINEERING_USER:-solz_eng}"
-ENGINEERING_HOME="/home/${ENGINEERING_USER}"
+ENGINEERING_USER="solz_eng"
+ENGINEERING_HOME="/home/solz_eng"
 ENGINEERING_AUTHORIZED_KEYS="${ENGINEERING_HOME}/.ssh/authorized_keys"
 ENGINEERING_KEY_FINGERPRINT_FILE="${STATE_DIR}/engineering-ssh-key-${REVISION}.fingerprint"
 ENGINEERING_PASSWORD_MARKER="${STATE_DIR}/engineering-password-provisioned"
 ENGINEERING_SSH_PUBLIC_KEY_DEFAULT="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID+1eabf+qtPdaR33oTrQPTl1GV3Ru/1xsFklfa1Sbfv Solutionz RMM Engineering"
-ENGINEERING_SSH_PUBLIC_KEY="${SOLUTIONZ_RMM_ENGINEERING_SSH_PUBLIC_KEY:-${ENGINEERING_SSH_PUBLIC_KEY_DEFAULT}}"
 ENGINEERING_SSH_FINGERPRINT_EXPECTED="SHA256:F8aZDgPAP4X7ofp2wjQSed9rWzhs7xcCLMas39JFWa0"
-# The approved baseline local Engineering password is retained only as a one-way
-# SHA-512 crypt hash. SSH remains public-key-only regardless of this local password.
-ENGINEERING_DEFAULT_PASSWORD_HASH_DEFAULT='$6$ZW5peV.ARuXyhI5t$lys38PO0hLihNoI3YyDr51dtwP39qNEXIsUzJqRXp6u91B8/vtDhJVWbI/xpAVjczsAfB7NReXUZ2D8s4KDll.'
-ENGINEERING_DEFAULT_PASSWORD_HASH="${SOLUTIONZ_RMM_ENGINEERING_PASSWORD_HASH:-${ENGINEERING_DEFAULT_PASSWORD_HASH_DEFAULT}}"
 INSTALLED_SETUP_COMMAND="/usr/local/sbin/solutionz-rmm-setup"
 DOMOTZ_ACTIVATION_TOOL="/usr/local/sbin/solutionz-domotz-activate"
 DOMOTZ_ACTIVATION_CONFIG="/etc/solutionz-rmm/domotz-activation.json"
 DOMOTZ_ACTIVATION_RESULT="/var/lib/solutionz-domotz-activation/result.json"
-DOMOTZ_PROVISIONING_DEFAULTS="/etc/solutionz-rmm/domotz-provisioning-defaults.json"
 DOMOTZ_ACTIVATION_SERVICE="/etc/systemd/system/solutionz-domotz-activate.service"
 DOMOTZ_ACTIVATION_TIMER="/etc/systemd/system/solutionz-domotz-activate.timer"
 GRUB_FILE="/etc/default/grub"
 MOTD_FILE="/etc/update-motd.d/slz-rsw-login"
-# All authenticated interactive login paths enter the menu. This replaces the
-# older serial-only profile while preserving USB-C behavior.
-SERIAL_PROFILE_FILE="/etc/profile.d/solutionz-rmm-access.sh"
+SERIAL_PROFILE_FILE="/etc/profile.d/solutionz-rmm-serial.sh"
 LOCAL_CONFIG_TOOL="/usr/local/sbin/solutionz-rmm-local-config"
 LOCAL_CONFIG_SUDOERS_FILE="/etc/sudoers.d/solutionz-rmm-local-config"
-ENGINEERING_SHELL_TOOL="/usr/local/sbin/solutionz-rmm-engineering-shell"
-ENGINEERING_PASSWORD_TOOL="/usr/local/sbin/solutionz-rmm-engineering-password"
-APPARMOR_POLICY_REVISION="AA-SOC2-V07111226"
-APPARMOR_DIR="/etc/apparmor.d"
-APPARMOR_COMMON_ABSTRACTION="${APPARMOR_DIR}/abstractions/solutionz-rmm-common"
-APPARMOR_PROFILE_FILES=(
-  "${APPARMOR_DIR}/solutionz-rmm-setup"
-  "${APPARMOR_DIR}/solutionz-rmm-local-config"
-  "${APPARMOR_DIR}/solutionz-rmm-network-profile"
-  "${APPARMOR_DIR}/solutionz-rmm-network-validate"
-  "${APPARMOR_DIR}/solutionz-rmm-live-network-discovery"
-  "${APPARMOR_DIR}/solutionz-rmm-security-validate"
-  "${APPARMOR_DIR}/solutionz-rmm-integrity-baseline"
-  "${APPARMOR_DIR}/solutionz-rmm-postreboot-validate"
-  "${APPARMOR_DIR}/solutionz-domotz-activate"
-  "${APPARMOR_DIR}/solutionz-rmm-engineering-shell"
-  "${APPARMOR_DIR}/solutionz-rmm-engineering-password"
-)
-APPARMOR_REQUIRED_PROFILES=(
-  solutionz-rmm-setup
-  solutionz-rmm-local-config
-  solutionz-rmm-network-profile
-  solutionz-rmm-network-validate
-  solutionz-rmm-live-network-discovery
-  solutionz-rmm-security-validate
-  solutionz-rmm-integrity-baseline
-  solutionz-rmm-postreboot-validate
-  solutionz-domotz-activate
-  solutionz-rmm-engineering-shell
-  solutionz-rmm-engineering-password
-)
 
 SERIAL_DEVICE="/dev/ttyS0"
 SERIAL_SERVICE="serial-getty@ttyS0.service"
@@ -342,10 +275,6 @@ Options:
   --non-interactive             Mass-production/unattended mode; skip the two manual confirmation prompts.
   --network-profile <json>      Stage, validate, and render the supplied WAN/LAN/VLAN
                                 JSON profile before it is committed to the appliance.
-  --preserve-existing-network-profile
-                                Preserve/re-render an existing valid Solutionz network
-                                profile instead of resetting to the factory default.
-                                Refurb/manual rebuilds otherwise use a fresh baseline.
   --activation-status           Show build and Domotz activation/deployment status only.
   --prepare-deployment          Arm the staged Domotz registration for the next boot, then power off.
   --prepare-deployment --no-poweroff
@@ -371,9 +300,6 @@ parse_args() {
         ;;
       --network-profile=*)
         NETWORK_PROFILE_SOURCE="${1#*=}"
-        ;;
-      --preserve-existing-network-profile)
-        PRESERVE_EXISTING_NETWORK_PROFILE=1
         ;;
       --activation-status)
         ACTION_MODE="activation_status"
@@ -495,7 +421,7 @@ detect_setup_context() {
 
 record_network_requirements() {
   cat > "${NETWORK_REQUIREMENTS_FILE}" <<'EOF'
-Solutionz RMM Agent Network Requirements - Revision SOC2-V07111226
+Solutionz RMM Agent Network Requirements - Revision V06.100626N
 
 Dual-homed interface model
 - eth0 = WAN/cloud uplink. eth0 is the only interface allowed to own the IPv4
@@ -561,8 +487,7 @@ Host security baseline
 - Dedicated solutionz-rmm-tech and solutionz-rmm-engineering groups separate controlled field configuration from engineering administration.
 - The field configuration menu does not expose an unrestricted Linux shell option.
 - auditd records changes to Solutionz-controlled network, SSH, firewall, sysctl, systemd, utility and state paths.
-- AppArmor is enabled with Solutionz role-specific enforcing profiles for all Solutionz-developed executables.
-- Domotz remains snapd-confined; the security validator verifies strict Snap confinement and required interfaces.
+- AppArmor remains enabled as an OS mandatory-access-control layer.
 - A SHA-256 integrity baseline protects Solutionz scripts and security/network configuration files.
 - The security validator flags unexpected network-reachable TCP listeners beyond approved TCP 22/3000.
 - Security updates use a controlled maintenance policy: unattended installation and automatic reboot are disabled.
@@ -780,25 +705,9 @@ report_ntp_diagnostics() {
   systemctl status systemd-timesyncd.service --no-pager -l 2>/dev/null | sed -n '1,40p' || true
 }
 
-validate_engineering_access_preflight() {
-  local key="${ENGINEERING_SSH_PUBLIC_KEY}" key_blob
-  [[ -n "${key}" ]] || error_exit "Solutionz engineering SSH public key is not configured."
-  [[ "${key}" == ssh-ed25519\ * ]] || error_exit "Engineering SSH key must be a single OpenSSH ED25519 public-key line beginning with 'ssh-ed25519 '."
-  [[ "${key}" != *$'\n'* && "${key}" != *$'\r'* ]] || error_exit "Engineering SSH public key must be a single line."
-  [[ "${key}" != *"PRIVATE KEY"* ]] || error_exit "A private SSH key was supplied where a public key is required. Never place the engineering private key in Setup."
-  key_blob="$(awk '{print $2}' <<<"${key}")"
-  [[ -n "${key_blob}" ]] || error_exit "Engineering SSH public key is missing its key data."
-  printf '%s' "${key_blob}" | base64 -d >/dev/null 2>&1 || error_exit "Engineering SSH public key data is not valid base64/OpenSSH key material."
-
-  [[ -n "${ENGINEERING_DEFAULT_PASSWORD_HASH}" ]] || error_exit "Default engineering password hash is empty."
-  [[ "${ENGINEERING_DEFAULT_PASSWORD_HASH}" == '$6$'* ]] || error_exit "Default engineering password hash must be a SHA-512 crypt hash beginning with \$6\$."
-  progress_message "Engineering SSH public-key and local-password-hash preflight validation passed."
-}
-
 preflight_checks() {
   step_message 1 "Preflight validation"
 
-  validate_engineering_access_preflight
   [[ -r /etc/os-release ]] || error_exit "/etc/os-release not found."
   # shellcheck disable=SC1091
   source /etc/os-release
@@ -1102,7 +1011,7 @@ configure_time_sync() {
   systemctl list-unit-files systemd-timesyncd.service >/dev/null 2>&1 || \
     error_exit "systemd-timesyncd.service is unavailable; the required systemd-timesyncd package is not installed correctly."
 
-  # Revision SOC2-V07111226 standardizes Ubuntu time synchronization on
+  # Revision V06.100626N standardizes Ubuntu time synchronization on
   # systemd-timesyncd. timedatectl enables network time, while the explicit
   # service commands make the runtime/startup state deterministic.
   timedatectl set-ntp true >/dev/null 2>&1 || \
@@ -1115,7 +1024,7 @@ configure_time_sync() {
   # Phase 2 must never be blocked behind time-sync.target. On networks where
   # UDP/123 is delayed or blocked, systemd-time-wait-sync can hold time-sync.target
   # indefinitely and prevent the post-reboot validator from running at all.
-  # Revision SOC2-V07111226 therefore lets the validator start after network-online and
+  # Revision V06.100626N therefore lets the validator start after network-online and
   # systemd-timesyncd, then performs its own bounded 180-second synchronization
   # wait and records a PASS/FAIL result in install.state.
   systemctl is-enabled --quiet systemd-timesyncd.service || \
@@ -1175,16 +1084,9 @@ error_exit "Domotz Snap installation failed."
   cat "${SNAP_BASELINE_FILE}"
 }
 
-domotz_snap_confinement_is_strict() {
-  local confinement
-  confinement="$(snap info --verbose "${DOMOTZ_SNAP_NAME}" 2>/dev/null | awk '$1=="confinement:" {print $2; exit}')"
-  [[ "$confinement" == "strict" ]]
-}
-
 configure_domotz_permissions() {
   step_message 8 "Connect and verify required Domotz permissions"
 
-  domotz_snap_confinement_is_strict || error_exit "Domotz Snap is not strictly confined; production requires strict snap confinement."
   local permission
   for permission in "${REQUIRED_DOMOTZ_PERMISSIONS[@]}"; do
     progress_message "Connecting Domotz permission: ${permission}"
@@ -1244,10 +1146,10 @@ install_security_integrity_tool() {
   cat > "${INTEGRITY_TOOL}" <<'INTEGRITYTOOL'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-REVISION="SOC2-V07111226"
-BASELINE="/var/lib/rswsolutionz-rmm/security-baseline-SOC2-V07111226.sha256"
+REVISION="V06.100626N"
+BASELINE="/var/lib/rswsolutionz-rmm/security-baseline-V06.100626N.sha256"
 FILES=(
-  "/usr/local/share/solutionz-rmm/SOC2-V07111226"
+  "/usr/local/share/solutionz-rmm/V06.100626N"
   "/usr/local/sbin/solutionz-rmm-network-profile"
   "/usr/local/sbin/solutionz-rmm-network-validate"
   "/usr/local/sbin/solutionz-rmm-live-network-discovery"
@@ -1256,8 +1158,6 @@ FILES=(
   "/usr/local/sbin/solutionz-rmm-local-config"
   "/usr/local/sbin/solutionz-rmm-setup"
   "/usr/local/sbin/solutionz-domotz-activate"
-  "/usr/local/sbin/solutionz-rmm-engineering-shell"
-  "/usr/local/sbin/solutionz-rmm-engineering-password"
   "/usr/local/sbin/rswsolutionz-rmm-postreboot-validate"
   "/etc/solutionz-rmm/network-profile.json"
   "/etc/netplan/00-installer-config.yaml"
@@ -1268,24 +1168,12 @@ FILES=(
   "/etc/apt/apt.conf.d/52solutionz-rmm-security-updates"
   "/etc/default/ufw"
   "/etc/ufw/user.rules"
-  "/etc/profile.d/solutionz-rmm-access.sh"
+  "/etc/profile.d/solutionz-rmm-serial.sh"
   "/etc/sudoers.d/solutionz-rmm-local-config"
   "/etc/systemd/system/solutionz-domotz-activate.service"
   "/etc/systemd/system/solutionz-domotz-activate.timer"
   "/home/solz_eng/.ssh/authorized_keys"
-  "/var/lib/rswsolutionz-rmm/engineering-ssh-key-SOC2-V07111226.fingerprint"
-  "/etc/apparmor.d/abstractions/solutionz-rmm-common"
-  "/etc/apparmor.d/solutionz-rmm-setup"
-  "/etc/apparmor.d/solutionz-rmm-local-config"
-  "/etc/apparmor.d/solutionz-rmm-network-profile"
-  "/etc/apparmor.d/solutionz-rmm-network-validate"
-  "/etc/apparmor.d/solutionz-rmm-live-network-discovery"
-  "/etc/apparmor.d/solutionz-rmm-security-validate"
-  "/etc/apparmor.d/solutionz-rmm-integrity-baseline"
-  "/etc/apparmor.d/solutionz-rmm-postreboot-validate"
-  "/etc/apparmor.d/solutionz-domotz-activate"
-  "/etc/apparmor.d/solutionz-rmm-engineering-shell"
-  "/etc/apparmor.d/solutionz-rmm-engineering-password"
+  "/var/lib/rswsolutionz-rmm/engineering-ssh-key-V06.100626N.fingerprint"
 )
 usage(){ echo "Usage: $(basename "$0") --refresh|--verify"; }
 case "${1:-}" in
@@ -1315,30 +1203,23 @@ install_security_validator() {
   cat > "${SECURITY_VALIDATOR}" <<'SECURITYVALIDATOR'
 #!/usr/bin/env bash
 set -uo pipefail
-REVISION="SOC2-V07111226"
-RESULT="/var/lib/rswsolutionz-rmm/security-validation-SOC2-V07111226.result"
+REVISION="V06.100626N"
+RESULT="/var/lib/rswsolutionz-rmm/security-validation-V06.100626N.result"
 SYSCTL_FILE="/etc/sysctl.d/91-solutionz-rmm-security.conf"
 SSH_FILE="/etc/ssh/sshd_config.d/99-solutionz-rmm-hardening.conf"
 AUDIT_FILE="/etc/audit/rules.d/99-solutionz-rmm.rules"
 APT_POLICY="/etc/apt/apt.conf.d/52solutionz-rmm-security-updates"
 INTEGRITY="/usr/local/sbin/solutionz-rmm-integrity-baseline"
-BASELINE="/var/lib/rswsolutionz-rmm/security-baseline-SOC2-V07111226.sha256"
+BASELINE="/var/lib/rswsolutionz-rmm/security-baseline-V06.100626N.sha256"
 TECH_GROUP="solutionz-rmm-tech"
 ENG_GROUP="solutionz-rmm-engineering"
 ENG_USER="solz_eng"
 ENG_KEYS="/home/solz_eng/.ssh/authorized_keys"
 ENG_FP_EXPECTED="SHA256:F8aZDgPAP4X7ofp2wjQSed9rWzhs7xcCLMas39JFWa0"
-ENG_FP_FILE="/var/lib/rswsolutionz-rmm/engineering-ssh-key-SOC2-V07111226.fingerprint"
-ENG_PASSWORD_MARKER="/var/lib/rswsolutionz-rmm/engineering-password-provisioned"
-ACCESS_PROFILE="/etc/profile.d/solutionz-rmm-access.sh"
+ENG_FP_FILE="/var/lib/rswsolutionz-rmm/engineering-ssh-key-V06.100626N.fingerprint"
 LOCALCFG="/usr/local/sbin/solutionz-rmm-local-config"
 LIVE="/usr/local/sbin/solutionz-rmm-live-network-discovery"
-LIVE_RESULT="/var/lib/rswsolutionz-rmm/network-live-discovery-SOC2-V07111226.result"
-APPARMOR_POLICY_REVISION="AA-SOC2-V07111226"
-APPARMOR_REQUIRED_PROFILES=(solutionz-rmm-setup solutionz-rmm-local-config solutionz-rmm-network-profile solutionz-rmm-network-validate solutionz-rmm-live-network-discovery solutionz-rmm-security-validate solutionz-rmm-integrity-baseline solutionz-rmm-postreboot-validate solutionz-domotz-activate solutionz-rmm-engineering-shell solutionz-rmm-engineering-password)
-APPARMOR_REQUIRED_FILES=(/etc/apparmor.d/abstractions/solutionz-rmm-common /etc/apparmor.d/solutionz-rmm-setup /etc/apparmor.d/solutionz-rmm-local-config /etc/apparmor.d/solutionz-rmm-network-profile /etc/apparmor.d/solutionz-rmm-network-validate /etc/apparmor.d/solutionz-rmm-live-network-discovery /etc/apparmor.d/solutionz-rmm-security-validate /etc/apparmor.d/solutionz-rmm-integrity-baseline /etc/apparmor.d/solutionz-rmm-postreboot-validate /etc/apparmor.d/solutionz-domotz-activate /etc/apparmor.d/solutionz-rmm-engineering-shell /etc/apparmor.d/solutionz-rmm-engineering-password)
-DOMOTZ_SNAP="domotzpro-agent-publicstore"
-DOMOTZ_REQUIRED_INTERFACES=(firewall-control network-observe raw-usb shutdown system-observe)
+LIVE_RESULT="/var/lib/rswsolutionz-rmm/network-live-discovery-V06.100626N.result"
 F=(); W=()
 pass(){ echo "PASS - $*"; }
 fail(){ echo "FAIL - $*"; F+=("$*"); }
@@ -1397,7 +1278,7 @@ if command -v sshd >/dev/null 2>&1 && sshd -t >/dev/null 2>&1; then
   TECH_SSH_EFFECTIVE="$(sshd -T -C user=solz_rmm,host=localhost,addr=127.0.0.1 2>/dev/null || true)"
   grep -q '^forcecommand sudo -n /usr/local/sbin/solutionz-rmm-local-config$' <<<"$TECH_SSH_EFFECTIVE" && pass "solz_rmm SSH is forced into the network configuration menu." || fail "solz_rmm SSH is not forced into the network configuration menu."
   ENG_SSH_EFFECTIVE="$(sshd -T -C user=solz_eng,host=localhost,addr=127.0.0.1 2>/dev/null || true)"
-  grep -q '^forcecommand sudo -n /usr/local/sbin/solutionz-rmm-local-config --engineering-auto$' <<<"$ENG_SSH_EFFECTIVE" && pass "solz_eng SSH is forced into authenticated Engineering menu mode." || fail "solz_eng SSH ForceCommand is not the Engineering menu."
+  grep -q '^forcecommand none$' <<<"$ENG_SSH_EFFECTIVE" && pass "solz_eng SSH opens the Engineering login shell directly." || fail "solz_eng SSH is unexpectedly forced to another command instead of the Engineering shell."
   grep -q '^passwordauthentication no$' <<<"$ENG_SSH_EFFECTIVE" && pass "solz_eng SSH password authentication disabled." || fail "solz_eng SSH password authentication is not disabled."
   grep -q '^authenticationmethods publickey$' <<<"$ENG_SSH_EFFECTIVE" && pass "solz_eng SSH requires public-key authentication." || fail "solz_eng SSH does not require public-key authentication."
 else
@@ -1419,9 +1300,6 @@ else
   fail "Engineering authorized_keys missing."
 fi
 [[ -s "$ENG_FP_FILE" ]] && grep -qx "$ENG_FP_EXPECTED" "$ENG_FP_FILE" && pass "Engineering SSH fingerprint audit record matches approved key." || fail "Engineering SSH fingerprint audit record missing/mismatched."
-[[ "$(passwd -S "$ENG_USER" 2>/dev/null | awk '{print $2}')" == "P" ]] && pass "Engineering local password is configured for console/sudo recovery." || fail "Engineering local password is not configured."
-[[ -s "$ENG_PASSWORD_MARKER" ]] && pass "Engineering password provisioning marker exists." || fail "Engineering password provisioning marker missing."
-[[ -s "$ACCESS_PROFILE" ]] && grep -q -- '--engineering-auto' "$ACCESS_PROFILE" && grep -q -- '--serial-auto' "$ACCESS_PROFILE" && pass "All-interactive login policy routes Engineering and technician logins through the menu." || fail "All-interactive login menu policy missing/incomplete."
 if [[ -x "$LOCALCFG" ]] && ! grep -q 'Open Linux shell' "$LOCALCFG"; then
   pass "Field configuration menu does not expose an unrestricted Linux shell option."
 else
@@ -1429,40 +1307,16 @@ else
 fi
 grep -q 'Engineering Login / Password Setup' "$LOCALCFG" 2>/dev/null && pass "Engineering Login / Password Setup menu option installed." || fail "Engineering Login / Password Setup menu option missing."
 grep -q 'Engineering Tools / Setup Script' "$LOCALCFG" 2>/dev/null && pass "Engineering Tools / Setup Script menu option installed." || fail "Engineering Tools / Setup Script menu option missing."
-grep -q 'Open Engineering Shell (solz_eng only)' "$LOCALCFG" 2>/dev/null && pass "Direct Engineering shell menu option installed and labeled solz_eng-only." || fail "Direct Engineering shell menu option missing."
-grep -q 'LIVE NIC / CABLING STATUS' "$LOCALCFG" 2>/dev/null && pass "Live NIC/cabling status banner installed." || fail "Live NIC/cabling status banner missing."
 grep -q 'Register NEW Domotz Collector Now' "$LOCALCFG" 2>/dev/null && pass "NEW Domotz Collector registration menu option installed." || fail "NEW Domotz Collector registration menu option missing."
 [[ -x "$LIVE" ]] && pass "Live network discovery utility installed." || fail "Live network discovery utility missing."
 [[ -s "$LIVE_RESULT" ]] && pass "Live network discovery result record exists." || warn "Live network discovery result record is not present yet."
 
 systemctl is-active --quiet auditd 2>/dev/null && pass "auditd active." || fail "auditd inactive."
 [[ -s "$AUDIT_FILE" ]] && pass "Solutionz audit rules installed." || fail "Solutionz audit rules missing."
-grep -q 'solutionz_apparmor' "$AUDIT_FILE" 2>/dev/null && pass "AppArmor policy directory changes are audited." || fail "AppArmor audit watch is missing."
 if command -v auditctl >/dev/null 2>&1; then
   auditctl -l 2>/dev/null | grep -q 'solutionz_netplan' && pass "Solutionz audit rules loaded." || warn "Solutionz audit rules are not visible in auditctl output; verify after reboot."
 fi
 systemctl is-active --quiet apparmor 2>/dev/null && pass "AppArmor service active." || fail "AppArmor service inactive."
-if [[ -r /sys/kernel/security/apparmor/profiles ]]; then
-  for aa_file in "${APPARMOR_REQUIRED_FILES[@]}"; do
-    [[ -s "$aa_file" ]] && pass "AppArmor policy file installed: $aa_file" || fail "Required AppArmor policy file missing: $aa_file"
-  done
-  for aa_profile in "${APPARMOR_REQUIRED_PROFILES[@]}"; do
-    grep -Fq "${aa_profile} (enforce)" /sys/kernel/security/apparmor/profiles && \
-      pass "AppArmor profile enforced: ${aa_profile}" || fail "AppArmor profile missing or not in enforce mode: ${aa_profile}"
-  done
-else
-  fail "AppArmor loaded-profile inventory is unavailable."
-fi
-if command -v snap >/dev/null 2>&1 && snap list "$DOMOTZ_SNAP" >/dev/null 2>&1; then
-  domotz_confinement="$(snap info --verbose "$DOMOTZ_SNAP" 2>/dev/null | awk '$1=="confinement:" {print $2; exit}')"
-  [[ "$domotz_confinement" == "strict" ]] && pass "Domotz Snap confinement is strict." || fail "Domotz Snap confinement is '${domotz_confinement:-unknown}', expected strict."
-  for domotz_iface in "${DOMOTZ_REQUIRED_INTERFACES[@]}"; do
-    snap connections "$DOMOTZ_SNAP" 2>/dev/null | awk -v p="$domotz_iface" '$1==p && $3!="-" {f=1} END {exit f?0:1}' && \
-      pass "Domotz approved interface connected: ${domotz_iface}" || fail "Domotz required interface not connected: ${domotz_iface}"
-  done
-else
-  fail "Domotz Snap is not installed for confinement validation."
-fi
 [[ -s "$APT_POLICY" ]] && grep -q 'Automatic-Reboot "false"' "$APT_POLICY" && pass "Controlled security-update policy installed with automatic reboot disabled." || fail "Controlled security-update policy missing/invalid."
 grep -q 'APT::Periodic::Unattended-Upgrade "0"' "$APT_POLICY" 2>/dev/null && pass "Unattended package installation disabled; security updates require an approved maintenance action." || fail "Unattended package installation is not disabled by Solutionz policy."
 
@@ -1526,7 +1380,7 @@ SECURITYVALIDATOR
 }
 
 install_engineering_identity() {
-  local key_tmp actual_fp engineering_password_state password_source
+  local key_tmp actual_fp
 
   groupadd -f "${ENGINEERING_GROUP}"
   groupadd -f "${ENGINEERING_USER}"
@@ -1534,25 +1388,27 @@ install_engineering_identity() {
   if ! id "${ENGINEERING_USER}" >/dev/null 2>&1; then
     useradd -m -d "${ENGINEERING_HOME}" -s /bin/bash -g "${ENGINEERING_USER}" -G "sudo,${ENGINEERING_GROUP}" -c "Solutionz RMM Engineering" "${ENGINEERING_USER}" || \
       error_exit "Unable to create ${ENGINEERING_USER}."
-    progress_message "Created ${ENGINEERING_USER} engineering account."
+    progress_message "Created ${ENGINEERING_USER} engineering account with key-first SSH access."
   else
     usermod -d "${ENGINEERING_HOME}" -s /bin/bash -g "${ENGINEERING_USER}" -aG "sudo,${ENGINEERING_GROUP}" "${ENGINEERING_USER}" || \
       error_exit "Unable to normalize ${ENGINEERING_USER} engineering account."
   fi
 
-  # The Engineering account must never be classified as a technician account.
-  if id -nG "${ENGINEERING_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx "${FIELD_TECH_GROUP}"; then
-    gpasswd -d "${ENGINEERING_USER}" "${FIELD_TECH_GROUP}" >/dev/null 2>&1 || \
-      error_exit "Unable to remove ${ENGINEERING_USER} from ${FIELD_TECH_GROUP}."
+  # Keep the account usable for SSH public-key authentication before the first
+  # local password is created. A leading ! shadow value can be treated by sshd as
+  # a locked account; *NP* is deliberately non-authenticating while Match User
+  # solz_eng independently disables SSH password authentication.
+  if [[ ! -e "${ENGINEERING_PASSWORD_MARKER}" ]]; then
+    usermod -p '*NP*' "${ENGINEERING_USER}" || error_exit "Unable to prepare ${ENGINEERING_USER} for key-only first login."
   fi
 
   install -d -o "${ENGINEERING_USER}" -g "${ENGINEERING_USER}" -m 700 "${ENGINEERING_HOME}/.ssh"
-  printf '%s\n' "${ENGINEERING_SSH_PUBLIC_KEY}" > "${ENGINEERING_AUTHORIZED_KEYS}"
+  printf '%s\n' "${ENGINEERING_SSH_PUBLIC_KEY_DEFAULT}" > "${ENGINEERING_AUTHORIZED_KEYS}"
   chown "${ENGINEERING_USER}:${ENGINEERING_USER}" "${ENGINEERING_AUTHORIZED_KEYS}"
   chmod 600 "${ENGINEERING_AUTHORIZED_KEYS}"
 
   key_tmp="$(mktemp)"
-  printf '%s\n' "${ENGINEERING_SSH_PUBLIC_KEY}" > "${key_tmp}"
+  printf '%s\n' "${ENGINEERING_SSH_PUBLIC_KEY_DEFAULT}" > "${key_tmp}"
   if command -v ssh-keygen >/dev/null 2>&1; then
     actual_fp="$(ssh-keygen -lf "${key_tmp}" -E sha256 2>/dev/null | awk '{print $2}')"
   else
@@ -1570,36 +1426,11 @@ PYFP
     error_exit "Engineering SSH public-key fingerprint mismatch: got ${actual_fp:-missing}."
   printf '%s\n' "${actual_fp}" > "${ENGINEERING_KEY_FINGERPRINT_FILE}"
   chmod 640 "${ENGINEERING_KEY_FINGERPRINT_FILE}"
-  chown root:root "${ENGINEERING_KEY_FINGERPRINT_FILE}"
 
-  # Preserve an already configured local Engineering password. Fresh or otherwise
-  # unprovisioned accounts receive the approved baseline local password through a
-  # one-way SHA-512 crypt hash. SSH remains public-key-only in sshd regardless.
-  engineering_password_state="$(passwd -S "${ENGINEERING_USER}" 2>/dev/null | awk '{print $2}' || true)"
-  password_source=""
-  if [[ "${engineering_password_state}" == "P" ]]; then
-    password_source="existing_engineering_password_preserved"
-    progress_message "Existing ${ENGINEERING_USER} local password preserved unchanged."
-  else
-    usermod -p "${ENGINEERING_DEFAULT_PASSWORD_HASH}" "${ENGINEERING_USER}" || \
-      error_exit "Unable to provision the approved default local password for ${ENGINEERING_USER}."
-    password_source="default_engineering_password_hash"
-    progress_message "Approved default local engineering password hash provisioned for ${ENGINEERING_USER}; plaintext was not stored or logged."
-  fi
-
-  install -d -m 750 "$(dirname "${ENGINEERING_PASSWORD_MARKER}")"
-  {
-    echo "engineering_login=${ENGINEERING_USER}"
-    echo "status=configured"
-    echo "timestamp_utc=$(date -u +%FT%TZ)"
-    echo "source=${password_source}"
-    echo "ssh_authentication=public_key_only"
-    echo "engineering_key_fingerprint=${actual_fp}"
-  } > "${ENGINEERING_PASSWORD_MARKER}"
-  chmod 640 "${ENGINEERING_PASSWORD_MARKER}"
-  chown root:root "${ENGINEERING_PASSWORD_MARKER}"
-
-  progress_message "Engineering SSH key installed and verified: ${actual_fp}. Local console password is configured; SSH remains public-key only."
+  # Do not set or disclose a default local engineering password. The first local
+  # password is created only by an authenticated solz_eng session after Phase 2.
+  # SSH remains public-key only for solz_eng even after that local password exists.
+  progress_message "Engineering SSH key installed and verified: ${actual_fp}."
 }
 
 configure_security_hardening() {
@@ -1650,14 +1481,13 @@ LoginGraceTime 30
 X11Forwarding no
 PubkeyAuthentication yes
 
-# Engineering SSH is key-only. A successful key-authenticated solz_eng login is
-# forced into the Solutionz menu in ENGINEERING mode; Engineering shell access
-# is available only through explicit authenticated menu selections.
+# Engineering SSH is key-only. A successful key-authenticated solz_eng login
+# opens the account's /bin/bash login shell directly. The controlled Engineering
+# menu remains available through the local configuration utility when needed.
 Match User solz_eng
     AuthenticationMethods publickey
     PasswordAuthentication no
     PubkeyAuthentication yes
-    ForceCommand sudo -n /usr/local/sbin/solutionz-rmm-local-config --engineering-auto
     X11Forwarding no
     AllowTcpForwarding no
     PermitTunnel no
@@ -1705,7 +1535,6 @@ EOF
 -w /etc/ufw/ -p wa -k solutionz_ufw
 -w /etc/sysctl.d/ -p wa -k solutionz_sysctl
 -w /etc/systemd/system/ -p wa -k solutionz_systemd
--w /etc/apparmor.d/ -p wa -k solutionz_apparmor
 -w /usr/local/sbin/ -p wa -k solutionz_sbin
 -w /var/lib/rswsolutionz-rmm/ -p wa -k solutionz_state
 EOF
@@ -1720,498 +1549,12 @@ EOF
   progress_message "Security hardening installed: forwarding/redirect/source-route protections, SSH hardening, auditd, AppArmor, integrity tooling, and security validation."
 }
 
-install_solutionz_apparmor_profiles() {
-  progress_message "Installing Solutionz role-specific AppArmor enforcement policies (${APPARMOR_POLICY_REVISION})."
-  install -d -m 755 "${APPARMOR_DIR}" "${APPARMOR_DIR}/abstractions"
-
-  cat > "${ENGINEERING_SHELL_TOOL}" <<'ENGSHELL'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-ENGINEERING_USER="solz_eng"
-[[ "$(id -un)" == "${ENGINEERING_USER}" ]] || { echo "Engineering shell requires the ${ENGINEERING_USER} identity." >&2; exit 77; }
-ENGINEERING_HOME="$(getent passwd "${ENGINEERING_USER}" | awk -F: '{print $6}')"
-[[ -n "${ENGINEERING_HOME}" && -d "${ENGINEERING_HOME}" ]] || ENGINEERING_HOME="/home/${ENGINEERING_USER}"
-export HOME="${ENGINEERING_HOME}"
-export USER="${ENGINEERING_USER}"
-export LOGNAME="${ENGINEERING_USER}"
-export SHELL="/bin/bash"
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-export SOLUTIONZ_RMM_MENU_ACTIVE=1
-export SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE=1
-cd "${HOME}" 2>/dev/null || cd /
-echo "Solutionz Engineering shell. Type 'exit' to return to the RMM menu."
-exec /bin/bash --noprofile --norc -i
-ENGSHELL
-  chown root:${ENGINEERING_GROUP} "${ENGINEERING_SHELL_TOOL}"
-  chmod 750 "${ENGINEERING_SHELL_TOOL}"
-
-  cat > "${ENGINEERING_PASSWORD_TOOL}" <<'ENGPASS'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-ENGINEERING_USER="solz_eng"
-STATE="/var/lib/rswsolutionz-rmm/install.state"
-caller="${SUDO_USER:-unknown}"
-[[ "$caller" == "$ENGINEERING_USER" ]] || { echo "Engineering password helper requires an authenticated solz_eng session." >&2; exit 77; }
-[[ "$(head -n1 "$STATE" 2>/dev/null || true)" == "phase2_system_validated" ]] || { echo "Phase 2 must be validated before local engineering password provisioning." >&2; exit 78; }
-exec /usr/bin/passwd "$ENGINEERING_USER"
-ENGPASS
-  chown root:${ENGINEERING_GROUP} "${ENGINEERING_PASSWORD_TOOL}"
-  chmod 750 "${ENGINEERING_PASSWORD_TOOL}"
-
-  cat > "${APPARMOR_COMMON_ABSTRACTION}" <<'AACOMMON'
-# Policy revision: AA-SOC2-V07111226
-# Solutionz RMM common AppArmor abstraction
-#include <abstractions/base>
-#include <abstractions/nameservice>
-#include <abstractions/dbus>
-
-/etc/os-release r,
-/etc/lsb-release r,
-/etc/hostname r,
-/etc/hosts r,
-/etc/nsswitch.conf r,
-/etc/resolv.conf r,
-/run/systemd/resolve/** r,
-/etc/ssl/** r,
-/proc/** r,
-/sys/** r,
-/run/systemd/** r,
-/run/dbus/system_bus_socket rw,
-/dev/null rw,
-/dev/urandom r,
-/dev/random r,
-/dev/tty rw,
-/dev/pts/** rw,
-
-/usr/bin/bash ix,
-/usr/bin/sh ix,
-/usr/bin/awk ix,
-/usr/bin/basename ix,
-/usr/bin/cat ix,
-/usr/bin/chmod ix,
-/usr/bin/chown ix,
-/usr/bin/cp ix,
-/usr/bin/cut ix,
-/usr/bin/date ix,
-/usr/bin/dirname ix,
-/usr/bin/env ix,
-/usr/bin/getent ix,
-/usr/bin/grep ix,
-/usr/bin/head ix,
-/usr/bin/id ix,
-/usr/bin/install ix,
-/usr/bin/ls ix,
-/usr/bin/mkdir ix,
-/usr/bin/mktemp ix,
-/usr/bin/mv ix,
-/usr/bin/paste ix,
-/usr/bin/readlink ix,
-/usr/bin/rm ix,
-/usr/bin/sed ix,
-/usr/bin/sha256sum ix,
-/usr/bin/sleep ix,
-/usr/bin/sort ix,
-/usr/bin/stat ix,
-/usr/bin/tail ix,
-/usr/bin/tee ix,
-/usr/bin/timeout ix,
-/usr/bin/tr ix,
-/usr/bin/uname ix,
-/usr/bin/wc ix,
-/usr/bin/which ix,
-/usr/bin/printf ix,
-/usr/bin/test ix,
-/usr/bin/true ix,
-/usr/bin/false ix,
-/usr/sbin/ip ix,
-/usr/bin/ss ix,
-/usr/sbin/sysctl ix,
-AACOMMON
-  chmod 644 "${APPARMOR_COMMON_ABSTRACTION}"
-
-  cat > "${APPARMOR_DIR}/solutionz-rmm-network-profile" <<'AAPROFILE_SOLUTIONZ_RMM_NETWORK_PROFILE'
-# Policy revision: AA-SOC2-V07111226
-#include <tunables/global>
-profile solutionz-rmm-network-profile /usr/local/sbin/solutionz-rmm-network-profile flags=(attach_disconnected,mediate_deleted) {
-  #include <abstractions/solutionz-rmm-common>
-  /usr/local/sbin/solutionz-rmm-network-profile r,
-  /usr/bin/python3 ix,
-  /usr/bin/python3.* ix,
-  /etc/solutionz-rmm/** rwk,
-  /etc/netplan/** rwk,
-  /etc/passwd r,
-  /etc/group r,
-  /etc/shadow r,
-  /etc/sudoers r,
-  /etc/sudoers.d/** r,
-  /home/solz_eng/ r,
-  /home/solz_eng/** r,
-  /var/lib/rswsolutionz-rmm/** rwk,
-  /tmp/** rwk,
-  /var/tmp/** rwk,
-}
-AAPROFILE_SOLUTIONZ_RMM_NETWORK_PROFILE
-  chmod 644 "${APPARMOR_DIR}/solutionz-rmm-network-profile"
-
-  cat > "${APPARMOR_DIR}/solutionz-rmm-network-validate" <<'AAPROFILE_SOLUTIONZ_RMM_NETWORK_VALIDATE'
-# Policy revision: AA-SOC2-V07111226
-#include <tunables/global>
-profile solutionz-rmm-network-validate /usr/local/sbin/solutionz-rmm-network-validate flags=(attach_disconnected,mediate_deleted) {
-  #include <abstractions/solutionz-rmm-common>
-  capability net_raw,
-  network inet stream,
-  network inet dgram,
-  network inet6 stream,
-  network inet6 dgram,
-  network netlink raw,
-  /usr/local/sbin/solutionz-rmm-network-validate r,
-  /usr/bin/python3 ix,
-  /usr/bin/python3.* ix,
-  /usr/bin/nc ix,
-  /usr/bin/curl ix,
-  /usr/bin/networkctl ix,
-  /etc/solutionz-rmm/** r,
-  /etc/netplan/** r,
-  /var/lib/rswsolutionz-rmm/network-validation-* rwk,
-  /tmp/** rwk,
-}
-AAPROFILE_SOLUTIONZ_RMM_NETWORK_VALIDATE
-  chmod 644 "${APPARMOR_DIR}/solutionz-rmm-network-validate"
-
-  cat > "${APPARMOR_DIR}/solutionz-rmm-live-network-discovery" <<'AAPROFILE_SOLUTIONZ_RMM_LIVE_NETWORK_DISCOVERY'
-# Policy revision: AA-SOC2-V07111226
-#include <tunables/global>
-profile solutionz-rmm-live-network-discovery /usr/local/sbin/solutionz-rmm-live-network-discovery flags=(attach_disconnected,mediate_deleted) {
-  #include <abstractions/solutionz-rmm-common>
-  capability net_raw,
-  capability net_admin,
-  capability audit_read,
-  capability audit_control,
-  network netlink raw,
-  /usr/local/sbin/solutionz-rmm-live-network-discovery r,
-  /usr/bin/networkctl ix,
-  /usr/bin/resolvectl ix,
-  /usr/sbin/ethtool ix,
-  /etc/solutionz-rmm/** r,
-  /etc/netplan/** r,
-  /var/lib/rswsolutionz-rmm/network-live-discovery-* rwk,
-  /tmp/** rwk,
-}
-AAPROFILE_SOLUTIONZ_RMM_LIVE_NETWORK_DISCOVERY
-  chmod 644 "${APPARMOR_DIR}/solutionz-rmm-live-network-discovery"
-
-  cat > "${APPARMOR_DIR}/solutionz-rmm-security-validate" <<'AAPROFILE_SOLUTIONZ_RMM_SECURITY_VALIDATE'
-# Policy revision: AA-SOC2-V07111226
-#include <tunables/global>
-profile solutionz-rmm-security-validate /usr/local/sbin/solutionz-rmm-security-validate flags=(attach_disconnected,mediate_deleted) {
-  #include <abstractions/solutionz-rmm-common>
-  capability net_raw,
-  network netlink raw,
-  /usr/local/sbin/solutionz-rmm-security-validate r,
-  /usr/local/sbin/solutionz-rmm-integrity-baseline Px,
-  /usr/sbin/ufw ix,
-  /run/ufw.lock rwk,
-  /usr/sbin/sshd ix,
-  /usr/sbin/auditctl ix,
-  /usr/sbin/aa-status ix,
-  /usr/sbin/apparmor_status ix,
-  /usr/sbin/nft ix,
-  /usr/bin/snap ix,
-  /usr/bin/systemctl ix,
-  /usr/bin/ssh-keygen ix,
-  /usr/bin/mokutil ix,
-  /etc/solutionz-rmm/** r,
-  /etc/netplan/** r,
-  /etc/ssh/** r,
-  /etc/sysctl.d/** r,
-  /etc/audit/** r,
-  /etc/apparmor.d/** r,
-  /etc/apt/** r,
-  /etc/default/ufw r,
-  /etc/ufw/** r,
-  /etc/systemd/system/** r,
-  /etc/sudoers.d/** r,
-  /home/solz_eng/.ssh/authorized_keys r,
-  /var/lib/rswsolutionz-rmm/** r,
-  /var/lib/rswsolutionz-rmm/security-validation-* rwk,
-  /var/lib/snapd/** r,
-  /snap/** r,
-  /run/snapd.socket rw,
-  /sys/kernel/security/apparmor/profiles r,
-  /tmp/** rwk,
-}
-AAPROFILE_SOLUTIONZ_RMM_SECURITY_VALIDATE
-  chmod 644 "${APPARMOR_DIR}/solutionz-rmm-security-validate"
-
-  cat > "${APPARMOR_DIR}/solutionz-rmm-integrity-baseline" <<'AAPROFILE_SOLUTIONZ_RMM_INTEGRITY_BASELINE'
-# Policy revision: AA-SOC2-V07111226
-#include <tunables/global>
-profile solutionz-rmm-integrity-baseline /usr/local/sbin/solutionz-rmm-integrity-baseline flags=(attach_disconnected,mediate_deleted) {
-  #include <abstractions/solutionz-rmm-common>
-  /usr/local/sbin/solutionz-rmm-integrity-baseline r,
-  /usr/local/share/solutionz-rmm/** r,
-  /usr/local/sbin/solutionz-rmm-* r,
-  /usr/local/sbin/solutionz-domotz-activate r,
-  /usr/local/sbin/rswsolutionz-rmm-postreboot-validate r,
-  /etc/solutionz-rmm/** r,
-  /etc/netplan/** r,
-  /etc/ssh/** r,
-  /etc/sysctl.d/** r,
-  /etc/audit/** r,
-  /etc/apparmor.d/** r,
-  /etc/apt/** r,
-  /etc/default/ufw r,
-  /etc/ufw/** r,
-  /etc/profile.d/** r,
-  /etc/sudoers.d/** r,
-  /etc/systemd/system/** r,
-  /home/solz_eng/.ssh/authorized_keys r,
-  /var/lib/rswsolutionz-rmm/** r,
-  /var/lib/rswsolutionz-rmm/security-baseline-* rwk,
-  /tmp/** rwk,
-}
-AAPROFILE_SOLUTIONZ_RMM_INTEGRITY_BASELINE
-  chmod 644 "${APPARMOR_DIR}/solutionz-rmm-integrity-baseline"
-
-  cat > "${APPARMOR_DIR}/solutionz-domotz-activate" <<'AAPROFILE_SOLUTIONZ_DOMOTZ_ACTIVATE'
-# Policy revision: AA-SOC2-V07111226
-#include <tunables/global>
-profile solutionz-domotz-activate /usr/local/sbin/solutionz-domotz-activate flags=(attach_disconnected,mediate_deleted) {
-  #include <abstractions/solutionz-rmm-common>
-  network inet stream,
-  network inet dgram,
-  network inet6 stream,
-  network inet6 dgram,
-  /usr/local/sbin/solutionz-domotz-activate r,
-  /usr/bin/python3 ix,
-  /usr/bin/python3.* ix,
-  /etc/solutionz-rmm/domotz-activation.json rwk,
-  /etc/solutionz-rmm/domotz-provisioning-defaults.json r,
-  /var/lib/solutionz-domotz-activation/** rwk,
-  /var/lib/rswsolutionz-rmm/install.state r,
-  /tmp/** rwk,
-}
-AAPROFILE_SOLUTIONZ_DOMOTZ_ACTIVATE
-  chmod 644 "${APPARMOR_DIR}/solutionz-domotz-activate"
-
-  cat > "${APPARMOR_DIR}/solutionz-rmm-postreboot-validate" <<'AAPROFILE_SOLUTIONZ_RMM_POSTREBOOT_VALIDATE'
-# Policy revision: AA-SOC2-V07111226
-#include <tunables/global>
-profile solutionz-rmm-postreboot-validate /usr/local/sbin/rswsolutionz-rmm-postreboot-validate flags=(attach_disconnected,mediate_deleted) {
-  #include <abstractions/solutionz-rmm-common>
-  capability net_raw,
-  network netlink raw,
-  /usr/local/sbin/rswsolutionz-rmm-postreboot-validate r,
-  /usr/local/sbin/solutionz-rmm-network-validate Px,
-  /usr/local/sbin/solutionz-rmm-security-validate Px,
-  /usr/local/sbin/solutionz-rmm-integrity-baseline Px,
-  /usr/local/sbin/solutionz-rmm-live-network-discovery Px,
-  /usr/bin/systemctl ix,
-  /usr/bin/timedatectl ix,
-  /usr/bin/snap ix,
-  /usr/bin/ssh-keygen ix,
-  /usr/sbin/netplan ix,
-  /usr/sbin/sshd ix,
-  /usr/sbin/ufw ix,
-  /etc/** r,
-  /var/lib/rswsolutionz-rmm/** rwk,
-  /var/log/solutionz-rmm/** rwk,
-  /var/lib/snapd/** r,
-  /snap/** r,
-  /run/snapd.socket rw,
-  /run/netplan/** rwk,
-  /run/systemd/network/** rwk,
-  /tmp/** rwk,
-}
-AAPROFILE_SOLUTIONZ_RMM_POSTREBOOT_VALIDATE
-  chmod 644 "${APPARMOR_DIR}/solutionz-rmm-postreboot-validate"
-
-  cat > "${APPARMOR_DIR}/solutionz-rmm-local-config" <<'AAPROFILE_SOLUTIONZ_RMM_LOCAL_CONFIG'
-# Policy revision: AA-SOC2-V07111226
-#include <tunables/global>
-profile solutionz-rmm-local-config /usr/local/sbin/solutionz-rmm-local-config flags=(attach_disconnected,mediate_deleted) {
-  #include <abstractions/solutionz-rmm-common>
-  #include <abstractions/authentication>
-  capability net_admin,
-  capability net_raw,
-  capability setuid,
-  capability setgid,
-  capability dac_override,
-  capability chown,
-  capability fowner,
-  network inet stream,
-  network inet dgram,
-  network inet6 stream,
-  network inet6 dgram,
-  network netlink raw,
-  /usr/local/sbin/solutionz-rmm-local-config r,
-  /usr/local/sbin/solutionz-rmm-network-profile Px,
-  /usr/local/sbin/solutionz-rmm-network-validate Px,
-  /usr/local/sbin/solutionz-rmm-live-network-discovery Px,
-  /usr/local/sbin/solutionz-rmm-security-validate Px,
-  /usr/local/sbin/solutionz-rmm-integrity-baseline Px,
-  /usr/local/sbin/solutionz-rmm-setup Px,
-  /usr/local/sbin/solutionz-domotz-activate Px,
-  /usr/local/sbin/solutionz-rmm-engineering-shell Px,
-  /usr/local/sbin/solutionz-rmm-engineering-password Px,
-  /usr/bin/systemctl ix,
-  /usr/bin/networkctl ix,
-  /usr/bin/udevadm ix,
-  /usr/bin/busctl ix,
-  /usr/bin/flock ix,
-  /usr/sbin/runuser ix,
-  /usr/bin/su ix,
-  /usr/bin/sudo ix,
-  /usr/sbin/netplan ix,
-  /usr/bin/python3 ix,
-  /usr/bin/python3.* ix,
-  /etc/solutionz-rmm/** rwk,
-  /etc/netplan/** rwk,
-  /var/lib/rswsolutionz-rmm/** rwk,
-  /var/lib/solutionz-domotz-activation/** r,
-  /run/lock/solutionz-rmm-network.lock rwk,
-  /run/netplan/** rwk,
-  /run/systemd/network/** rwk,
-  /tmp/** rwk,
-  /var/tmp/** rwk,
-}
-AAPROFILE_SOLUTIONZ_RMM_LOCAL_CONFIG
-  chmod 644 "${APPARMOR_DIR}/solutionz-rmm-local-config"
-
-  cat > "${APPARMOR_DIR}/solutionz-rmm-engineering-shell" <<'AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_SHELL'
-# Policy revision: AA-SOC2-V07111226
-#include <tunables/global>
-profile solutionz-rmm-engineering-shell /usr/local/sbin/solutionz-rmm-engineering-shell flags=(attach_disconnected,mediate_deleted) {
-  #include <abstractions/base>
-  #include <abstractions/nameservice>
-  #include <abstractions/dbus>
-  #include <abstractions/authentication>
-  capability,
-  network,
-  mount,
-  remount,
-  umount,
-  pivot_root,
-  /usr/local/sbin/solutionz-rmm-engineering-shell r,
-  /usr/bin/** rix,
-  /usr/sbin/** rix,
-  /bin/** rix,
-  /sbin/** rix,
-  /snap/bin/** rix,
-  /etc/** rwkl,
-  /var/** rwkl,
-  /run/** rwkl,
-  /tmp/** rwkl,
-  /home/solz_eng/** rwkl,
-  /usr/** rwkl,
-  /bin/** rwkl,
-  /sbin/** rwkl,
-  /lib/** rwkl,
-  /lib64/** rwkl,
-  /opt/** rwkl,
-  /boot/** rwkl,
-  /snap/** rwkl,
-  /dev/** rw,
-  /proc/** r,
-  /sys/** r,
-  /sys/kernel/security/apparmor/** rw,
-}
-AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_SHELL
-  chmod 644 "${APPARMOR_DIR}/solutionz-rmm-engineering-shell"
-
-  cat > "${APPARMOR_DIR}/solutionz-rmm-engineering-password" <<'AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_PASSWORD'
-# Policy revision: AA-SOC2-V07111226
-#include <tunables/global>
-profile solutionz-rmm-engineering-password /usr/local/sbin/solutionz-rmm-engineering-password flags=(attach_disconnected,mediate_deleted) {
-  #include <abstractions/base>
-  #include <abstractions/authentication>
-  capability setuid,
-  capability setgid,
-  capability dac_override,
-  capability chown,
-  capability fowner,
-  /usr/local/sbin/solutionz-rmm-engineering-password r,
-  /usr/bin/passwd ix,
-  /usr/bin/head ix,
-  /usr/bin/id ix,
-  /etc/passwd r,
-  /etc/group r,
-  /etc/shadow rwk,
-  /etc/shadow.* rwk,
-  /etc/.pwd.lock rwk,
-  /etc/login.defs r,
-  /var/lib/rswsolutionz-rmm/install.state r,
-  /dev/tty rw,
-  /dev/pts/** rw,
-}
-AAPROFILE_SOLUTIONZ_RMM_ENGINEERING_PASSWORD
-  chmod 644 "${APPARMOR_DIR}/solutionz-rmm-engineering-password"
-
-  cat > "${APPARMOR_DIR}/solutionz-rmm-setup" <<'AAPROFILE_SOLUTIONZ_RMM_SETUP'
-# Policy revision: AA-SOC2-V07111226
-#include <tunables/global>
-profile solutionz-rmm-setup /usr/local/sbin/solutionz-rmm-setup flags=(attach_disconnected,mediate_deleted) {
-  #include <abstractions/base>
-  #include <abstractions/nameservice>
-  #include <abstractions/dbus>
-  #include <abstractions/authentication>
-  capability,
-  network,
-  mount,
-  remount,
-  umount,
-  pivot_root,
-  /usr/local/sbin/solutionz-rmm-setup r,
-  /usr/local/sbin/solutionz-rmm-* Px,
-  /usr/local/sbin/solutionz-domotz-activate Px,
-  /usr/local/sbin/rswsolutionz-rmm-postreboot-validate Px,
-  /usr/bin/** rix,
-  /usr/sbin/** rix,
-  /bin/** rix,
-  /sbin/** rix,
-  /snap/bin/** rix,
-  /etc/** rwkl,
-  /var/** rwkl,
-  /run/** rwkl,
-  /tmp/** rwkl,
-  /home/solz_eng/** rwkl,
-  /usr/** rwkl,
-  /bin/** rwkl,
-  /sbin/** rwkl,
-  /lib/** rwkl,
-  /lib64/** rwkl,
-  /opt/** rwkl,
-  /boot/** rwkl,
-  /snap/** rwkl,
-  /dev/** rw,
-  /proc/** r,
-  /sys/** r,
-  /sys/kernel/security/apparmor/** rw,
-}
-AAPROFILE_SOLUTIONZ_RMM_SETUP
-  chmod 644 "${APPARMOR_DIR}/solutionz-rmm-setup"
-
-  local profile_file profile_name
-  for profile_file in "${APPARMOR_PROFILE_FILES[@]}"; do
-    apparmor_parser -Q -K "$profile_file" >/dev/null 2>&1 || error_exit "AppArmor syntax validation failed: $profile_file"
-    apparmor_parser -r -K "$profile_file" >/dev/null 2>&1 || error_exit "Unable to load AppArmor profile: $profile_file"
-  done
-
-  [[ -r /sys/kernel/security/apparmor/profiles ]] || error_exit "AppArmor profile inventory is not readable after profile load."
-  for profile_name in "${APPARMOR_REQUIRED_PROFILES[@]}"; do
-    grep -Fq "${profile_name} (enforce)" /sys/kernel/security/apparmor/profiles || \
-      error_exit "Required AppArmor profile is not loaded in enforce mode: ${profile_name}"
-  done
-
-  progress_message "Solutionz AppArmor policy ${APPARMOR_POLICY_REVISION} loaded: ${#APPARMOR_REQUIRED_PROFILES[@]} role-specific profiles in enforce mode."
-}
-
 write_default_network_profile() {
   local target="${1:-${NETWORK_PROFILE_FILE}}"
   install -d -m 750 "$(dirname "${target}")"
   cat > "${target}" <<'JSON'
 {
-  "revision": "SOC2-V07111226",
+  "revision": "V06.100626N",
   "wan": {"interface": "eth0", "mode": "dhcp", "dns": []},
   "lan": {"interface": "eth1", "mode": "dhcp"},
   "vlans": []
@@ -2226,7 +1569,7 @@ install_network_profile_tool() {
 #!/usr/bin/env python3
 import argparse, ipaddress, json, os, sys
 from pathlib import Path
-REVISION="SOC2-V07111226"; WAN_IFACE="eth0"; LAN_IFACE="eth1"; MAX_VLANS=32
+REVISION="V06.100626N"; WAN_IFACE="eth0"; LAN_IFACE="eth1"; MAX_VLANS=32
 class ProfileError(ValueError): pass
 def fail(msg): raise ProfileError(msg)
 def normalize_dns(values,label):
@@ -2396,10 +1739,10 @@ install_live_network_discovery_tool() {
 #!/usr/bin/env bash
 set -uo pipefail
 
-REVISION="SOC2-V07111226"
+REVISION="V06.100626N"
 WAN="eth0"
 LAN="eth1"
-RESULT="/var/lib/rswsolutionz-rmm/network-live-discovery-SOC2-V07111226.result"
+RESULT="/var/lib/rswsolutionz-rmm/network-live-discovery-V06.100626N.result"
 
 mkdir -p "$(dirname "$RESULT")"
 tmp="$(mktemp)"
@@ -2588,10 +1931,10 @@ install_network_validator() {
 #!/usr/bin/env bash
 set -uo pipefail
 
-REVISION="SOC2-V07111226"
+REVISION="V06.100626N"
 PROFILE="/etc/solutionz-rmm/network-profile.json"
 PROFILE_TOOL="/usr/local/sbin/solutionz-rmm-network-profile"
-RESULT="/var/lib/rswsolutionz-rmm/network-validation-SOC2-V07111226.result"
+RESULT="/var/lib/rswsolutionz-rmm/network-validation-V06.100626N.result"
 WAN="eth0"
 LAN="eth1"
 WAIT_SECONDS="${SOLUTIONZ_NETWORK_VALIDATION_WAIT_SECONDS:-30}"
@@ -3036,11 +2379,6 @@ prepare_production_network_candidate() {
     [[ -r "${NETWORK_PROFILE_SOURCE}" ]] || error_exit "Network profile is not readable: ${NETWORK_PROFILE_SOURCE}"
     cp -f "${NETWORK_PROFILE_SOURCE}" "${CANDIDATE_PROFILE}"
     progress_message "Validating supplied dual-homed WAN/LAN network profile before commit: ${NETWORK_PROFILE_SOURCE}"
-  elif (( PRESERVE_EXISTING_NETWORK_PROFILE )) && [[ -s "${NETWORK_PROFILE_FILE}" ]]; then
-    "${NETWORK_PROFILE_TOOL}" validate "${NETWORK_PROFILE_FILE}" >/dev/null 2>&1 || \
-      error_exit "Existing network profile is present but invalid; preserve mode refuses to replace it. Supply --network-profile <json> or repair ${NETWORK_PROFILE_FILE}."
-    cp -f "${NETWORK_PROFILE_FILE}" "${CANDIDATE_PROFILE}"
-    progress_message "Preserve-existing mode: staging the current valid customer network profile without altering its values."
   else
     write_default_network_profile "${CANDIDATE_PROFILE}"
     progress_message "Preparing default WAN eth0 DHCP + LAN eth1 DHCP profile in staging before commit."
@@ -3161,7 +2499,7 @@ stage_network_config() {
 network: {config: disabled}
 EOF
   cat > "${IP_FORWARD_SYSCTL_FILE}" <<'EOF'
-# Solutionz RMM SOC2-V07111226 - dual-homed collector, not a router.
+# Solutionz RMM V06.100626N - dual-homed collector, not a router.
 net.ipv4.ip_forward=0
 EOF
   chmod 644 "${IP_FORWARD_SYSCTL_FILE}"; sysctl -w net.ipv4.ip_forward=0 >/dev/null
@@ -3315,35 +2653,6 @@ install_domotz_activation_helper() {
   install -d -m 750 /etc/solutionz-rmm
   install -d -m 750 /var/lib/solutionz-domotz-activation
 
-  if [[ -n "${DOMOTZ_COLLECTOR_ACTIVATION_KEY}" ]]; then
-    local domotz_defaults_input
-    umask 077
-    domotz_defaults_input="$(mktemp /tmp/solutionz-domotz-defaults.XXXXXX)"
-    printf '%s\n%s\n%s\n' \
-      "${DOMOTZ_PUBLIC_ENDPOINT}" \
-      "${DOMOTZ_COLLECTOR_ACTIVATION_KEY_NAME}" \
-      "${DOMOTZ_COLLECTOR_ACTIVATION_KEY}" > "${domotz_defaults_input}"
-    python3 - "${DOMOTZ_PROVISIONING_DEFAULTS}" "${domotz_defaults_input}" <<'PYDEFAULTS'
-import json, os, sys, tempfile
-p=sys.argv[1]; src=sys.argv[2]
-with open(src,encoding='utf-8') as f:
-    endpoint=f.readline().rstrip('\n'); key_name=f.readline().rstrip('\n'); key=f.readline().rstrip('\n')
-d={'schema_version':1,'endpoint':endpoint,'activation_key_name':key_name,'activation_key':key}
-os.makedirs(os.path.dirname(p),exist_ok=True)
-fd,tmp=tempfile.mkstemp(prefix='.'+os.path.basename(p)+'.',dir=os.path.dirname(p))
-with os.fdopen(fd,'w',encoding='utf-8') as f:
-    json.dump(d,f,indent=2,sort_keys=True); f.write('\n'); f.flush(); os.fsync(f.fileno())
-os.chmod(tmp,0o600); os.replace(tmp,p)
-PYDEFAULTS
-    rm -f "${domotz_defaults_input}"
-    chown root:root "${DOMOTZ_PROVISIONING_DEFAULTS}"
-    chmod 600 "${DOMOTZ_PROVISIONING_DEFAULTS}"
-    progress_message "Domotz deployment credential staged root-only (${DOMOTZ_COLLECTOR_ACTIVATION_KEY_NAME}); secret value not logged."
-  else
-    rm -f "${DOMOTZ_PROVISIONING_DEFAULTS}"
-    info_message "No embedded Domotz activation key is present; registration can use an Engineering-entered key or a build-time SOLUTIONZ_RMM_DOMOTZ_ACTIVATION_KEY override."
-  fi
-
   cat > "${DOMOTZ_ACTIVATION_TOOL}" <<'PYACT'
 #!/usr/bin/env python3
 import argparse, getpass, json, os, socket, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
@@ -3351,7 +2660,6 @@ from pathlib import Path
 
 CONFIG=Path('/etc/solutionz-rmm/domotz-activation.json')
 RESULT=Path('/var/lib/solutionz-domotz-activation/result.json')
-DEFAULTS=Path('/etc/solutionz-rmm/domotz-provisioning-defaults.json')
 LOCAL_STATUS='http://127.0.0.1:3000/api/v1/status'
 LOCAL_ACTIVATE='http://127.0.0.1:3000/api/v1/agent'
 US_API_HOST='api-us-east-1-cell-1.domotz.com'
@@ -3403,46 +2711,14 @@ def prior_result_status():
     except Exception:
         return ''
 
-def read_provisioning_defaults():
-    if not DEFAULTS.exists(): return None
-    try: d=json.loads(DEFAULTS.read_text(encoding='utf-8'))
-    except Exception as e: raise RuntimeError(f'Invalid Domotz provisioning defaults: {e}')
-    if not isinstance(d,dict): raise RuntimeError('Domotz provisioning defaults must be a JSON object.')
-    endpoint=str(d.get('endpoint','')).strip(); key=str(d.get('activation_key','')).strip(); key_name=str(d.get('activation_key_name','')).strip()
-    u=urllib.parse.urlparse(endpoint)
-    if u.scheme!='https' or u.hostname!=US_API_HOST: raise RuntimeError(f'Provisioning endpoint must use {US_API_HOST}.')
-    if not key: raise RuntimeError('Domotz provisioning defaults do not contain a Collector Activation Key.')
-    return {'endpoint':endpoint,'activation_key':key,'activation_key_name':key_name or 'preconfigured'}
-
-def preflight_new():
-    try: st=local_status()
-    except Exception as e:
-        print(f'Local Domotz status unavailable: {e}',file=sys.stderr); return 75
-    mode=str(st.get('mode','')).upper(); version=str(st.get('agent_version',''))
-    print(f'Local collector mode: {mode or "unknown"}')
-    print(f'Local collector version: {version or "unknown"}')
-    if mode != 'RESTRICTED':
-        print('ERROR: Collector is already configured/registered; NEW registration is blocked.',file=sys.stderr); return 3
-    if version_tuple(version)<MIN_VERSION:
-        print(f'ERROR: Domotz agent_version {version or "unknown"} is below required 3.9.3.',file=sys.stderr); return 2
-    print('PASS: Collector is RESTRICTED and eligible for NEW registration.')
-    return 0
-
 def configure():
-    defaults=read_provisioning_defaults()
-    default_name=socket.gethostname().strip()
-    name=input(f'Collector name [{default_name}]: ' if default_name else 'Collector name: ').strip() or default_name
-    if defaults:
-        endpoint=defaults['endpoint']; key=defaults['activation_key']
-        print(f'Domotz API endpoint: {endpoint} (preconfigured)')
-        print(f'Collector Activation Key: PRECONFIGURED ({defaults["activation_key_name"]})')
-    else:
-        endpoint=input(f'Domotz API endpoint [{"https://"+US_API_HOST+"/public-api/v1/"}]: ').strip() or f'https://{US_API_HOST}/public-api/v1/'
-        key=getpass.getpass('Collector activation key: ').strip()
-    # Solutionz policy requires discovery enabled for a new collector.
-    data={'enabled':False,'name':name,'endpoint':endpoint,'activation_key':key,'deny_all_interfaces':False}
+    name=input('Collector name: ').strip()
+    endpoint=input(f'Domotz API endpoint [{"https://"+US_API_HOST+"/public-api/v1/"}]: ').strip() or f'https://{US_API_HOST}/public-api/v1/'
+    key=getpass.getpass('Collector activation key: ').strip()
+    scan=input('Disable network scanning after activation? [y/N]: ').strip().lower() in ('y','yes')
+    data={'enabled':False,'name':name,'endpoint':endpoint,'activation_key':key,'deny_all_interfaces':scan}
     atomic_json(CONFIG,data); load_config(True)
-    print(f'Activation configuration staged at {CONFIG}; activation remains disabled and network scanning is enabled by Solutionz policy.')
+    print(f'Activation configuration staged at {CONFIG}; activation remains disabled.')
 
 def check():
     d=load_config(False)
@@ -3450,14 +2726,6 @@ def check():
 
 def arm():
     d=load_config(True); d['enabled']=True; atomic_json(CONFIG,d); print('Domotz activation armed for the next permitted attempt.')
-
-def disarm():
-    d=load_config(False); d['enabled']=False; atomic_json(CONFIG,d); print('Domotz activation disarmed.')
-
-def reset_result():
-    try: RESULT.unlink()
-    except FileNotFoundError: pass
-    print('Domotz activation result marker reset. Confirm Collector state before retrying registration.')
 
 def preflight_cloud(endpoint):
     host=urllib.parse.urlparse(endpoint).hostname
@@ -3529,16 +2797,12 @@ def main():
     ap=argparse.ArgumentParser()
     g=ap.add_mutually_exclusive_group(required=True)
     g.add_argument('--configure',action='store_true'); g.add_argument('--check',action='store_true'); g.add_argument('--arm',action='store_true')
-    g.add_argument('--disarm',action='store_true'); g.add_argument('--preflight-new',action='store_true'); g.add_argument('--reset-result',action='store_true')
     g.add_argument('--attempt',action='store_true'); g.add_argument('--register-now',action='store_true'); g.add_argument('--status',action='store_true')
     a=ap.parse_args()
     try:
         if a.configure: configure(); return 0
         if a.check: check(); return 0
         if a.arm: arm(); return 0
-        if a.disarm: disarm(); return 0
-        if a.preflight_new: return preflight_new()
-        if a.reset_result: reset_result(); return 0
         if a.attempt: return activate(False)
         if a.register_now: return activate(True)
         if a.status: show_status(); return 0
@@ -3559,16 +2823,6 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=${DOMOTZ_ACTIVATION_TOOL} --attempt
-SuccessExitStatus=0 75
-TimeoutStartSec=180
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=strict
-ReadWritePaths=/var/lib/solutionz-domotz-activation /etc/solutionz-rmm
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-LockPersonality=true
-MemoryDenyWriteExecute=true
 EOF_SERVICE
 
   cat > "${DOMOTZ_ACTIVATION_TIMER}" <<'EOF_TIMER'
@@ -3577,10 +2831,10 @@ Description=Solutionz Domotz Collector Activation Retry Timer
 
 [Timer]
 OnBootSec=90s
-OnUnitInactiveSec=2min
-AccuracySec=10s
+OnUnitActiveSec=120s
+AccuracySec=15s
 Unit=solutionz-domotz-activate.service
-Persistent=true
+Persistent=false
 
 [Install]
 WantedBy=timers.target
@@ -3598,41 +2852,37 @@ install_local_serial_config_tool() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REVISION="SOC2-V07111226"
+REVISION="V06.100626N"
 NETPLAN="/etc/netplan/00-installer-config.yaml"
 PROFILE="/etc/solutionz-rmm/network-profile.json"
 TOOL="/usr/local/sbin/solutionz-rmm-network-profile"
 VALIDATOR="/usr/local/sbin/solutionz-rmm-network-validate"
 LIVE="/usr/local/sbin/solutionz-rmm-live-network-discovery"
-LIVE_RESULT="/var/lib/rswsolutionz-rmm/network-live-discovery-SOC2-V07111226.result"
+LIVE_RESULT="/var/lib/rswsolutionz-rmm/network-live-discovery-V06.100626N.result"
 POSTVALIDATOR="/usr/local/sbin/rswsolutionz-rmm-postreboot-validate"
-RESULT="/var/lib/rswsolutionz-rmm/network-validation-SOC2-V07111226.result"
-CHANGE="/var/lib/rswsolutionz-rmm/network-change-SOC2-V07111226.result"
-PROFILE_RESULT="/var/lib/rswsolutionz-rmm/network-profile-SOC2-V07111226.result"
-POST_RESULT="/var/lib/rswsolutionz-rmm/postreboot-validation-SOC2-V07111226.result"
-SECURITY_RESULT="/var/lib/rswsolutionz-rmm/security-validation-SOC2-V07111226.result"
+RESULT="/var/lib/rswsolutionz-rmm/network-validation-V06.100626N.result"
+CHANGE="/var/lib/rswsolutionz-rmm/network-change-V06.100626N.result"
+PROFILE_RESULT="/var/lib/rswsolutionz-rmm/network-profile-V06.100626N.result"
+POST_RESULT="/var/lib/rswsolutionz-rmm/postreboot-validation-V06.100626N.result"
+SECURITY_RESULT="/var/lib/rswsolutionz-rmm/security-validation-V06.100626N.result"
 INTEGRITY="/usr/local/sbin/solutionz-rmm-integrity-baseline"
-SECURITY_BASELINE="/var/lib/rswsolutionz-rmm/security-baseline-SOC2-V07111226.sha256"
+SECURITY_BASELINE="/var/lib/rswsolutionz-rmm/security-baseline-V06.100626N.sha256"
 STATE="/var/lib/rswsolutionz-rmm/install.state"
 ENGINEERING_USER="solz_eng"
 ENGINEERING_GROUP="solutionz-rmm-engineering"
 ENGINEERING_PASSWORD_MARKER="/var/lib/rswsolutionz-rmm/engineering-password-provisioned"
-ENGINEERING_KEY_FINGERPRINT_FILE="/var/lib/rswsolutionz-rmm/engineering-ssh-key-SOC2-V07111226.fingerprint"
+ENGINEERING_KEY_FINGERPRINT_FILE="/var/lib/rswsolutionz-rmm/engineering-ssh-key-V06.100626N.fingerprint"
 ENGINEERING_KEY_FINGERPRINT_EXPECTED="SHA256:F8aZDgPAP4X7ofp2wjQSed9rWzhs7xcCLMas39JFWa0"
 SETUP_CMD="/usr/local/sbin/solutionz-rmm-setup"
-ENGINEERING_SHELL="/usr/local/sbin/solutionz-rmm-engineering-shell"
-ENGINEERING_PASSWORD_TOOL="/usr/local/sbin/solutionz-rmm-engineering-password"
 ACTIVATION_TOOL="/usr/local/sbin/solutionz-domotz-activate"
 ACTIVATION_CONFIG="/etc/solutionz-rmm/domotz-activation.json"
 ACTIVATION_RESULT="/var/lib/solutionz-domotz-activation/result.json"
-ACTIVATION_DEFAULTS="/etc/solutionz-rmm/domotz-provisioning-defaults.json"
 TRANSACTION_DIR="/var/lib/rswsolutionz-rmm/network-transactions/field"
 # Field Restore reads only this namespace. Engineering/factory Setup transactions
 # live under network-transactions/engineering and are never exposed to technicians.
 LOCK_FILE="/run/lock/solutionz-rmm-network.lock"
 AUTO=0
 ENGINEERING_MODE=0
-DIRECT_ACTION=""
 PRODUCTION_VALIDATION_RESULT="NOT_RUN"
 PRE_NETPLAN_SHA256=""
 PRE_PROFILE_SHA256=""
@@ -3640,21 +2890,19 @@ CURRENT_TRANSACTION=""
 CALLER_USER="${SUDO_USER:-${USER:-unknown}}"
 
 case "${1:-}" in
-  --serial-auto|--restricted-login) AUTO=1 ;;
-  --engineering-auto|--engineering-login) ENGINEERING_MODE=1 ;;
-  --engineering-tools) ENGINEERING_MODE=1; DIRECT_ACTION="engineering_tools" ;;
-  --register-new-domotz) DIRECT_ACTION="register_new_domotz" ;;
+  --serial-auto) AUTO=1 ;;
+  --engineering-auto) ENGINEERING_MODE=1 ;;
   "") ;;
-  *) echo "Usage: $(basename "$0") [--serial-auto|--restricted-login|--engineering-auto|--engineering-login|--engineering-tools|--register-new-domotz]"; exit 2 ;;
+  *) echo "Usage: $(basename "$0") [--serial-auto|--engineering-auto]"; exit 2 ;;
 esac
-[[ $# -le 1 ]] || { echo "Usage: $(basename "$0") [--serial-auto|--restricted-login|--engineering-auto|--engineering-login|--engineering-tools|--register-new-domotz]"; exit 2; }
+[[ $# -le 1 ]] || { echo "Usage: $(basename "$0") [--serial-auto|--engineering-auto]"; exit 2; }
 [[ $EUID -eq 0 ]] || { echo "Run with sudo."; exit 1; }
 
 is_engineering_caller() {
   [[ "$CALLER_USER" == "$ENGINEERING_USER" ]] && id -nG "$ENGINEERING_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$ENGINEERING_GROUP"
 }
 if is_engineering_caller; then ENGINEERING_MODE=1; fi
-if [[ "${ENGINEERING_MODE}" == 1 ]] && ! is_engineering_caller; then
+if [[ "${1:-}" == "--engineering-auto" ]] && ! is_engineering_caller; then
   echo "Engineering mode requires an authenticated ${ENGINEERING_USER} session."
   exit 77
 fi
@@ -4012,7 +3260,7 @@ src,out,sec,mode,addr,gw,dns=sys.argv[1:]
 try:
     p=json.load(open(src))
 except Exception:
-    p={"revision":"SOC2-V07111226","wan":{"interface":"eth0","mode":"dhcp","dns":[]},"lan":{"interface":"eth1","mode":"dhcp"},"vlans":[]}
+    p={"revision":"V06.100626N","wan":{"interface":"eth0","mode":"dhcp","dns":[]},"lan":{"interface":"eth1","mode":"dhcp"},"vlans":[]}
 if sec=='wan':
     p['wan']={'interface':'eth0','mode':mode,'dns':[]}
     if mode=='static':
@@ -4080,107 +3328,6 @@ saved() {
   local p
   read -r -p "JSON profile path: " p
   stage "$p" && apply saved_profile
-}
-
-profile_iface_info() {
-  local iface="$1"
-  python3 - "$PROFILE" "$iface" <<'PYPROFILEINFO'
-import ipaddress,json,sys
-from pathlib import Path
-path=Path(sys.argv[1]); iface=sys.argv[2]
-if not path.exists():
-    print('unconfigured||'); raise SystemExit(0)
-try:
-    data=json.loads(path.read_text(encoding='utf-8'))
-    section=data.get('wan',{}) if iface=='eth0' else data.get('lan',{})
-    mode=str(section.get('mode','unconfigured')).strip().lower() or 'unconfigured'
-    address=str(section.get('address','')).strip(); network=''
-    if address: network=str(ipaddress.ip_interface(address).network)
-    print(f'{mode}|{address}|{network}')
-except Exception:
-    print('invalid||')
-PYPROFILEINFO
-}
-
-nic_status_line() {
-  local iface="$1" role="$2"
-  local carrier="unknown" operstate="unknown" speed="unknown" duplex="unknown"
-  local live_cidr="" live_network="" gateway="" mac="unknown"
-  local profile_mode="unconfigured" expected_cidr="" expected_network="" profile_info=""
-  local link_text="UNKNOWN" speed_text="n/a" profile_text="UNCONFIGURED" match_text=""
-
-  if [[ ! -e "/sys/class/net/${iface}" ]]; then
-    printf '%-4s %-3s | LINK: MISSING INTERFACE\n' "$iface" "$role"
-    printf '     LIVE IPv4: NONE | SUBNET: NONE | GATEWAY: NONE\n'
-    printf '     PROFILE: unavailable | STATUS: INTERFACE NOT DETECTED\n'
-    return 0
-  fi
-
-  carrier="$(cat "/sys/class/net/${iface}/carrier" 2>/dev/null || echo unknown)"
-  operstate="$(cat "/sys/class/net/${iface}/operstate" 2>/dev/null || echo unknown)"
-  speed="$(cat "/sys/class/net/${iface}/speed" 2>/dev/null || echo unknown)"
-  duplex="$(cat "/sys/class/net/${iface}/duplex" 2>/dev/null || echo unknown)"
-  mac="$(cat "/sys/class/net/${iface}/address" 2>/dev/null || echo unknown)"
-  live_cidr="$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk 'NR==1 {print $4}')"
-  live_network="$(ip -4 route show dev "$iface" scope link 2>/dev/null | awk '$1 ~ /^[0-9]+\./ && $1 != "default" {print $1; exit}')"
-  gateway="$(ip -4 route show default dev "$iface" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')"
-  [[ -n "$live_cidr" ]] || live_cidr="NONE"
-  [[ -n "$live_network" ]] || live_network="NONE"
-  [[ -n "$gateway" ]] || gateway="NONE"
-
-  case "${carrier}:${operstate}" in
-    1:up|1:unknown) link_text="CONNECTED" ;;
-    1:*) link_text="CONNECTED (${operstate})" ;;
-    0:*) link_text="NO CARRIER - CHECK CABLE/PORT" ;;
-    *) link_text="${operstate^^} / CARRIER ${carrier}" ;;
-  esac
-  if [[ "$speed" =~ ^[0-9]+$ ]] && (( speed > 0 )); then speed_text="${speed} Mb/s ${duplex^}"; fi
-
-  profile_info="$(profile_iface_info "$iface")"
-  IFS='|' read -r profile_mode expected_cidr expected_network <<<"$profile_info"
-  case "$profile_mode" in
-    static)
-      profile_text="STATIC ${expected_cidr:-UNKNOWN}"
-      if [[ "$live_cidr" == NONE ]]; then match_text="NO LIVE IPv4 - CHECK LINK/CONFIG"
-      elif [[ "$live_cidr" == "$expected_cidr" ]]; then match_text="IP MATCH"
-      elif [[ -n "$expected_network" && "$live_network" == "$expected_network" ]]; then match_text="SUBNET MATCH / IP DIFFERENT"
-      else match_text="SUBNET MISMATCH"; fi ;;
-    dhcp)
-      profile_text="DHCP"
-      if [[ "$carrier" == 0 ]]; then match_text="NO CARRIER"
-      elif [[ "$live_cidr" == NONE ]]; then match_text="LINK UP / NO IPv4 LEASE"
-      else match_text="IPv4 ASSIGNED"; fi ;;
-    none)
-      profile_text="UNNUMBERED/TRUNK"
-      [[ "$carrier" == 0 ]] && match_text="NO CARRIER" || match_text="LINK PRESENT" ;;
-    unused)
-      profile_text="UNUSED / SINGLE-PORT"
-      [[ "$live_cidr" == NONE ]] && match_text="INTENTIONALLY UNUSED" || match_text="UNEXPECTED IPv4 PRESENT" ;;
-    invalid)
-      profile_text="INVALID PROFILE"; match_text="PROFILE REVIEW REQUIRED" ;;
-    *)
-      profile_text="UNCONFIGURED"
-      if [[ "$carrier" == 0 ]]; then match_text="NO CARRIER"
-      elif [[ "$live_cidr" == NONE ]]; then match_text="LINK UP / NO IPv4"
-      else match_text="LIVE ADDRESS DETECTED"; fi ;;
-  esac
-
-  printf '%-4s %-3s | LINK: %s | SPEED: %s\n' "$iface" "$role" "$link_text" "$speed_text"
-  printf '     LIVE IPv4: %s | SUBNET: %s | GATEWAY: %s\n' "$live_cidr" "$live_network" "$gateway"
-  printf '     PROFILE: %s | STATUS: %s | MAC: %s\n' "$profile_text" "$match_text" "$mac"
-}
-
-show_nic_banner() {
-  echo
-  echo "============================================================"
-  echo "LIVE NIC / CABLING STATUS"
-  echo "============================================================"
-  nic_status_line eth0 WAN
-  nic_status_line eth1 LAN
-  echo "------------------------------------------------------------"
-  echo "Carrier/speed confirm Ethernet link negotiation; they do not replace cable certification."
-  echo "Static STATUS compares the live address/subnet with the saved Solutionz network profile."
-  echo "============================================================"
 }
 
 show_live() {
@@ -4341,8 +3488,7 @@ engineering_password_setup() {
     fi
     echo "Authenticated engineering session: ${ENGINEERING_USER}"
     echo "SSH remains public-key only; this password is for local USB-C console and sudo authentication."
-    [[ -x "$ENGINEERING_PASSWORD_TOOL" ]] || { echo "Engineering password helper missing: $ENGINEERING_PASSWORD_TOOL"; return 1; }
-    "$ENGINEERING_PASSWORD_TOOL" || return 1
+    passwd "$ENGINEERING_USER" || return 1
     install -o root -g root -m 640 /dev/null "$ENGINEERING_PASSWORD_MARKER"
     {
       echo "provisioned_by=$CALLER_USER"
@@ -4388,7 +3534,7 @@ show_domotz_registration_status() {
 }
 
 register_domotz_now() {
-  local state_first confirm rc
+  local state_first confirm
   state_first="$(head -n1 "$STATE" 2>/dev/null || true)"
   [[ "$state_first" == "phase2_system_validated" ]] || {
     echo "DOMOTZ REGISTRATION BLOCKED"
@@ -4396,40 +3542,17 @@ register_domotz_now() {
     return 1
   }
   [[ -x "$ACTIVATION_TOOL" ]] || { echo "Domotz activation helper missing: $ACTIVATION_TOOL"; return 1; }
-
-  "$ACTIVATION_TOOL" --preflight-new || return $?
-
-  if [[ ! -s "$ACTIVATION_CONFIG" ]]; then
-    if [[ -s "$ACTIVATION_DEFAULTS" ]]; then
-      echo "Protected mass-production Domotz registration defaults are available."
-      "$ACTIVATION_TOOL" --configure || return $?
-    elif is_engineering_caller; then
-      echo "No preconfigured activation credential is staged. Engineering will configure registration interactively."
-      "$ACTIVATION_TOOL" --configure || return $?
-    else
-      echo "DOMOTZ REGISTRATION CONFIGURATION REQUIRED"
-      echo "No protected factory activation credential is staged. RMM Engineering must configure registration before a technician can submit it."
-      return 1
-    fi
-  else
-    "$ACTIVATION_TOOL" --check || return 1
-  fi
-
+  [[ -s "$ACTIVATION_CONFIG" ]] || {
+    echo "Domotz activation configuration is not staged. RMM Engineering must configure it before registration."
+    return 1
+  }
+  "$ACTIVATION_TOOL" --check || return 1
   echo "This action is only for a genuinely NEW/unregistered Domotz Collector."
   read -r -p "Type REGISTER to submit the staged NEW Collector registration: " confirm
   [[ "$confirm" == "REGISTER" ]] || { echo "Registration cancelled."; return 0; }
-
-  "$ACTIVATION_TOOL" --arm || return $?
-  set +e
   "$ACTIVATION_TOOL" --register-now
-  rc=$?
-  set -e
+  local rc=$?
   [[ -s "$ACTIVATION_RESULT" ]] && cat "$ACTIVATION_RESULT"
-  if (( rc == 75 )); then
-    echo "Domotz is not ready/reachable yet. Registration remains armed and the retry timer may continue after deployment."
-    systemctl enable solutionz-domotz-activate.timer >/dev/null 2>&1 || true
-    return 0
-  fi
   return $rc
 }
 
@@ -4457,25 +3580,6 @@ SETUPMENU
   done
 }
 
-open_engineering_shell() {
-  is_engineering_caller || {
-    echo "ENGINEERING AUTHENTICATION REQUIRED"
-    echo "The Engineering shell is available only to an authenticated ${ENGINEERING_USER} session."
-    echo "Use Engineering Login / Password Setup or SSH directly as ${ENGINEERING_USER} with the approved private key."
-    return 77
-  }
-  [[ -x "$ENGINEERING_SHELL" ]] || { echo "Engineering shell helper missing: $ENGINEERING_SHELL"; return 1; }
-  echo "Opening AppArmor-confined Engineering shell as ${ENGINEERING_USER}. Type exit to return to the RMM menu."
-  echo "The network configuration lock is released while the Engineering shell is active so authorized Setup/refurbishment can run."
-  flock -u 9 || true
-  runuser -u "$ENGINEERING_USER" -- "$ENGINEERING_SHELL" || true
-  if ! flock -n 9; then
-    echo "NETWORK CONFIGURATION BUSY - another session acquired the network lock while Engineering shell was open."
-    return 75
-  fi
-  return 0
-}
-
 engineering_session() {
   is_engineering_caller || {
     echo "ENGINEERING AUTHENTICATION REQUIRED"
@@ -4497,7 +3601,16 @@ Engineering Session
 ENGMENU
     read -r -p "Selection: " ec
     case "$ec" in
-      1) open_engineering_shell || true ;;
+      1)
+        echo "Opening unrestricted engineering shell as ${ENGINEERING_USER}. Type exit to return."
+        echo "Network configuration lock is released while the engineering shell is active so authorized Setup/refurbishment can run."
+        flock -u 9 || true
+        runuser -u "$ENGINEERING_USER" -- env SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE=1 /bin/bash -l || true
+        if ! flock -n 9; then
+          echo "NETWORK CONFIGURATION BUSY - another session acquired the network lock while Engineering shell was open."
+          return 75
+        fi
+        ;;
       2) engineering_password_setup || true ;;
       3)
         [[ -x "$ACTIVATION_TOOL" ]] || { echo "Domotz activation helper missing."; continue; }
@@ -4513,24 +3626,15 @@ ENGMENU
   done
 }
 
-if [[ "$DIRECT_ACTION" == "engineering_tools" ]]; then
-  engineering_session
-  exit $?
-elif [[ "$DIRECT_ACTION" == "register_new_domotz" ]]; then
-  register_domotz_now
-  exit $?
-fi
-
 echo
 echo "AUTO-DETECT CURRENT NETWORK"
 echo "------------------------------------------------"
 show_live
 
 while true; do
-  show_nic_banner
   cat <<'MENU'
 
-Solutionz RMM Dual-Homed Network Configuration - Revision SOC2-V07111226
+Solutionz RMM Dual-Homed Network Configuration - Revision V06.100626N
 1) Configure WAN / eth0 (DHCP or static; default route/DNS)
 2) Configure LAN / eth1 (DHCP, static, unnumbered trunk, or explicitly unused)
 3) Guided WAN + LAN + 802.1Q VLAN configuration (VLANs on eth1)
@@ -4541,9 +3645,8 @@ Solutionz RMM Dual-Homed Network Configuration - Revision SOC2-V07111226
 8) Restore previous network configuration
 9) Engineering Login / Password Setup
 10) Engineering Tools / Setup Script
-11) Open Engineering Shell (solz_eng only)
-12) Register NEW Domotz Collector Now
-13) Log out
+11) Register NEW Domotz Collector Now
+12) Log out
 
 eth0 = WAN/cloud | eth1 = AV/control LAN | VLANs on eth1 | forwarding disabled
 Live detected state comes from the running Linux network stack, not Netplan.
@@ -4563,9 +3666,8 @@ MENU
     8) restore || true ;;
     9) engineering_password_setup || true ;;
     10) engineering_session || true ;;
-    11) open_engineering_shell || true ;;
-    12) register_domotz_now || true ;;
-    13) if (( AUTO )); then exit 90; else exit 0; fi ;;
+    11) register_domotz_now || true ;;
+    12) if (( AUTO )); then exit 90; else exit 0; fi ;;
     *) echo "Invalid selection." ;;
   esac
 done
@@ -4582,71 +3684,43 @@ EOF
   visudo -cf "${LOCAL_CONFIG_SUDOERS_FILE}" >/dev/null || error_exit "Local config sudoers validation failed."
 
   cat > "${SERIAL_PROFILE_FILE}" <<EOF
-# Solutionz RMM all-interactive-login access policy.
-# - solz_rmm always enters the controlled technician menu and is logged out when
-#   the menu exits.
-# - solz_eng always enters the authenticated Engineering menu. The Engineering
-#   shell is entered only through an explicit menu selection.
-# - SSH is independently protected with sshd ForceCommand and solz_eng remains
-#   public-key-only for remote authentication.
+#!/usr/bin/env bash
+# The factory technician account never receives an interactive shell. This
+# profile catches local/login-shell paths; SSH is independently protected by
+# ForceCommand. Exiting or interrupting the menu logs the technician out.
+if [[ "\${SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE:-0}" != 1 && "\${USER:-}" == solz_rmm ]]; then
+  export SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE=1
+  _rc=0
+  echo
+  echo "Solutionz technician session detected; launching WAN/LAN/VLAN menu."
+  if [[ \${EUID} -eq 0 ]]; then
+    "${LOCAL_CONFIG_TOOL}" --serial-auto || _rc=\$?
+  else
+    sudo "${LOCAL_CONFIG_TOOL}" --serial-auto || _rc=\$?
+  fi
+  unset SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE
+  unset _rc
+  exit
+fi
 
-case "\$-" in
-  *i*) ;;
-  *) return 0 2>/dev/null || exit 0 ;;
-esac
-
-if [[ "\${SOLUTIONZ_RMM_MENU_ACTIVE:-0}" != 1 && "\${SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE:-0}" != 1 ]]; then
-  _solutionz_user="\$(id -un 2>/dev/null || true)"
-  _solutionz_tty="\$(tty 2>/dev/null || true)"
-
-  if [[ "\${_solutionz_user}" == "${ENGINEERING_USER}" ]]; then
-    export SOLUTIONZ_RMM_MENU_ACTIVE=1
-    echo
-    echo "Solutionz Engineering session detected; launching RMM configuration menu."
-    _rc=0
-    if [[ \${EUID:-\$(id -u)} -eq 0 ]]; then
-      "${LOCAL_CONFIG_TOOL}" --engineering-auto || _rc=\$?
-    else
-      sudo -n "${LOCAL_CONFIG_TOOL}" --engineering-auto || _rc=\$?
-    fi
-    unset SOLUTIONZ_RMM_MENU_ACTIVE
-    unset _solutionz_user _solutionz_tty _rc
+# USB-C COM remains the independent configuration/recovery path for authenticated
+# users. solz_eng bypasses the automatic network menu and opens its login shell.
+if [[ "\${SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE:-0}" != 1 && "\${USER:-}" != '${ENGINEERING_USER}' && "\$(tty 2>/dev/null || true)" == /dev/ttyS0 ]]; then
+  export SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE=1
+  _rc=0
+  echo
+  echo "Solutionz USB-C COM session detected; launching WAN/LAN/VLAN menu."
+  if [[ \${EUID} -eq 0 ]]; then
+    "${LOCAL_CONFIG_TOOL}" --serial-auto || _rc=\$?
+  else
+    sudo "${LOCAL_CONFIG_TOOL}" --serial-auto || _rc=\$?
+  fi
+  unset SOLUTIONZ_RMM_SERIAL_MENU_ACTIVE
+  if [[ \${EUID} -ne 0 ]] && ! id -nG "\${USER:-}" 2>/dev/null | tr ' ' '\n' | grep -qx '${ENGINEERING_GROUP}'; then
     exit
   fi
-
-  if [[ "\${_solutionz_user}" == "${TECHNICIAN_USER}" ]]; then
-    export SOLUTIONZ_RMM_MENU_ACTIVE=1
-    echo
-    echo "Solutionz technician session detected; launching WAN/LAN/VLAN menu."
-    _rc=0
-    if [[ \${EUID:-\$(id -u)} -eq 0 ]]; then
-      "${LOCAL_CONFIG_TOOL}" --serial-auto || _rc=\$?
-    else
-      sudo -n "${LOCAL_CONFIG_TOOL}" --serial-auto || _rc=\$?
-    fi
-    unset SOLUTIONZ_RMM_MENU_ACTIVE
-    unset _solutionz_user _solutionz_tty _rc
-    exit
-  fi
-
-  # Any other authenticated account reaching the physical USB-C COM console is
-  # still placed into the controlled menu. Only the exact solz_eng identity can
-  # enter Engineering mode or open the Engineering shell.
-  if [[ "\${_solutionz_tty}" == /dev/ttyS0 ]]; then
-    export SOLUTIONZ_RMM_MENU_ACTIVE=1
-    echo
-    echo "Solutionz USB-C COM session detected; launching WAN/LAN/VLAN menu."
-    _rc=0
-    if [[ \${EUID:-\$(id -u)} -eq 0 ]]; then
-      "${LOCAL_CONFIG_TOOL}" --serial-auto || _rc=\$?
-    else
-      sudo -n "${LOCAL_CONFIG_TOOL}" --serial-auto || _rc=\$?
-    fi
-    unset SOLUTIONZ_RMM_MENU_ACTIVE
-    unset _solutionz_user _solutionz_tty _rc
-    exit
-  fi
-  unset _solutionz_user _solutionz_tty
+  [[ \$_rc -eq 90 ]] && exit
+  unset _rc
 fi
 EOF
   chmod 644 "${SERIAL_PROFILE_FILE}"
@@ -4688,34 +3762,34 @@ install_postreboot_validation() {
 #!/usr/bin/env bash
 set -uo pipefail
 
-REVISION="SOC2-V07111226"
+REVISION="V06.100626N"
 STATE="/var/lib/rswsolutionz-rmm/install.state"
-RESULT="/var/lib/rswsolutionz-rmm/postreboot-validation-SOC2-V07111226.result"
+RESULT="/var/lib/rswsolutionz-rmm/postreboot-validation-V06.100626N.result"
 LOG="/var/log/solutionz-rmm/setup/postreboot-validation.log"
 NV="/usr/local/sbin/solutionz-rmm-network-validate"
-NVR="/var/lib/rswsolutionz-rmm/network-validation-SOC2-V07111226.result"
+NVR="/var/lib/rswsolutionz-rmm/network-validation-V06.100626N.result"
 LD="/usr/local/sbin/solutionz-rmm-live-network-discovery"
-LDR="/var/lib/rswsolutionz-rmm/network-live-discovery-SOC2-V07111226.result"
+LDR="/var/lib/rswsolutionz-rmm/network-live-discovery-V06.100626N.result"
 PF="/etc/solutionz-rmm/network-profile.json"
 PT="/usr/local/sbin/solutionz-rmm-network-profile"
-PR="/var/lib/rswsolutionz-rmm/network-profile-SOC2-V07111226.result"
+PR="/var/lib/rswsolutionz-rmm/network-profile-V06.100626N.result"
 DOM="domotzpro-agent-publicstore"
 SER="serial-getty@ttyS0.service"
 CFG="/usr/local/sbin/solutionz-rmm-local-config"
-SP="/etc/profile.d/solutionz-rmm-access.sh"
+SP="/etc/profile.d/solutionz-rmm-serial.sh"
 SD="/etc/sudoers.d/solutionz-rmm-local-config"
 ENG_USER="solz_eng"
 ENG_GROUP="solutionz-rmm-engineering"
 ENG_KEYS="/home/solz_eng/.ssh/authorized_keys"
 ENG_FP_EXPECTED="SHA256:F8aZDgPAP4X7ofp2wjQSed9rWzhs7xcCLMas39JFWa0"
-ENG_FP_FILE="/var/lib/rswsolutionz-rmm/engineering-ssh-key-SOC2-V07111226.fingerprint"
+ENG_FP_FILE="/var/lib/rswsolutionz-rmm/engineering-ssh-key-V06.100626N.fingerprint"
 ACT="/usr/local/sbin/solutionz-domotz-activate"
 SETUP="/usr/local/sbin/solutionz-rmm-setup"
 GRUB="/etc/default/grub"
 IPF="/etc/sysctl.d/90-solutionz-rmm-no-forwarding.conf"
 SV="/usr/local/sbin/solutionz-rmm-security-validate"
-SVR="/var/lib/rswsolutionz-rmm/security-validation-SOC2-V07111226.result"
-IB="/var/lib/rswsolutionz-rmm/security-baseline-SOC2-V07111226.sha256"
+SVR="/var/lib/rswsolutionz-rmm/security-validation-V06.100626N.result"
+IB="/var/lib/rswsolutionz-rmm/security-baseline-V06.100626N.sha256"
 FORCE=0
 
 if [[ "${1:-}" == "--force" ]]; then
@@ -4997,8 +4071,6 @@ final_summary_check() {
   check_final_requirement "USB-C COM automatic-menu profile installed" test -s "${SERIAL_PROFILE_FILE}" || failures=$((failures + 1))
   check_final_requirement "USB-C COM automatic-menu profile targets ttyS0" grep -q '/dev/ttyS0' "${SERIAL_PROFILE_FILE}" || failures=$((failures + 1))
   check_final_requirement "USB-C COM automatic-menu profile launches serial-auto mode" grep -q -- '--serial-auto' "${SERIAL_PROFILE_FILE}" || failures=$((failures + 1))
-  check_final_requirement "All-interactive access profile launches engineering-auto mode" grep -q -- '--engineering-auto' "${SERIAL_PROFILE_FILE}" || failures=$((failures + 1))
-  check_final_requirement "All-interactive access profile recognizes solz_eng" grep -q "${ENGINEERING_USER}" "${SERIAL_PROFILE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Local config sudoers policy installed" test -s "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
   check_final_requirement "Local config sudoers policy valid" visudo -cf "${LOCAL_CONFIG_SUDOERS_FILE}" || failures=$((failures + 1))
   check_final_requirement "Protectli V1210 hardware" bash -c 'vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null); model=$(cat /sys/class/dmi/id/product_name 2>/dev/null); [[ "${vendor,,}" == *protectli* && "$model" == "V1210" ]]' || failures=$((failures + 1))
@@ -5011,15 +4083,13 @@ final_summary_check() {
   check_final_requirement "SSH configuration valid" sshd -t || failures=$((failures + 1))
   check_final_requirement "SSH root login disabled" bash -c "sshd -T | grep -q '^permitrootlogin no$'" || failures=$((failures + 1))
   check_final_requirement "solz_rmm SSH forced to network menu" bash -c "sshd -T -C user=solz_rmm,host=localhost,addr=127.0.0.1 | grep -q '^forcecommand sudo -n /usr/local/sbin/solutionz-rmm-local-config$'" || failures=$((failures + 1))
-  check_final_requirement "solz_eng SSH forced to Engineering menu" bash -c "sshd -T -C user=solz_eng,host=localhost,addr=127.0.0.1 | grep -q '^forcecommand sudo -n /usr/local/sbin/solutionz-rmm-local-config --engineering-auto$'" || failures=$((failures + 1))
+  check_final_requirement "solz_eng SSH opens direct Engineering shell" bash -c "sshd -T -C user=solz_eng,host=localhost,addr=127.0.0.1 | grep -q '^forcecommand none$'" || failures=$((failures + 1))
   check_final_requirement "solz_eng SSH is public-key only" bash -c "e=\$(sshd -T -C user=solz_eng,host=localhost,addr=127.0.0.1); grep -q '^passwordauthentication no$' <<<"\$e" && grep -q '^authenticationmethods publickey$' <<<"\$e"" || failures=$((failures + 1))
   check_final_requirement "Restricted field-tech group exists" getent group "${FIELD_TECH_GROUP}" || failures=$((failures + 1))
   check_final_requirement "Engineering group exists" getent group "${ENGINEERING_GROUP}" || failures=$((failures + 1))
   check_final_requirement "Engineering account exists" id "${ENGINEERING_USER}" || failures=$((failures + 1))
   check_final_requirement "Engineering account uses Bash shell" bash -c "[[ \$(getent passwd '${ENGINEERING_USER}' | cut -d: -f7) == /bin/bash ]]" || failures=$((failures + 1))
   check_final_requirement "Engineering account is in engineering group" bash -c "id -nG '${ENGINEERING_USER}' | tr ' ' '\n' | grep -qx '${ENGINEERING_GROUP}'" || failures=$((failures + 1))
-  check_final_requirement "Engineering local password configured" bash -c "[[ \$(passwd -S '${ENGINEERING_USER}' 2>/dev/null | awk '{print \$2}') == P ]]" || failures=$((failures + 1))
-  check_final_requirement "Engineering password provisioning marker present" test -s "${ENGINEERING_PASSWORD_MARKER}" || failures=$((failures + 1))
   check_final_requirement "Engineering authorized_keys installed" test -s "${ENGINEERING_AUTHORIZED_KEYS}" || failures=$((failures + 1))
   check_final_requirement "Engineering SSH fingerprint audit record valid" grep -qx "${ENGINEERING_SSH_FINGERPRINT_EXPECTED}" "${ENGINEERING_KEY_FINGERPRINT_FILE}" || failures=$((failures + 1))
   check_final_requirement "Engineering Setup command installed" test -x "${INSTALLED_SETUP_COMMAND}" || failures=$((failures + 1))
@@ -5027,22 +4097,10 @@ final_summary_check() {
   check_final_requirement "Field network menu has no unrestricted Linux shell option" bash -c "! grep -q 'Open Linux shell' '${LOCAL_CONFIG_TOOL}'" || failures=$((failures + 1))
   check_final_requirement "Engineering Login option restored" grep -q 'Engineering Login / Password Setup' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "Engineering Tools option restored" grep -q 'Engineering Tools / Setup Script' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Direct solz_eng Engineering shell option restored" grep -q 'Open Engineering Shell (solz_eng only)' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Live NIC/cabling banner restored" grep -q 'LIVE NIC / CABLING STATUS' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "NEW Domotz Collector option restored" grep -q 'Register NEW Domotz Collector Now' "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
   check_final_requirement "auditd active" systemctl is-active --quiet auditd || failures=$((failures + 1))
   check_final_requirement "Solutionz audit rules installed" test -s "${AUDIT_RULES_FILE}" || failures=$((failures + 1))
   check_final_requirement "AppArmor active" systemctl is-active --quiet apparmor || failures=$((failures + 1))
-  check_final_requirement "Solutionz AppArmor common abstraction installed" test -s "${APPARMOR_COMMON_ABSTRACTION}" || failures=$((failures + 1))
-  local aa_profile aa_file
-  for aa_file in "${APPARMOR_PROFILE_FILES[@]}"; do
-    check_final_requirement "AppArmor policy installed: $(basename "$aa_file")" test -s "$aa_file" || failures=$((failures + 1))
-    check_final_requirement "AppArmor policy syntax valid: $(basename "$aa_file")" apparmor_parser -Q -K "$aa_file" || failures=$((failures + 1))
-  done
-  for aa_profile in "${APPARMOR_REQUIRED_PROFILES[@]}"; do
-    check_final_requirement "AppArmor enforcing profile: ${aa_profile}" bash -c "grep -Fq '${aa_profile} (enforce)' /sys/kernel/security/apparmor/profiles" || failures=$((failures + 1))
-  done
-  check_final_requirement "Domotz Snap uses strict confinement" domotz_snap_confinement_is_strict || failures=$((failures + 1))
   check_final_requirement "Controlled security-update policy installed" test -s "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
   check_final_requirement "Automatic security reboot disabled" grep -q 'Automatic-Reboot "false"' "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
   check_final_requirement "Unattended package installation disabled" grep -q 'APT::Periodic::Unattended-Upgrade "0"' "${SECURITY_APT_POLICY_FILE}" || failures=$((failures + 1))
@@ -5083,12 +4141,6 @@ check_final_requirement "Solutionz security validator installed" test -x "${SECU
   check_final_requirement "Automatic dual-homed network validator installed" test -x "${NETWORK_VALIDATOR}" || failures=$((failures + 1))
   check_final_requirement "Persistent IPv4 forwarding disable policy installed" grep -Eq '^net\.ipv4\.ip_forward=0$' "${IP_FORWARD_SYSCTL_FILE}" || failures=$((failures + 1))
   check_final_requirement "Current IPv4 forwarding is disabled" bash -c '[[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "0" ]]' || failures=$((failures + 1))
-  check_final_requirement "Domotz registration helper supports NEW-collector preflight" grep -q -- '--preflight-new' "${DOMOTZ_ACTIVATION_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Domotz registration policy forces scanning enabled" grep -q "'deny_all_interfaces':False" "${DOMOTZ_ACTIVATION_TOOL}" || failures=$((failures + 1))
-  check_final_requirement "Domotz activation service/timer units validate" systemd-analyze verify "${DOMOTZ_ACTIVATION_SERVICE}" "${DOMOTZ_ACTIVATION_TIMER}" || failures=$((failures + 1))
-  if [[ -n "${DOMOTZ_COLLECTOR_ACTIVATION_KEY}" ]]; then
-    check_final_requirement "Domotz provisioning defaults staged root-only" bash -c 'f="$1"; [[ -s "$f" && "$(stat -c %U:%G "$f")" == root:root && "$(stat -c %a "$f")" == 600 ]]' _ "${DOMOTZ_PROVISIONING_DEFAULTS}" || failures=$((failures + 1))
-  fi
   check_final_requirement "Domotz installed" snap list "${DOMOTZ_SNAP_NAME}" || failures=$((failures + 1))
   check_final_requirement "Post-reboot production validator installed" test -x "${POSTREBOOT_VALIDATOR}" || failures=$((failures + 1))
 
@@ -5153,35 +4205,14 @@ show_activation_status_action() {
 
 prepare_deployment_action() {
   require_engineering_action
-  local state_first confirm use_existing
+  local state_first confirm
   state_first="$(head -n1 "$STATE_FILE" 2>/dev/null || true)"
   [[ "$state_first" == "phase2_system_validated" ]] || {
     echo "ERROR: Deployment preparation requires phase2_system_validated." >&2
     exit 1
   }
   [[ -x "$DOMOTZ_ACTIVATION_TOOL" ]] || { echo "ERROR: Domotz activation helper missing." >&2; exit 1; }
-
-  systemctl stop solutionz-domotz-activate.timer solutionz-domotz-activate.service >/dev/null 2>&1 || true
-
-  if [[ ! -s "$DOMOTZ_ACTIVATION_CONFIG" ]]; then
-    (( NON_INTERACTIVE == 0 )) || { echo "ERROR: No Domotz activation configuration exists. Run deployment preparation interactively once or stage protected defaults." >&2; exit 1; }
-    "$DOMOTZ_ACTIVATION_TOOL" --preflight-new || exit $?
-    "$DOMOTZ_ACTIVATION_TOOL" --configure || exit 1
-  else
-    "$DOMOTZ_ACTIVATION_TOOL" --check || exit 1
-    if (( NON_INTERACTIVE == 0 )); then
-      read -r -p "Use the existing protected Domotz activation configuration? [Y/n]: " use_existing </dev/tty
-      case "${use_existing:-Y}" in
-        Y|y|YES|Yes|yes) ;;
-        N|n|NO|No|no)
-          "$DOMOTZ_ACTIVATION_TOOL" --preflight-new || exit $?
-          "$DOMOTZ_ACTIVATION_TOOL" --configure || exit 1
-          ;;
-        *) echo "ERROR: Enter Y or N." >&2; exit 2 ;;
-      esac
-    fi
-  fi
-
+  [[ -s "$DOMOTZ_ACTIVATION_CONFIG" ]] || { echo "ERROR: Domotz activation configuration is not staged." >&2; exit 1; }
   "$DOMOTZ_ACTIVATION_TOOL" --check || exit 1
 
   if (( NON_INTERACTIVE )); then
@@ -5195,12 +4226,12 @@ prepare_deployment_action() {
     *) echo "ERROR: Expected exact DEPLOY or CANCEL." >&2; exit 2 ;;
   esac
 
+  systemctl stop solutionz-domotz-activate.timer solutionz-domotz-activate.service >/dev/null 2>&1 || true
   "$DOMOTZ_ACTIVATION_TOOL" --arm || exit 1
   systemctl enable solutionz-domotz-activate.timer >/dev/null 2>&1 || { echo "ERROR: Unable to enable activation timer." >&2; exit 1; }
-  systemctl stop solutionz-domotz-activate.timer solutionz-domotz-activate.service >/dev/null 2>&1 || true
   echo "Deployment preparation: PASS - Domotz registration armed for the next boot."
   if (( NO_POWEROFF )); then
-    echo "Appliance remains powered on by engineering request. Do not manually start the activation timer in the lab."
+    echo "Appliance remains powered on by engineering request. Do not reboot in the lab unless activation is intentional."
   else
     echo "Powering off to prevent accidental lab activation."
     systemctl poweroff
@@ -5254,7 +4285,6 @@ main() {
   install_local_serial_config_tool
   update_banner
   install_postreboot_validation
-  install_solutionz_apparmor_profiles
 
   if ! final_summary_check; then
     error_exit "Mandatory pre-reboot validation failed. Review ${PREREBOOT_RESULT_FILE} for failed check names."
@@ -5273,11 +4303,6 @@ main() {
     "network_live_discovery_result=${LIVE_DISCOVERY_RESULT_FILE}" \
     "security_validation_result=${SECURITY_VALIDATION_RESULT_FILE}" \
     "security_baseline=${SECURITY_BASELINE_FILE}" \
-    "apparmor_policy_revision=${APPARMOR_POLICY_REVISION}" \
-    "engineering_login=${ENGINEERING_USER}" \
-    "engineering_ssh_fingerprint=${ENGINEERING_SSH_FINGERPRINT_EXPECTED}" \
-    "engineering_local_password_status=configured" \
-    "engineering_shell_menu=enabled" \
     "log=${LOG_FILE}"
 
   completion_message
@@ -5286,14 +4311,10 @@ main() {
   progress_message "Hostname: $(hostname)"
   progress_message "Script Revision: ${REVISION}"
   progress_message "Setup Context: ${SETUP_CONTEXT}"
-  progress_message "Engineering login: ${ENGINEERING_USER}; SSH public-key fingerprint ${ENGINEERING_SSH_FINGERPRINT_EXPECTED}."
-  progress_message "Engineering local password status: configured from approved hash on fresh/unprovisioned units or preserved when already set; SSH remains key-only."
-  progress_message "Engineering shell access: explicit main-menu option plus Engineering Session option; both require authenticated ${ENGINEERING_USER}."
   progress_message "Network mode after reboot is generated from ${NETWORK_PROFILE_FILE}. Default profile: eth0 WAN DHCP + eth1 LAN DHCP with LAN routes/DNS suppressed."
   progress_message "eth0 is WAN/cloud and owns the only default route. eth1 is AV/control LAN; 802.1Q VLANs, when used, are linked to eth1."
   progress_message "Automatic network validation tool: ${NETWORK_VALIDATOR}"
   progress_message "Automatic security validation tool: ${SECURITY_VALIDATOR}"
-  progress_message "AppArmor policy revision: ${APPARMOR_POLICY_REVISION} (${#APPARMOR_REQUIRED_PROFILES[@]} enforcing Solutionz profiles)"
   progress_message "Security integrity baseline: ${SECURITY_BASELINE_FILE}"
   progress_message "State File: ${STATE_FILE}"
   progress_message "Log File: ${LOG_FILE}"

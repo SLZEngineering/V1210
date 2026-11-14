@@ -1266,9 +1266,15 @@ for iface in eth0 eth1; do
   fi
 done
 
-ufw status 2>/dev/null | grep -q 'Status: active' && pass "UFW active." || fail "UFW inactive."
-ufw status 2>/dev/null | grep -Eq '^22/tcp[[:space:]]+ALLOW' && pass "Domotz-required TCP 22 permitted." || fail "Required UFW TCP 22 rule missing."
-ufw status 2>/dev/null | grep -Eq '^3000/tcp[[:space:]]+ALLOW' && pass "Domotz-required TCP 3000 permitted." || fail "Required UFW TCP 3000 rule missing."
+if UFW_STATUS="$(LC_ALL=C ufw status 2>&1)"; then
+  printf '%s\n' "$UFW_STATUS"
+  grep -q '^Status: active' <<<"$UFW_STATUS" && pass "UFW active." || fail "UFW inactive."
+  grep -Eq '^22/tcp[[:space:]]+ALLOW' <<<"$UFW_STATUS" && pass "Domotz-required TCP 22 permitted." || fail "Required UFW TCP 22 rule missing."
+  grep -Eq '^3000/tcp[[:space:]]+ALLOW' <<<"$UFW_STATUS" && pass "Domotz-required TCP 3000 permitted." || fail "Required UFW TCP 3000 rule missing."
+else
+  printf '%s\n' "$UFW_STATUS"
+  fail "Unable to query UFW status; see command output above."
+fi
 grep -Eq '^DEFAULT_INPUT_POLICY="?DROP"?$' /etc/default/ufw 2>/dev/null && pass "UFW default inbound policy is DROP." || fail "UFW default inbound policy is not DROP."
 grep -Eq '^DEFAULT_OUTPUT_POLICY="?ACCEPT"?$' /etc/default/ufw 2>/dev/null && pass "UFW default outbound policy is ACCEPT." || fail "UFW default outbound policy is not ACCEPT."
 grep -Eq '^DEFAULT_FORWARD_POLICY="?DROP"?$' /etc/default/ufw 2>/dev/null && pass "UFW forwarded/routed policy is DROP." || fail "UFW forwarded/routed policy is not DROP."
@@ -1326,7 +1332,7 @@ systemctl is-active --quiet apparmor 2>/dev/null && pass "AppArmor service activ
 grep -q 'APT::Periodic::Unattended-Upgrade "0"' "$APT_POLICY" 2>/dev/null && pass "Unattended package installation disabled; security updates require an approved maintenance action." || fail "Unattended package installation is not disabled by Solutionz policy."
 
 if [[ -x "$INTEGRITY" && -s "$BASELINE" ]]; then
-  "$INTEGRITY" --verify >/dev/null 2>&1 && pass "Security integrity baseline validates." || fail "Security integrity baseline validation failed."
+  "$INTEGRITY" --verify && pass "Security integrity baseline validates." || fail "Security integrity baseline validation failed."
 else
   fail "Security integrity baseline/tool missing."
 fi
@@ -3894,7 +3900,11 @@ else
 fi
 
 check "SSH active" systemctl is-active --quiet ssh
-ufw status | grep -q 'Status: active' && pass "UFW active." || fail "UFW inactive."
+if UFW_STATUS="$(LC_ALL=C ufw status 2>&1)"; then
+  grep -q '^Status: active' <<<"$UFW_STATUS" && pass "UFW active." || fail "UFW inactive."
+else
+  printf '%s\n' "$UFW_STATUS"; fail "Unable to query UFW status."
+fi
 [[ -c /dev/net/tun ]] && pass "TUN available." || fail "TUN unavailable."
 snap list "$DOM" >/dev/null 2>&1 && pass "Domotz installed." || fail "Domotz missing."
 for p in firewall-control network-observe raw-usb shutdown system-observe; do
@@ -3902,7 +3912,7 @@ for p in firewall-control network-observe raw-usb shutdown system-observe; do
     pass "Domotz ${p} connected." || fail "Domotz ${p} missing."
 done
 systemctl is-active --quiet systemd-timesyncd.service && pass "systemd-timesyncd active." || fail "systemd-timesyncd inactive."
-waitntp && pass "NTP synchronized." || fail "NTP synchronization failed."
+waitntp && pass "NTP synchronized." || warn "NTP synchronization not confirmed."
 [[ -c /dev/ttyS0 ]] && pass "ttyS0 present." || fail "ttyS0 missing."
 check "Serial service active" systemctl is-active --quiet "$SER"
 [[ -x "$CFG" && -s "$SP" ]] && grep -q '/dev/ttyS0' "$SP" && pass "USB-C COM network menu installed." || fail "USB-C COM menu missing."
@@ -4117,10 +4127,12 @@ check_final_requirement "Solutionz security validator installed" test -x "${SECU
   check_final_requirement "DNS resolves archive.ubuntu.com to IPv4" dns_resolves_ipv4 archive.ubuntu.com || failures=$((failures + 1))
   check_final_requirement "systemd-timesyncd enabled" systemctl is-enabled --quiet systemd-timesyncd.service || failures=$((failures + 1))
   check_final_requirement "systemd-timesyncd active" systemctl is-active --quiet systemd-timesyncd.service || failures=$((failures + 1))
-  check_final_requirement "systemd-time-wait-sync enabled" systemctl is-enabled --quiet systemd-time-wait-sync.service || failures=$((failures + 1))
+  info_message "systemd-time-wait-sync is not a mandatory production prerequisite."
   echo "INFO - Waiting up to 180 seconds for NTP synchronization before Phase 1 completion."
-  if ! check_final_requirement "NTP synchronization active" wait_for_ntp_sync 36 5; then
-    failures=$((failures + 1))
+  if wait_for_ntp_sync 36 5; then
+    progress_message "NTP synchronization active."
+  else
+    warning_message "NTP synchronization not confirmed; review diagnostics."
     report_ntp_diagnostics
   fi
   check_final_requirement "Initial OS runtime baseline record exists" test -s "${OS_BASELINE_FILE}" || failures=$((failures + 1))

@@ -5416,8 +5416,13 @@ check_final_requirement "Solutionz security validator installed" test -x "${SECU
   check_final_requirement "Persistent IPv4 forwarding disable policy installed" grep -Eq '^net\.ipv4\.ip_forward=0$' "${IP_FORWARD_SYSCTL_FILE}" || failures=$((failures + 1))
   check_final_requirement "Current IPv4 forwarding is disabled" bash -c '[[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "0" ]]' || failures=$((failures + 1))
   check_final_requirement "Installed Setup copy does not retain embedded Domotz activation key" grep -q '^DOMOTZ_COLLECTOR_ACTIVATION_KEY_DEFAULT=""$' "${INSTALLED_SCRIPT_COPY}" || failures=$((failures + 1))
-  if [[ -n "${DOMOTZ_COLLECTOR_ACTIVATION_KEY}" ]]; then
-    check_final_requirement "Domotz provisioning defaults staged root-only" bash -c 'f="$1"; [[ -s "$f" && "$(stat -c %U:%G "$f")" == root:root && "$(stat -c %a "$f")" == 600 ]]' _ "${DOMOTZ_PROVISIONING_DEFAULTS}" || failures=$((failures + 1))
+  # Completed collectors must not retain or restage reusable deployment credentials.
+  if [[ -s "${DOMOTZ_ACTIVATION_CONFIG}" ]] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); raise SystemExit(0 if d.get("registration_complete") is True else 1)' "${DOMOTZ_ACTIVATION_CONFIG}" >/dev/null 2>&1; then
+    check_final_requirement "Registered Domotz configuration root-only" bash -c 'f="$1"; [[ ! -L "$f" && -f "$f" && "$(stat -c %U:%G "$f")" == root:root && "$(stat -c %a "$f")" == 600 ]]' _ "${DOMOTZ_ACTIVATION_CONFIG}" || failures=$((failures + 1))
+    check_final_requirement "Registered Domotz activation credential scrubbed" python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); raise SystemExit(0 if d.get("activation_key", "") in ("", None) else 1)' "${DOMOTZ_ACTIVATION_CONFIG}" || failures=$((failures + 1))
+    check_final_requirement "Registered Domotz provisioning defaults absent" bash -c '[[ ! -e "$1" && ! -L "$1" ]]' _ "${DOMOTZ_PROVISIONING_DEFAULTS}" || failures=$((failures + 1))
+  elif [[ -n "${DOMOTZ_COLLECTOR_ACTIVATION_KEY}" ]]; then
+    check_final_requirement "Domotz provisioning defaults staged root-only" bash -c 'f="$1"; [[ ! -L "$f" && -f "$f" && -s "$f" && "$(stat -c %U:%G "$f")" == root:root && "$(stat -c %a "$f")" == 600 ]]' _ "${DOMOTZ_PROVISIONING_DEFAULTS}" || failures=$((failures + 1))
   fi
   check_final_requirement "Integrated Domotz activation helper installed" test -x "${DOMOTZ_ACTIVATION_HELPER}" || failures=$((failures + 1))
   check_final_requirement "Domotz activation service unit installed" test -s "${DOMOTZ_ACTIVATION_SERVICE}" || failures=$((failures + 1))

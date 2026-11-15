@@ -1399,6 +1399,49 @@ if id "$TECH_USER" >/dev/null 2>&1; then
 else
   warn "Default technician account $TECH_USER does not exist on this appliance."
 fi
+# V6-SEC-002: validate the configured technician and the on-demand installer.
+if id "$TECH_USER" >/dev/null 2>&1; then
+  if technician_groups="$(id -nG "$TECH_USER")"; then
+    if [[ " $technician_groups " == *" lxd "* ]]; then
+      fail "$TECH_USER has LXD group membership."
+    else
+      pass "$TECH_USER has no LXD group membership."
+    fi
+  else
+    fail "Unable to inspect $TECH_USER group memberships for LXD policy."
+  fi
+fi
+if lxd_load="$(systemctl show -p LoadState --value lxd-installer.socket)"; then
+  case "$lxd_load" in
+    not-found) pass "LXD installer socket unit is not installed." ;;
+    loaded|masked)
+      lxd_enabled="$(systemctl is-enabled lxd-installer.socket 2>/dev/null || true)"
+      if lxd_active="$(systemctl show -p ActiveState --value lxd-installer.socket)" && [[ "$lxd_enabled" == masked && "$lxd_active" == inactive ]]; then
+        pass "LXD installer socket is persistently masked and inactive."
+      else
+        fail "LXD installer socket is not persistently masked and inactive."
+      fi
+      ;;
+    *) fail "Unexpected LXD installer socket LoadState: $lxd_load" ;;
+  esac
+else
+  fail "Unable to inspect LXD installer socket unit."
+fi
+if [[ -e /run/lxd-installer.socket || -L /run/lxd-installer.socket ]]; then
+  fail "LXD installer socket path still exists."
+else
+  pass "LXD installer socket path is absent."
+fi
+# Inspect package inventory without invoking the on-demand lxd/lxc wrappers.
+if lxd_snap_inventory="$(snap list 2>/dev/null)"; then
+  if awk '$1 == "lxd" {found=1} END {exit !found}' <<<"$lxd_snap_inventory"; then
+    warn "LXD Snap is installed; Engineering review required."
+  else
+    pass "LXD Snap is not installed."
+  fi
+else
+  warn "Unable to inspect Snap inventory for LXD."
+fi
 if id "$ENG_USER" >/dev/null 2>&1; then
   id -nG "$ENG_USER" | tr ' ' '\n' | grep -qx "$ENG_GROUP" && pass "$ENG_USER is assigned to the engineering group." || fail "$ENG_USER is not assigned to the engineering group."
   id -nG "$ENG_USER" | tr ' ' '\n' | grep -qx 'sudo' && pass "$ENG_USER has sudo-group membership." || fail "$ENG_USER is missing sudo-group membership."
@@ -1498,6 +1541,38 @@ SECURITYVALIDATOR
   chown root:root "${SECURITY_VALIDATOR}"
 }
 
+remediate_technician_lxd() {
+  # V6-SEC-002: prevent the default technician from accessing LXD administration
+  # or triggering Ubuntu's on-demand LXD installation. Do not remove packages.
+  if id "${TECHNICIAN_USER}" >/dev/null 2>&1; then
+    local technician_groups
+    technician_groups="$(id -nG "${TECHNICIAN_USER}")" || error_exit "Unable to inspect technician groups for LXD policy."
+    if [[ " ${technician_groups} " == *" lxd "* ]]; then
+      gpasswd -d "${TECHNICIAN_USER}" lxd || error_exit "Unable to remove technician LXD group membership."
+      progress_message "Removed ${TECHNICIAN_USER} from lxd; existing sessions require logout/reboot."
+    fi
+    technician_groups="$(id -nG "${TECHNICIAN_USER}")" || error_exit "Unable to verify technician groups."
+    [[ " ${technician_groups} " != *" lxd "* ]] || error_exit "Technician still has LXD group membership."
+  fi
+  local lxd_load lxd_enabled lxd_active
+  lxd_load="$(systemctl show -p LoadState --value lxd-installer.socket)" || error_exit "Unable to inspect LXD installer socket."
+  case "$lxd_load" in
+    not-found) progress_message "LXD installer socket not installed." ;;
+    loaded|masked)
+      if [[ "$lxd_load" != masked ]]; then
+        systemctl disable --now lxd-installer.socket || error_exit "Unable to disable LXD installer socket."
+      fi
+      systemctl mask --now lxd-installer.socket || error_exit "Unable to mask LXD installer socket."
+      lxd_enabled="$(systemctl is-enabled lxd-installer.socket 2>/dev/null || true)"
+      lxd_active="$(systemctl show -p ActiveState --value lxd-installer.socket)" || error_exit "Unable to verify LXD installer socket state."
+      [[ "$lxd_enabled" == masked && "$lxd_active" == inactive ]] || error_exit "LXD installer socket is not persistently masked and inactive."
+      progress_message "LXD installer socket masked and inactive."
+      ;;
+    *) error_exit "Unexpected LXD installer socket LoadState: $lxd_load" ;;
+  esac
+  [[ ! -e /run/lxd-installer.socket && ! -L /run/lxd-installer.socket ]] || error_exit "LXD installer socket path still exists."
+}
+
 configure_security_hardening() {
   progress_message "Applying Solutionz host security hardening baseline."
 
@@ -1531,6 +1606,8 @@ configure_security_hardening() {
   else
     warning_message "Default technician account ${TECHNICIAN_USER} does not exist; technician menu enforcement will apply to any account later added to ${FIELD_TECH_GROUP}."
   fi
+
+  remediate_technician_lxd
 
   # The default engineering account is explicit and repeatable. Setup never
   # promotes the account that happened to invoke sudo into engineering access.

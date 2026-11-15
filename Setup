@@ -1370,6 +1370,15 @@ if command -v sshd >/dev/null 2>&1 && sshd -t >/dev/null 2>&1; then
   SSH_EFFECTIVE="$(sshd -T 2>/dev/null || true)"
   grep -q '^permitrootlogin no$' <<<"$SSH_EFFECTIVE" && pass "SSH root login disabled." || fail "SSH PermitRootLogin is not 'no'."
   grep -q '^pubkeyauthentication yes$' <<<"$SSH_EFFECTIVE" && pass "SSH public-key authentication enabled." || fail "SSH PubkeyAuthentication is not enabled."
+  # V6-SEC-006: inspect the effective Match policy for the Engineering account.
+  if SSH_ENG_EFFECTIVE="$(sshd -T -C "user=$ENG_USER,host=localhost,addr=127.0.0.1" 2>/dev/null)"; then
+    grep -qx 'pubkeyauthentication yes' <<<"$SSH_ENG_EFFECTIVE" && pass "Engineering SSH public-key authentication enabled." || fail "Engineering SSH public-key authentication is not enabled."
+    grep -qx 'passwordauthentication no' <<<"$SSH_ENG_EFFECTIVE" && pass "Engineering SSH password authentication disabled." || fail "Engineering SSH password authentication is not disabled."
+    grep -qx 'kbdinteractiveauthentication no' <<<"$SSH_ENG_EFFECTIVE" && pass "Engineering SSH keyboard-interactive authentication disabled." || fail "Engineering SSH keyboard-interactive authentication is not disabled."
+    grep -qx 'authenticationmethods publickey' <<<"$SSH_ENG_EFFECTIVE" && pass "Engineering SSH requires public-key authentication." || fail "Engineering SSH does not require public-key authentication."
+  else
+    fail "Unable to determine effective Engineering SSH authentication policy."
+  fi
   grep -q '^maxauthtries 3$' <<<"$SSH_EFFECTIVE" && pass "SSH MaxAuthTries=3." || fail "SSH MaxAuthTries is not 3."
   grep -q '^logingracetime 30$' <<<"$SSH_EFFECTIVE" && pass "SSH LoginGraceTime=30." || fail "SSH LoginGraceTime is not 30 seconds."
   grep -q '^x11forwarding no$' <<<"$SSH_EFFECTIVE" && pass "SSH X11 forwarding disabled." || fail "SSH X11Forwarding is not disabled."
@@ -1762,6 +1771,14 @@ EOF
   sysctl -w net.ipv4.conf.default.log_martians=1 >/dev/null || error_exit "Failed to enable runtime default martian logging."
 
   install -d -m 755 /etc/ssh/sshd_config.d
+  # Preserve the preceding SSH policy so a failed V6-SEC-006 check cannot
+  # leave a broken configuration on disk for the next boot.
+  local ssh_policy_backup ssh_policy_previous=0 ssh_eng_effective
+  ssh_policy_backup="$(mktemp -d)" || error_exit "Unable to back up SSH policy."
+  if [[ -e "${SSH_HARDENING_FILE}" || -L "${SSH_HARDENING_FILE}" ]]; then
+    cp -a -- "${SSH_HARDENING_FILE}" "${ssh_policy_backup}/previous" || error_exit "Unable to back up SSH policy."
+    ssh_policy_previous=1
+  fi
   cat > "${SSH_HARDENING_FILE}" <<'EOF'
 # Solutionz RMM SSH hardening. Domotz-sensitive global tunneling/authentication
 # controls are intentionally not changed until V1210/Domotz regression testing.
@@ -1770,6 +1787,14 @@ PubkeyAuthentication yes
 MaxAuthTries 3
 LoginGraceTime 30
 X11Forwarding no
+
+# V6-SEC-006: remote Engineering authentication is key-only. Local PAM
+# password authentication (console/USB-C) is not controlled by sshd.
+Match Group solutionz-rmm-engineering
+    PubkeyAuthentication yes
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    AuthenticationMethods publickey
 
 # Dedicated field technicians are forced into the controlled configuration
 # menu for SSH sessions. Membership in the engineering group is an explicit
@@ -1782,8 +1807,30 @@ Match Group solutionz-rmm-tech,!solutionz-rmm-engineering
 Match all
 EOF
   chmod 644 "${SSH_HARDENING_FILE}"
-  sshd -t || error_exit "SSH hardening configuration failed sshd syntax validation."
-  systemctl reload ssh || error_exit "Unable to reload SSH after hardening."
+  if ! sshd -t || ! ssh_eng_effective="$(sshd -T -C "user=${ENGINEERING_USER},host=localhost,addr=127.0.0.1")" ||
+     ! grep -qx 'pubkeyauthentication yes' <<<"$ssh_eng_effective" ||
+     ! grep -qx 'passwordauthentication no' <<<"$ssh_eng_effective" ||
+     ! grep -qx 'kbdinteractiveauthentication no' <<<"$ssh_eng_effective" ||
+     ! grep -qx 'authenticationmethods publickey' <<<"$ssh_eng_effective"; then
+    if (( ssh_policy_previous )); then
+      cp -a --remove-destination -- "${ssh_policy_backup}/previous" "${SSH_HARDENING_FILE}" || error_exit "Unable to restore SSH policy; backup: ${ssh_policy_backup}"
+    else
+      rm -f -- "${SSH_HARDENING_FILE}" || error_exit "Unable to remove rejected SSH policy."
+    fi
+    rm -rf -- "${ssh_policy_backup}"
+    error_exit "V6-SEC-006: SSH policy validation failed; preceding policy restored; SSH was not reloaded."
+  fi
+  if ! systemctl reload ssh; then
+    if (( ssh_policy_previous )); then
+      cp -a --remove-destination -- "${ssh_policy_backup}/previous" "${SSH_HARDENING_FILE}" || error_exit "Unable to restore SSH policy; backup: ${ssh_policy_backup}"
+    else
+      rm -f -- "${SSH_HARDENING_FILE}" || error_exit "Unable to remove rejected SSH policy."
+    fi
+    rm -rf -- "${ssh_policy_backup}"
+    sshd -t && systemctl reload ssh || error_exit "SSH reload and recovery reload failed; use local console."
+    error_exit "Unable to reload SSH after hardening; preceding policy restored."
+  fi
+  rm -rf -- "${ssh_policy_backup}"
 
   cat > "${SECURITY_APT_POLICY_FILE}" <<'EOF'
 // Solutionz RMM controlled security-update policy.

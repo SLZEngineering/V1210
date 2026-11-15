@@ -1570,6 +1570,20 @@ remediate_technician_lxd() {
       ;;
     *) error_exit "Unexpected LXD installer socket LoadState: $lxd_load" ;;
   esac
+  # Stopping a systemd socket may leave a stale filesystem entry behind.
+  # Never unlink a live endpoint, symlink, or unexpected file type.
+  if [[ -e /run/lxd-installer.socket || -L /run/lxd-installer.socket ]]; then
+    local lxd_unix_sockets lxd_socket_owner
+    [[ ! -L /run/lxd-installer.socket && -S /run/lxd-installer.socket ]] || error_exit "Unexpected file type at LXD installer socket path; refusing removal."
+    lxd_socket_owner="$(stat -c %u -- /run/lxd-installer.socket)" || error_exit "Unable to inspect LXD installer socket owner."
+    [[ "$lxd_socket_owner" == 0 ]] || error_exit "LXD installer socket is not root-owned; refusing removal."
+    lxd_unix_sockets="$(ss -xapnH)" || error_exit "Unable to inspect live Unix sockets; refusing LXD socket removal."
+    if awk '{for(i=1;i<=NF;i++) if($i=="/run/lxd-installer.socket") found=1} END {exit !found}' <<<"$lxd_unix_sockets"; then
+      error_exit "LXD installer socket is still in use; refusing removal."
+    fi
+    rm -- /run/lxd-installer.socket || error_exit "Unable to remove stale LXD installer socket path."
+    progress_message "Removed stale LXD installer socket path."
+  fi
   [[ ! -e /run/lxd-installer.socket && ! -L /run/lxd-installer.socket ]] || error_exit "LXD installer socket path still exists."
 }
 

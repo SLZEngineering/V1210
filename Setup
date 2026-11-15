@@ -1972,8 +1972,8 @@ def validate_profile(raw):
     seen=set();nv=[]
     for idx,item in enumerate(vlans,1):
         if not isinstance(item,dict):fail(f"vlan entry {idx} must be object.")
-        try:vid=int(item.get("id"))
-        except Exception:fail(f"vlan entry {idx} id must be integer.")
+        vid=item.get("id")
+        if type(vid) is not int:fail(f"vlan entry {idx} id must be a JSON integer (not a boolean, float, or string).")
         if not 1<=vid<=4094:fail(f"VLAN {vid} id must be 1-4094.")
         if vid in seen:fail(f"Duplicate VLAN ID {vid}.")
         seen.add(vid);mode=str(item.get("mode","static")).strip().lower()
